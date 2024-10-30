@@ -14,13 +14,11 @@ fn main() -> std::io::Result<()> {
     );
 
     // Add target specification for clang
-    // let target = std::env::var("TARGET").unwrap();
-    // [commented out for now SINCE SPECIFIED IN MORE GLOBAL Cargo Config FILE: .CARGO/CONFIG.TOML at the Project Root]
-    // println!("cargo:rustc-link-arg=--target={}", target);
+    let target = std::env::var("TARGET").unwrap();
+    println!("cargo:rustc-link-arg=--target={}", target);
     
-    // Specify mold as linker with full path 
-    // [commented out for now SINCE SPECIFIED IN MORE GLOBAL Cargo Config FILE: .CARGO/CONFIG.TOML at the Project Root]
-    //////// println!("cargo:rustc-link-arg=-fuse-ld=/usr/local/bin/mold");
+    // Specify mold as linker with full path
+    println!("cargo:rustc-link-arg=-fuse-ld=/usr/local/bin/mold");
 
     let build_out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
