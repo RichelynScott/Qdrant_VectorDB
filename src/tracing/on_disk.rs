@@ -3,9 +3,9 @@ use std::sync::Mutex;
 use std::{fs, io};
 
 use anyhow::Context as _;
+use common::ext::OptionExt;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter, fmt, registry};
+use tracing_subscriber::{Layer, fmt, registry};
 
 use super::*;
 
@@ -15,34 +15,27 @@ pub struct Config {
     pub enabled: Option<bool>,
     pub log_file: Option<String>,
     pub log_level: Option<String>,
+    pub format: Option<config::LogFormat>,
     pub span_events: Option<HashSet<config::SpanEvent>>,
 }
 
 impl Config {
     pub fn merge(&mut self, other: Self) {
-        self.enabled = other.enabled.or(self.enabled.take());
-        self.log_file = other.log_file.or(self.log_file.take());
-        self.log_level = other.log_level.or(self.log_level.take());
-        self.span_events = other.span_events.or(self.span_events.take());
+        let Self {
+            enabled,
+            log_file,
+            log_level,
+            span_events,
+            format,
+        } = other;
+
+        self.enabled.replace_if_some(enabled);
+        self.log_file.replace_if_some(log_file);
+        self.log_level.replace_if_some(log_level);
+        self.span_events.replace_if_some(span_events);
+        self.format.replace_if_some(format);
     }
 }
-
-#[rustfmt::skip] // `rustfmt` formats this into unreadable single line :/
-pub type Logger<S> = filter::Filtered<
-    Option<Layer<S>>,
-    filter::EnvFilter,
-    S,
->;
-
-#[rustfmt::skip] // `rustfmt` formats this into unreadable single line :/
-pub type Layer<S> = fmt::Layer<
-    S,
-    fmt::format::DefaultFields,
-    fmt::format::Format,
-    MakeWriter,
->;
-
-pub type MakeWriter = Mutex<io::BufWriter<fs::File>>;
 
 pub fn new_logger<S>(config: &mut Config) -> Logger<S>
 where
@@ -65,7 +58,7 @@ where
     layer.with_filter(filter)
 }
 
-pub fn new_layer<S>(config: &Config) -> anyhow::Result<Option<Layer<S>>>
+pub fn new_layer<S>(config: &Config) -> anyhow::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
 where
     S: tracing::Subscriber + for<'span> registry::LookupSpan<'span>,
 {
@@ -89,6 +82,11 @@ where
             &config.span_events,
         ))
         .with_ansi(false);
+
+    let layer = match config.format {
+        None | Some(config::LogFormat::Text) => Box::new(layer) as _,
+        Some(config::LogFormat::Json) => Box::new(layer.json()) as _,
+    };
 
     Ok(Some(layer))
 }

@@ -1,10 +1,7 @@
-use actix_web::{post, web, Responder};
+use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use api::rest::{QueryGroupsRequest, QueryRequest, QueryRequestBatch, QueryResponse};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
-use collection::operations::universal_query::collection_query::{
-    CollectionQueryGroupsRequest, CollectionQueryRequest,
-};
 use itertools::Itertools;
 use storage::content_manager::collection_verification::{
     check_strict_mode, check_strict_mode_batch,
@@ -13,11 +10,16 @@ use storage::content_manager::errors::StorageError;
 use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
-use super::read_params::ReadParams;
 use super::CollectionPath;
+use super::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
-use crate::actix::helpers::{self, process_response_error};
-use crate::common::points::do_query_point_groups;
+use crate::actix::helpers::{self, get_request_hardware_counter};
+use crate::common::inference::InferenceToken;
+use crate::common::inference::query_requests_rest::{
+    convert_query_groups_request_from_rest, convert_query_request_from_rest,
+};
+use crate::common::query::do_query_point_groups;
+use crate::settings::ServiceConfig;
 
 #[post("/collections/{name}/points/query")]
 async fn query_points(
@@ -25,40 +27,49 @@ async fn query_points(
     collection: Path<CollectionPath>,
     request: Json<QueryRequest>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
+    inference_token: InferenceToken,
 ) -> impl Responder {
     let QueryRequest {
         internal: query_request,
         shard_key,
     } = request.into_inner();
 
-    let pass = match check_strict_mode(
-        &query_request,
-        params.timeout_as_secs(),
-        &collection.name,
+    let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        &access,
-    )
-    .await
-    {
-        Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
-    };
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+    let timing = Instant::now();
 
-    helpers::time(async move {
-        let shard_selection = match shard_key {
-            None => ShardSelectorInternal::All,
-            Some(shard_keys) => shard_keys.into(),
-        };
+    let shard_selection = match shard_key {
+        None => ShardSelectorInternal::All,
+        Some(shard_keys) => shard_keys.into(),
+    };
+    let hw_measurement_acc = request_hw_counter.get_counter();
+    let result = async move {
+        let request = convert_query_request_from_rest(query_request, &inference_token).await?;
+
+        let pass = check_strict_mode(
+            &request,
+            params.timeout_as_secs(),
+            &collection.name,
+            &dispatcher,
+            &access,
+        )
+        .await?;
 
         let points = dispatcher
             .toc(&access, &pass)
             .query_batch(
                 &collection.name,
-                vec![(query_request.into(), shard_selection)],
+                vec![(request, shard_selection)],
                 params.consistency,
                 access,
                 params.timeout(),
+                hw_measurement_acc,
             )
             .await?
             .pop()
@@ -70,8 +81,10 @@ async fn query_points(
             .collect_vec();
 
         Ok(QueryResponse { points })
-    })
-    .await
+    }
+    .await;
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
 #[post("/collections/{name}/points/query/batch")]
@@ -80,41 +93,46 @@ async fn query_points_batch(
     collection: Path<CollectionPath>,
     request: Json<QueryRequestBatch>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
+    inference_token: InferenceToken,
 ) -> impl Responder {
     let QueryRequestBatch { searches } = request.into_inner();
 
-    let pass = match check_strict_mode_batch(
-        searches.iter().map(|i| &i.internal),
-        params.timeout_as_secs(),
-        &collection.name,
+    let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        &access,
-    )
-    .await
-    {
-        Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
-    };
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+    let timing = Instant::now();
+    let hw_measurement_acc = request_hw_counter.get_counter();
 
-    helpers::time(async move {
-        let batch = searches
-            .into_iter()
-            .map(|request| {
-                let QueryRequest {
-                    internal,
-                    shard_key,
-                } = request;
+    let result = async move {
+        let mut batch = Vec::with_capacity(searches.len());
+        for request in searches {
+            let QueryRequest {
+                internal,
+                shard_key,
+            } = request;
 
-                let request = CollectionQueryRequest::from(internal);
-                let shard_selection = match shard_key {
-                    None => ShardSelectorInternal::All,
-                    Some(shard_keys) => shard_keys.into(),
-                };
+            let request = convert_query_request_from_rest(internal, &inference_token).await?;
+            let shard_selection = match shard_key {
+                None => ShardSelectorInternal::All,
+                Some(shard_keys) => shard_keys.into(),
+            };
 
-                (request, shard_selection)
-            })
-            .collect::<Vec<_>>();
+            batch.push((request, shard_selection));
+        }
+
+        let pass = check_strict_mode_batch(
+            batch.iter().map(|i| &i.0),
+            params.timeout_as_secs(),
+            &collection.name,
+            &dispatcher,
+            &access,
+        )
+        .await?;
 
         let res = dispatcher
             .toc(&access, &pass)
@@ -124,6 +142,7 @@ async fn query_points_batch(
                 params.consistency,
                 access,
                 params.timeout(),
+                hw_measurement_acc,
             )
             .await?
             .into_iter()
@@ -134,10 +153,11 @@ async fn query_points_batch(
                     .collect_vec(),
             })
             .collect_vec();
-
         Ok(res)
-    })
-    .await
+    }
+    .await;
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
 #[post("/collections/{name}/points/query/groups")]
@@ -146,33 +166,40 @@ async fn query_points_groups(
     collection: Path<CollectionPath>,
     request: Json<QueryGroupsRequest>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
+    inference_token: InferenceToken,
 ) -> impl Responder {
     let QueryGroupsRequest {
         search_group_request,
         shard_key,
     } = request.into_inner();
 
-    let pass = match check_strict_mode(
-        &search_group_request,
-        params.timeout_as_secs(),
-        &collection.name,
+    let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        &access,
-    )
-    .await
-    {
-        Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
-    };
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+    let timing = Instant::now();
+    let hw_measurement_acc = request_hw_counter.get_counter();
 
-    helpers::time(async move {
+    let result = async move {
         let shard_selection = match shard_key {
             None => ShardSelectorInternal::All,
             Some(shard_keys) => shard_keys.into(),
         };
+        let query_group_request =
+            convert_query_groups_request_from_rest(search_group_request, inference_token).await?;
 
-        let query_group_request = CollectionQueryGroupsRequest::from(search_group_request);
+        let pass = check_strict_mode(
+            &query_group_request,
+            params.timeout_as_secs(),
+            &collection.name,
+            &dispatcher,
+            &access,
+        )
+        .await?;
 
         do_query_point_groups(
             dispatcher.toc(&access, &pass),
@@ -182,10 +209,13 @@ async fn query_points_groups(
             shard_selection,
             access,
             params.timeout(),
+            hw_measurement_acc,
         )
         .await
-    })
-    .await
+    }
+    .await;
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
 pub fn config_query_api(cfg: &mut web::ServiceConfig) {

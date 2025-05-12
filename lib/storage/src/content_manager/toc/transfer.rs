@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use collection::operations::types::{CollectionError, CollectionResult};
+use collection::shards::CollectionId;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::transfer::{ShardTransfer, ShardTransferConsensus, ShardTransferKey};
-use collection::shards::CollectionId;
 
 use super::dispatcher::TocDispatcher;
 use crate::content_manager::collection_meta_ops::{
@@ -23,11 +23,14 @@ impl ShardTransferConsensus for TocDispatcher {
     }
 
     fn consensus_commit_term(&self) -> (u64, u64) {
-        let state = self.consensus_state.hard_state();
-        (state.commit, state.term)
+        self.consensus_state
+            .0
+            .persistent
+            .read()
+            .applied_commit_term()
     }
 
-    fn snapshot_recovered_switch_to_partial(
+    fn recovered_switch_to_partial(
         &self,
         transfer_config: &ShardTransfer,
         collection_id: CollectionId,

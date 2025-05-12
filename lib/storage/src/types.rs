@@ -3,11 +3,11 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use collection::common::snapshots_manager::SnapShotsConfig;
-use collection::config::WalConfig;
+use collection::common::snapshots_manager::SnapshotsConfig;
+use collection::config::{WalConfig, default_on_disk_payload};
 use collection::operations::config_diff::OptimizersConfigDiff;
 use collection::operations::shared_storage_config::{
-    SharedStorageConfig, DEFAULT_IO_SHARD_TRANSFER_LIMIT, DEFAULT_SNAPSHOTS_PATH,
+    DEFAULT_IO_SHARD_TRANSFER_LIMIT, DEFAULT_SNAPSHOTS_PATH, SharedStorageConfig,
 };
 use collection::operations::types::{NodeType, PeerMetadata};
 use collection::optimizers_builder::OptimizersConfig;
@@ -15,7 +15,7 @@ use collection::shards::shard::PeerId;
 use collection::shards::transfer::ShardTransferMethod;
 use memory::madvise;
 use schemars::JsonSchema;
-use segment::common::anonymize::Anonymize;
+use segment::common::anonymize::{Anonymize, anonymize_collection_with_u64_hashable_key};
 use segment::types::{CollectionConfigDefaults, HnswConfig};
 use serde::{Deserialize, Serialize};
 use tonic::transport::Uri;
@@ -39,10 +39,18 @@ pub struct PerformanceConfig {
     /// If positive - use this absolute number of CPUs.
     #[serde(default)]
     pub optimizer_cpu_budget: isize,
+    /// IO budget, how many parallel IO operations to allow for an optimization job.
+    /// IO usage per optimization job is equivalent to number of indexing threads.
+    /// If 0 - auto selection, one IO operation per each CPU.
+    /// Otherwise - use this exact number of IO operations.
+    #[serde(default)]
+    pub optimizer_io_budget: usize,
     #[serde(default = "default_io_shard_transfers_limit")]
     pub incoming_shard_transfers_limit: Option<usize>,
     #[serde(default = "default_io_shard_transfers_limit")]
     pub outgoing_shard_transfers_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_scorer: Option<bool>,
 }
 
 const fn default_io_shard_transfers_limit() -> Option<usize> {
@@ -58,7 +66,7 @@ pub struct StorageConfig {
     #[validate(length(min = 1))]
     pub snapshots_path: String,
     #[serde(default)]
-    pub snapshots_config: SnapShotsConfig,
+    pub snapshots_config: SnapshotsConfig,
     #[validate(length(min = 1))]
     #[serde(default)]
     pub temp_path: Option<String>,
@@ -82,8 +90,6 @@ pub struct StorageConfig {
     pub update_queue_size: Option<usize>,
     #[serde(default)]
     pub handle_collection_load_errors: bool,
-    #[serde(default)]
-    pub async_scorer: bool,
     /// If provided - qdrant will start in recovery mode, which means that it will not accept any new data.
     /// Only collection metadata will be available, and it will only process collection delete requests.
     /// Provided value will be used error message for unavailable requests.
@@ -95,6 +101,7 @@ pub struct StorageConfig {
     #[serde(default)]
     pub shard_transfer_method: Option<ShardTransferMethod>,
     /// Default values for collections.
+    #[validate(nested)]
     #[serde(default)]
     pub collection: Option<CollectionConfigDefaults>,
 }
@@ -124,16 +131,12 @@ fn default_snapshots_path() -> String {
     DEFAULT_SNAPSHOTS_PATH.to_string()
 }
 
-const fn default_on_disk_payload() -> bool {
-    false
-}
-
 const fn default_mmap_advice() -> madvise::Advice {
     madvise::Advice::Random
 }
 
 /// Information of a peer in the cluster
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Anonymize, Debug, Serialize, JsonSchema, Clone)]
 pub struct PeerInfo {
     pub uri: String,
     // ToDo: How long ago was the last communication? In milliseconds
@@ -141,7 +144,8 @@ pub struct PeerInfo {
 }
 
 /// Summary information about the current raft state
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Anonymize, Clone)]
+#[anonymize(false)]
 pub struct RaftInfo {
     /// Raft divides time into terms of arbitrary length, each beginning with an election.
     /// If a candidate wins the election, it remains the leader for the rest of the term.
@@ -161,7 +165,7 @@ pub struct RaftInfo {
 }
 
 /// Role of the peer in the consensus
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, JsonSchema, Anonymize)]
 pub enum StateRole {
     // The node is a follower of the leader.
     Follower,
@@ -194,11 +198,13 @@ pub struct MessageSendErrors {
 }
 
 /// Description of enabled cluster
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
 pub struct ClusterInfo {
     /// ID of this peer
+    #[anonymize(false)]
     pub peer_id: PeerId,
     /// Peers composition of the cluster with main information
+    #[anonymize(with = anonymize_collection_with_u64_hashable_key)]
     pub peers: HashMap<PeerId, PeerInfo>,
     /// Status of the Raft consensus
     pub raft_info: RaftInfo,
@@ -206,11 +212,12 @@ pub struct ClusterInfo {
     pub consensus_thread_status: ConsensusThreadStatus,
     /// Consequent failures of message send operations in consensus by peer address.
     /// On the first success to send to that peer - entry is removed from this hashmap.
+    #[anonymize(false)]
     pub message_send_failures: HashMap<String, MessageSendErrors>,
 }
 
 /// Information about current cluster status and structure
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Anonymize, Clone)]
 #[serde(tag = "status")]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterStatus {
@@ -219,59 +226,12 @@ pub enum ClusterStatus {
 }
 
 /// Information about current consensus thread status
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Anonymize, Clone)]
 #[serde(tag = "consensus_thread_status")]
 #[serde(rename_all = "snake_case")]
+#[anonymize(false)]
 pub enum ConsensusThreadStatus {
     Working { last_update: DateTime<Utc> },
     Stopped,
     StoppedWithErr { err: String },
-}
-
-impl Anonymize for PeerInfo {
-    fn anonymize(&self) -> Self {
-        PeerInfo {
-            uri: self.uri.anonymize(),
-        }
-    }
-}
-
-impl Anonymize for RaftInfo {
-    fn anonymize(&self) -> Self {
-        RaftInfo {
-            term: self.term,
-            commit: self.commit,
-            pending_operations: self.pending_operations,
-            leader: self.leader,
-            role: self.role,
-            is_voter: self.is_voter,
-        }
-    }
-}
-
-impl Anonymize for ClusterInfo {
-    fn anonymize(&self) -> Self {
-        ClusterInfo {
-            peer_id: self.peer_id,
-            peers: self
-                .peers
-                .iter()
-                .map(|(key, value)| (*key, value.anonymize()))
-                .collect(),
-            raft_info: self.raft_info.anonymize(),
-            consensus_thread_status: self.consensus_thread_status.clone(),
-            message_send_failures: self.message_send_failures.clone(),
-        }
-    }
-}
-
-impl Anonymize for ClusterStatus {
-    fn anonymize(&self) -> Self {
-        match self {
-            ClusterStatus::Disabled => ClusterStatus::Disabled,
-            ClusterStatus::Enabled(cluster_info) => {
-                ClusterStatus::Enabled(cluster_info.anonymize())
-            }
-        }
-    }
 }

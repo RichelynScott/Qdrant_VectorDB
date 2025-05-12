@@ -6,9 +6,9 @@ use serde_json::Value;
 use smallvec::SmallVec;
 
 use crate::data_types::named_vectors::NamedVectors;
-use crate::data_types::vectors::Vector;
+use crate::data_types::vectors::VectorInternal;
 use crate::index::field_index::FieldIndex;
-use crate::types::PayloadKeyType;
+use crate::types::{PayloadKeyType, VectorNameBuf};
 
 pub type IndexesMap = HashMap<PayloadKeyType, Vec<FieldIndex>>;
 
@@ -47,8 +47,8 @@ pub fn merge_map(
     }
 }
 
-pub fn transpose_map_into_named_vector<TVector: Into<Vector>>(
-    map: HashMap<String, Vec<TVector>>,
+pub fn transpose_map_into_named_vector<TVector: Into<VectorInternal>>(
+    map: HashMap<VectorNameBuf, Vec<TVector>>,
 ) -> Vec<NamedVectors<'static>> {
     let mut result = Vec::new();
     for (key, values) in map {
@@ -90,7 +90,7 @@ impl<'de, T: Deserialize<'de>> MaybeOneOrMany<T> {
 }
 
 impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::SchemaObject;
 
         #[derive(JsonSchema)]
@@ -101,7 +101,7 @@ impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
             _None(()),
         }
 
-        let schema: SchemaObject = <OneOrMany<T>>::json_schema(gen).into();
+        let schema: SchemaObject = <OneOrMany<T>>::json_schema(generator).into();
         schema.into()
     }
 
@@ -116,7 +116,7 @@ impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
 
 #[cfg(test)]
 mod tests {
-    use schemars::{schema_for, JsonSchema};
+    use schemars::{JsonSchema, schema_for};
     use serde::{Deserialize, Serialize};
 
     use crate::common::utils::MaybeOneOrMany;
@@ -184,14 +184,16 @@ mod tests {
             _field: Option<Vec<String>>,
         }
 
-        let mut field_schema = dbg!(schemars::schema_for!(Test)
-            .schema
-            .object
-            .unwrap()
-            .properties
-            .remove("_field")
-            .unwrap()
-            .into_object());
+        let mut field_schema = dbg!(
+            schemars::schema_for!(Test)
+                .schema
+                .object
+                .unwrap()
+                .properties
+                .remove("_field")
+                .unwrap()
+                .into_object(),
+        );
 
         assert!(field_schema.subschemas.is_some());
 

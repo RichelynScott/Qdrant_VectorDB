@@ -1,10 +1,11 @@
+use common::counter::hardware_counter::HardwareCounterCell;
 use parking_lot::RwLock;
 use segment::types::SeqNumberType;
 
 use crate::collection_manager::holders::segment_holder::SegmentHolder;
 use crate::collection_manager::segments_updater::*;
-use crate::operations::types::CollectionResult;
 use crate::operations::CollectionUpdateOperations;
+use crate::operations::types::CollectionResult;
 
 /// Implementation of the update operation
 #[derive(Default)]
@@ -19,20 +20,17 @@ impl CollectionUpdater {
         match operation_result {
             Ok(_) => {
                 if !segments.read().failed_operation.is_empty() {
-                    let mut write_segments = segments.write();
-                    if write_segments.failed_operation.contains(&op_num) {
-                        // Failed operation successfully fixed
-                        write_segments.failed_operation.remove(&op_num);
-                    }
+                    // If this operation failed before, remove it because it got fixed now
+                    segments.write().failed_operation.remove(&op_num);
                 }
             }
             Err(collection_error) => {
                 if collection_error.is_transient() {
                     let mut write_segments = segments.write();
                     write_segments.failed_operation.insert(op_num);
-                    log::error!("Update operation failed: {}", collection_error)
+                    log::error!("Update operation failed: {collection_error}")
                 } else {
-                    log::warn!("Update operation declined: {}", collection_error)
+                    log::warn!("Update operation declined: {collection_error}")
                 }
             }
         }
@@ -42,21 +40,27 @@ impl CollectionUpdater {
         segments: &RwLock<SegmentHolder>,
         op_num: SeqNumberType,
         operation: CollectionUpdateOperations,
+        hw_counter: &HardwareCounterCell,
     ) -> CollectionResult<usize> {
         // Allow only one update at a time, ensure no data races between segments.
         // let _lock = self.update_lock.lock().unwrap();
+        let scroll_lock = segments.read().scroll_read_lock.clone();
+
+        // Use block_in_place here to avoid blocking the current async executor
+        let _scroll_lock = tokio::task::block_in_place(|| scroll_lock.blocking_write());
+
         let operation_result = match operation {
             CollectionUpdateOperations::PointOperation(point_operation) => {
-                process_point_operation(segments, op_num, point_operation)
+                process_point_operation(segments, op_num, point_operation, hw_counter)
             }
             CollectionUpdateOperations::VectorOperation(vector_operation) => {
-                process_vector_operation(segments, op_num, vector_operation)
+                process_vector_operation(segments, op_num, vector_operation, hw_counter)
             }
             CollectionUpdateOperations::PayloadOperation(payload_operation) => {
-                process_payload_operation(segments, op_num, payload_operation)
+                process_payload_operation(segments, op_num, payload_operation, hw_counter)
             }
             CollectionUpdateOperations::FieldIndexOperation(index_operation) => {
-                process_field_index_operation(segments, op_num, &index_operation)
+                process_field_index_operation(segments, op_num, &index_operation, hw_counter)
             }
         };
 
@@ -68,16 +72,18 @@ impl CollectionUpdater {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
+    use common::counter::hardware_accumulator::HwMeasurementAcc;
     use itertools::Itertools;
     use parking_lot::RwLockUpgradableReadGuard;
     use segment::data_types::vectors::{
-        only_default_vector, VectorStructInternal, DEFAULT_VECTOR_NAME,
+        DEFAULT_VECTOR_NAME, VectorStructInternal, only_default_vector,
     };
     use segment::entry::entry_point::SegmentEntry;
     use segment::json_path::JsonPath;
+    use segment::payload_json;
     use segment::types::PayloadSchemaType::Keyword;
     use segment::types::{Payload, PayloadContainer, PayloadFieldSchema, WithPayload};
     use serde_json::json;
@@ -91,7 +97,9 @@ mod tests {
     use crate::collection_manager::segments_searcher::SegmentsSearcher;
     use crate::collection_manager::segments_updater::upsert_points;
     use crate::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
-    use crate::operations::point_ops::{PointOperations, PointStruct};
+    use crate::operations::point_ops::{
+        PointOperations, PointStructPersisted, VectorStructPersisted,
+    };
 
     #[test]
     fn test_sync_ops() {
@@ -104,40 +112,49 @@ mod tests {
         let vec13 = only_default_vector(&[1.0, 0.0, 1.0, 1.0]);
 
         let points = vec![
-            PointStruct {
+            PointStructPersisted {
                 id: 11.into(),
-                vector: VectorStructInternal::from(vec11).into(),
+                vector: VectorStructPersisted::from(VectorStructInternal::from(vec11)),
                 payload: None,
             },
-            PointStruct {
+            PointStructPersisted {
                 id: 12.into(),
-                vector: VectorStructInternal::from(vec12).into(),
+                vector: VectorStructPersisted::from(VectorStructInternal::from(vec12)),
                 payload: None,
             },
-            PointStruct {
+            PointStructPersisted {
                 id: 13.into(),
-                vector: VectorStructInternal::from(vec13).into(),
-                payload: Some(json!({ "color": "red" }).into()),
+                vector: VectorStructPersisted::from(VectorStructInternal::from(vec13)),
+                payload: Some(payload_json! { "color": "red" }),
             },
-            PointStruct {
+            PointStructPersisted {
                 id: 14.into(),
-                vector: VectorStructInternal::from(vec![0., 0., 0., 0.]).into(),
+                vector: VectorStructPersisted::Single(vec![0., 0., 0., 0.]),
                 payload: None,
             },
-            PointStruct {
+            PointStructPersisted {
                 id: 500.into(),
-                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
+                vector: VectorStructPersisted::Single(vec![2., 0., 2., 0.]),
                 payload: None,
             },
         ];
 
-        let (num_deleted, num_new, num_updated) =
-            sync_points(&segments.read(), 100, Some(10.into()), None, &points).unwrap();
+        let hw_counter = HardwareCounterCell::new();
+
+        let (num_deleted, num_new, num_updated) = sync_points(
+            &segments.read(),
+            100,
+            Some(10.into()),
+            None,
+            &points,
+            &hw_counter,
+        )
+        .unwrap();
 
         assert_eq!(num_deleted, 1); // delete point 15
         assert_eq!(num_new, 1); // insert point 500
         assert_eq!(num_updated, 2); // upsert point 13 and 14 as it has updated data
-                                    // points 11 and 12 are not updated as they are same as before
+        // points 11 and 12 are not updated as they are same as before
     }
 
     #[test]
@@ -147,19 +164,21 @@ mod tests {
 
         let segments = build_test_holder(dir.path());
         let points = vec![
-            PointStruct {
+            PointStructPersisted {
                 id: 1.into(),
-                vector: VectorStructInternal::from(vec![2., 2., 2., 2.]).into(),
+                vector: VectorStructPersisted::Single(vec![2., 2., 2., 2.]),
                 payload: None,
             },
-            PointStruct {
+            PointStructPersisted {
                 id: 500.into(),
-                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
+                vector: VectorStructPersisted::Single(vec![2., 0., 2., 0.]),
                 payload: None,
             },
         ];
 
-        let res = upsert_points(&segments.read(), 100, &points);
+        let hw_counter = HardwareCounterCell::new();
+
+        let res = upsert_points(&segments.read(), 100, &points, &hw_counter);
         assert!(matches!(res, Ok(1)));
 
         let segments = Arc::new(segments);
@@ -169,6 +188,7 @@ mod tests {
             &WithPayload::from(true),
             &true.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -195,15 +215,17 @@ mod tests {
             PointOperations::DeletePoints {
                 ids: vec![500.into()],
             },
+            &hw_counter,
         )
         .unwrap();
 
         let records = SegmentsSearcher::retrieve_blocking(
-            segments.clone(),
+            segments,
             &[1.into(), 2.into(), 500.into()],
             &WithPayload::from(true),
             &true.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -224,6 +246,8 @@ mod tests {
 
         let points = vec![1.into(), 2.into(), 3.into()];
 
+        let hw_counter = HardwareCounterCell::new();
+
         process_payload_operation(
             &segments,
             100,
@@ -233,6 +257,7 @@ mod tests {
                 filter: None,
                 key: None,
             }),
+            &hw_counter,
         )
         .unwrap();
 
@@ -243,6 +268,7 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -269,6 +295,7 @@ mod tests {
                 keys: vec!["color".parse().unwrap(), "empty".parse().unwrap()],
                 filter: None,
             }),
+            &hw_counter,
         )
         .unwrap();
 
@@ -278,6 +305,7 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -294,6 +322,7 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -308,6 +337,7 @@ mod tests {
             PayloadOps::ClearPayload {
                 points: vec![2.into()],
             },
+            &hw_counter,
         )
         .unwrap();
         let res = SegmentsSearcher::retrieve_blocking(
@@ -316,6 +346,7 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -333,12 +364,15 @@ mod tests {
         let meta_key_path = JsonPath::new("meta");
         let nested_key_path: JsonPath = JsonPath::new("meta.color");
 
+        let hw_counter = HardwareCounterCell::new();
+
         let mut segment1 = build_segment_1(path);
         segment1
             .create_field_index(
                 100,
                 &nested_key_path,
                 Some(&PayloadFieldSchema::FieldType(Keyword)),
+                &hw_counter,
             )
             .unwrap();
 
@@ -348,6 +382,7 @@ mod tests {
                 101,
                 &nested_key_path,
                 Some(&PayloadFieldSchema::FieldType(Keyword)),
+                &hw_counter,
             )
             .unwrap();
 
@@ -373,6 +408,7 @@ mod tests {
                 filter: None,
                 key: Some(meta_key_path.clone()),
             }),
+            &hw_counter,
         )
         .unwrap();
 
@@ -382,6 +418,7 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()
@@ -434,15 +471,17 @@ mod tests {
                 filter: None,
                 key: Some(meta_key_path.clone()),
             }),
+            &hw_counter,
         )
         .unwrap();
 
         let res = SegmentsSearcher::retrieve_blocking(
-            segments.clone(),
+            segments,
             &points,
             &WithPayload::from(true),
             &false.into(),
             &is_stopped,
+            HwMeasurementAcc::new(),
         )
         .unwrap()
         .into_values()

@@ -3,6 +3,7 @@ pub mod types;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::Future;
 use itertools::Itertools;
 use segment::types::{PointIdType, WithPayloadInterface, WithVector};
@@ -12,7 +13,9 @@ use types::PseudoId;
 use crate::collection::Collection;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
-use crate::operations::types::{CollectionError, CollectionResult, PointRequestInternal, Record};
+use crate::operations::types::{
+    CollectionError, CollectionResult, PointRequestInternal, RecordInternal,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithLookup {
@@ -33,14 +36,15 @@ pub async fn lookup_ids<'a, F, Fut>(
     read_consistency: Option<ReadConsistency>,
     shard_selection: &ShardSelectorInternal,
     timeout: Option<Duration>,
-) -> CollectionResult<HashMap<PseudoId, Record>>
+    hw_measurement_acc: HwMeasurementAcc,
+) -> CollectionResult<HashMap<PseudoId, RecordInternal>>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
 {
     let collection = collection_by_name(request.collection_name.clone())
         .await
-        .ok_or(CollectionError::NotFound {
+        .ok_or_else(|| CollectionError::NotFound {
             what: format!("Collection {}", request.collection_name),
         })?;
 
@@ -60,7 +64,13 @@ where
     };
 
     let result = collection
-        .retrieve(point_request, read_consistency, shard_selection, timeout)
+        .retrieve(
+            point_request,
+            read_consistency,
+            shard_selection,
+            timeout,
+            hw_measurement_acc,
+        )
         .await?
         .into_iter()
         .map(|point| (PseudoId::from(point.id), point))

@@ -1,27 +1,33 @@
 use collection::collection::Collection;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
-use collection::operations::point_ops::{Batch, WriteOrdering};
-use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
 use collection::operations::CollectionUpdateOperations;
+use collection::operations::point_ops::WriteOrdering;
+use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
 use itertools::Itertools;
-use rand::distributions::Uniform;
-use rand::rngs::ThreadRng;
 use rand::Rng;
+use rand::distr::Uniform;
+use rand::rngs::ThreadRng;
 use segment::data_types::vectors::DenseVector;
 use segment::json_path::JsonPath;
-use segment::types::{Filter, Payload, WithPayloadInterface, WithVector};
+use segment::types::{Filter, WithPayloadInterface, WithVector};
 use serde_json::json;
 
 use crate::common::simple_collection_fixture;
 
 fn rand_dense_vector(rng: &mut ThreadRng, size: usize) -> DenseVector {
-    rng.sample_iter(Uniform::new(0.4, 0.6)).take(size).collect()
+    rng.sample_iter(Uniform::new(0.4, 0.6).unwrap())
+        .take(size)
+        .collect()
 }
 
 mod group_by {
     use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
-    use segment::data_types::vectors::BatchVectorStructInternal;
+    use collection::operations::point_ops::{
+        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    };
+    use common::counter::hardware_accumulator::HwMeasurementAcc;
+    use segment::payload_json;
 
     use super::*;
 
@@ -31,7 +37,7 @@ mod group_by {
     }
 
     async fn setup(docs: u64, chunks: u64) -> Resources {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let source = SourceRequest::Search(SearchRequestInternal {
             vector: vec![0.5, 0.5, 0.5, 0.5].into(),
@@ -53,31 +59,35 @@ mod group_by {
 
         let collection = simple_collection_fixture(collection_dir.path(), 1).await;
 
-        let insert_points = CollectionUpdateOperations::PointOperation(
-            Batch {
-                ids: (0..docs * chunks).map(|x| x.into()).collect_vec(),
-                vectors: BatchVectorStructInternal::from(
-                    (0..docs * chunks)
-                        .map(|_| rand_dense_vector(&mut rng, 4))
-                        .collect_vec(),
-                )
-                .into(),
-                payloads: (0..docs)
-                    .flat_map(|x| {
-                        (0..chunks).map(move |_| {
-                            Some(Payload::from(
-                                json!({ "docId": x , "other_stuff": x.to_string() + "foo" }),
-                            ))
-                        })
+        let batch = BatchPersisted {
+            ids: (0..docs * chunks).map(|x| x.into()).collect_vec(),
+            vectors: BatchVectorStructPersisted::Single(
+                (0..docs * chunks)
+                    .map(|_| rand_dense_vector(&mut rng, 4))
+                    .collect_vec(),
+            ),
+            payloads: (0..docs)
+                .flat_map(|x| {
+                    (0..chunks).map(move |_| {
+                        Some(payload_json! { "docId": x , "other_stuff": x.to_string() + "foo" })
                     })
-                    .collect_vec()
-                    .into(),
-            }
-            .into(),
+                })
+                .collect_vec()
+                .into(),
+        };
+
+        let insert_points = CollectionUpdateOperations::PointOperation(
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
         );
 
+        let hw_counter = HwMeasurementAcc::new();
         let insert_result = collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(
+                insert_points,
+                true,
+                WriteOrdering::default(),
+                hw_counter.clone(),
+            )
             .await
             .expect("insert failed");
 
@@ -93,10 +103,12 @@ mod group_by {
     async fn searching() {
         let resources = setup(16, 8).await;
 
+        let hw_acc = HwMeasurementAcc::new();
         let group_by = GroupBy::new(
             resources.request.clone(),
             &resources.collection,
             |_| async { unreachable!() },
+            hw_acc,
         );
 
         let result = group_by.execute().await;
@@ -147,9 +159,13 @@ mod group_by {
             2,
         );
 
-        let group_by = GroupBy::new(request.clone(), &resources.collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            request.clone(),
+            &resources.collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -207,9 +223,13 @@ mod group_by {
             3,
         );
 
-        let group_by = GroupBy::new(group_by_request, &resources.collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request,
+            &resources.collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -239,9 +259,13 @@ mod group_by {
             3,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &resources.collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &resources.collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -277,9 +301,13 @@ mod group_by {
             3,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -313,9 +341,13 @@ mod group_by {
             0,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -345,9 +377,13 @@ mod group_by {
             3,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -377,9 +413,13 @@ mod group_by {
             3,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -413,9 +453,13 @@ mod group_by {
             400,
         );
 
-        let group_by = GroupBy::new(group_by_request.clone(), &collection, |_| async {
-            unreachable!()
-        });
+        let hw_acc = HwMeasurementAcc::new();
+        let group_by = GroupBy::new(
+            group_by_request.clone(),
+            &collection,
+            |_| async { unreachable!() },
+            hw_acc,
+        );
 
         let result = group_by.execute().await;
 
@@ -433,13 +477,16 @@ mod group_by {
 
 /// Tests out the different features working together. The individual features are already tested in other places.
 mod group_by_builder {
-
     use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
-    use collection::lookup::types::PseudoId;
     use collection::lookup::WithLookup;
-    use segment::data_types::vectors::BatchVectorStructInternal;
+    use collection::lookup::types::PseudoId;
+    use collection::operations::point_ops::{
+        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    };
+    use common::counter::hardware_accumulator::HwMeasurementAcc;
     use segment::json_path::JsonPath;
+    use segment::payload_json;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -454,7 +501,7 @@ mod group_by_builder {
 
     /// Sets up two collections: one for chunks and one for docs.
     async fn setup(docs: u64, chunks_per_doc: u64) -> Resources {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let source_request = SourceRequest::Search(SearchRequestInternal {
             vector: vec![0.5, 0.5, 0.5, 0.5].into(),
@@ -473,30 +520,36 @@ mod group_by_builder {
         let collection_dir = tempfile::Builder::new().prefix("chunks").tempdir().unwrap();
         let collection = simple_collection_fixture(collection_dir.path(), 1).await;
 
+        let hw_counter = HwMeasurementAcc::new();
+
         // insert chunk points
         {
-            let insert_points = CollectionUpdateOperations::PointOperation(
-                Batch {
-                    ids: (0..docs * chunks_per_doc).map(|x| x.into()).collect_vec(),
-                    vectors: BatchVectorStructInternal::from(
-                        (0..docs * chunks_per_doc)
-                            .map(|_| rand_dense_vector(&mut rng, 4))
-                            .collect_vec(),
-                    )
+            let batch = BatchPersisted {
+                ids: (0..docs * chunks_per_doc).map(|x| x.into()).collect_vec(),
+                vectors: BatchVectorStructPersisted::Single(
+                    (0..docs * chunks_per_doc)
+                        .map(|_| rand_dense_vector(&mut rng, 4))
+                        .collect_vec(),
+                ),
+                payloads: (0..docs)
+                    .flat_map(|x| {
+                        (0..chunks_per_doc).map(move |_| Some(payload_json! {"docId": x}))
+                    })
+                    .collect_vec()
                     .into(),
-                    payloads: (0..docs)
-                        .flat_map(|x| {
-                            (0..chunks_per_doc)
-                                .map(move |_| Some(Payload::from(json!({ "docId": x }))))
-                        })
-                        .collect_vec()
-                        .into(),
-                }
-                .into(),
+            };
+
+            let insert_points = CollectionUpdateOperations::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
             );
 
             let insert_result = collection
-                .update_from_client_simple(insert_points, true, WriteOrdering::default())
+                .update_from_client_simple(
+                    insert_points,
+                    true,
+                    WriteOrdering::default(),
+                    hw_counter.clone(),
+                )
                 .await
                 .expect("insert failed");
 
@@ -508,28 +561,29 @@ mod group_by_builder {
 
         // insert doc points
         {
-            let insert_points = CollectionUpdateOperations::PointOperation(
-                Batch {
-                    ids: (0..docs).map(|x| x.into()).collect_vec(),
-                    vectors: BatchVectorStructInternal::from(
-                        (0..docs)
-                            .map(|_| rand_dense_vector(&mut rng, 4))
-                            .collect_vec(),
-                    )
+            let batch = BatchPersisted {
+                ids: (0..docs).map(|x| x.into()).collect_vec(),
+                vectors: BatchVectorStructPersisted::Single(
+                    (0..docs)
+                        .map(|_| rand_dense_vector(&mut rng, 4))
+                        .collect_vec(),
+                ),
+                payloads: (0..docs)
+                    .map(|x| Some(payload_json! {"docId": x, "body": format!("{x} {BODY_TEXT}")}))
+                    .collect_vec()
                     .into(),
-                    payloads: (0..docs)
-                        .map(|x| {
-                            Some(Payload::from(
-                                json!({ "docId": x, "body": format!("{x} {BODY_TEXT}") }),
-                            ))
-                        })
-                        .collect_vec()
-                        .into(),
-                }
-                .into(),
+            };
+
+            let insert_points = CollectionUpdateOperations::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
             );
             let insert_result = lookup_collection
-                .update_from_client_simple(insert_points, true, WriteOrdering::default())
+                .update_from_client_simple(
+                    insert_points,
+                    true,
+                    WriteOrdering::default(),
+                    hw_counter.clone(),
+                )
                 .await
                 .expect("insert failed");
 
@@ -555,7 +609,8 @@ mod group_by_builder {
 
         let collection_by_name = |_: String| async { unreachable!() };
 
-        let result = GroupBy::new(request.clone(), &collection, collection_by_name)
+        let hw_acc = HwMeasurementAcc::new();
+        let result = GroupBy::new(request.clone(), &collection, collection_by_name, hw_acc)
             .execute()
             .await;
 
@@ -588,7 +643,8 @@ mod group_by_builder {
 
         let collection_by_name = |_: String| async { Some(lookup_collection.read().await) };
 
-        let result = GroupBy::new(request.clone(), &collection, collection_by_name)
+        let hw_acc = HwMeasurementAcc::new();
+        let result = GroupBy::new(request.clone(), &collection, collection_by_name, hw_acc)
             .execute()
             .await;
 

@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{future, TryFutureExt};
+use ahash::{AHashMap, AHashSet};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use futures::{TryFutureExt, future};
 use itertools::{Either, Itertools};
-use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     ExtendedPointId, Filter, Order, ScoredPoint, WithPayloadInterface, WithVector,
 };
@@ -18,12 +18,14 @@ use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 
 impl Collection {
+    #[cfg(feature = "testing")]
     pub async fn search(
         &self,
         request: CoreSearchRequest,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         if request.limit == 0 {
             return Ok(vec![]);
@@ -33,7 +35,13 @@ impl Collection {
             searches: vec![request],
         };
         let results = self
-            .do_core_search_batch(request_batch, read_consistency, shard_selection, timeout)
+            .do_core_search_batch(
+                request_batch,
+                read_consistency,
+                shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await?;
         Ok(results.into_iter().next().unwrap())
     }
@@ -44,26 +52,22 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let start = Instant::now();
         // shortcuts batch if all requests with limit=0
         if request.searches.iter().all(|s| s.limit == 0) {
             return Ok(vec![]);
         }
-        // A factor which determines if we need to use the 2-step search or not
-        // Should be adjusted based on usage statistics.
-        const PAYLOAD_TRANSFERS_FACTOR_THRESHOLD: usize = 10;
 
         let is_payload_required = request
             .searches
             .iter()
-            .all(|s| s.with_payload.clone().is_some_and(|p| p.is_required()));
-        let with_vectors = request.searches.iter().all(|s| {
-            s.with_vector
-                .as_ref()
-                .map(|wv| wv.is_enabled())
-                .unwrap_or(false)
-        });
+            .all(|s| s.with_payload.as_ref().is_some_and(|p| p.is_required()));
+        let with_vectors = request
+            .searches
+            .iter()
+            .all(|s| s.with_vector.as_ref().is_some_and(|wv| wv.is_enabled()));
 
         let metadata_required = is_payload_required || with_vectors;
 
@@ -75,8 +79,8 @@ impl Collection {
         // Actually used number of records.
         let used_transfers = sum_limits;
 
-        let is_required_transfer_large_enough =
-            require_transfers > used_transfers * PAYLOAD_TRANSFERS_FACTOR_THRESHOLD;
+        let is_required_transfer_large_enough = require_transfers
+            > used_transfers.saturating_mul(super::query::PAYLOAD_TRANSFERS_FACTOR_THRESHOLD);
 
         if metadata_required && is_required_transfer_large_enough {
             // If there is a significant offset, we need to retrieve the whole result
@@ -86,8 +90,12 @@ impl Collection {
             let mut without_payload_requests = Vec::with_capacity(request.searches.len());
             for search in &request.searches {
                 let mut without_payload_request = search.clone();
-                without_payload_request.with_payload = None;
-                without_payload_request.with_vector = None;
+                without_payload_request
+                    .with_payload
+                    .replace(WithPayloadInterface::Bool(false));
+                without_payload_request
+                    .with_vector
+                    .replace(WithVector::Bool(false));
                 without_payload_requests.push(without_payload_request);
             }
             let without_payload_batch = CoreSearchRequestBatch {
@@ -99,13 +107,14 @@ impl Collection {
                     read_consistency,
                     &shard_selection,
                     timeout,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
             // update timeout
             let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
             let filled_results = without_payload_results
                 .into_iter()
-                .zip(request.clone().searches.into_iter())
+                .zip(request.searches.into_iter())
                 .map(|(without_payload_result, req)| {
                     self.fill_search_result_with_payload(
                         without_payload_result,
@@ -114,12 +123,19 @@ impl Collection {
                         read_consistency,
                         &shard_selection,
                         timeout,
+                        hw_measurement_acc.clone(),
                     )
                 });
             future::try_join_all(filled_results).await
         } else {
             let result = self
-                .do_core_search_batch(request, read_consistency, &shard_selection, timeout)
+                .do_core_search_batch(
+                    request,
+                    read_consistency,
+                    &shard_selection,
+                    timeout,
+                    hw_measurement_acc,
+                )
                 .await?;
             Ok(result)
         }
@@ -131,6 +147,7 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let request = Arc::new(request);
 
@@ -140,14 +157,15 @@ impl Collection {
         let all_searches_res = {
             let shard_holder = self.shards_holder.read().await;
             let target_shards = shard_holder.select_shards(shard_selection)?;
-            let all_searches = target_shards.iter().map(|(shard, shard_key)| {
+            let all_searches = target_shards.into_iter().map(|(shard, shard_key)| {
                 let shard_key = shard_key.cloned();
                 shard
                     .core_search(
-                        Arc::clone(&request),
+                        request.clone(),
                         read_consistency,
                         shard_selection.is_shard_id(),
                         timeout,
+                        hw_measurement_acc.clone(),
                     )
                     .and_then(move |mut records| async move {
                         if shard_key.is_none() {
@@ -167,7 +185,7 @@ impl Collection {
         let result = self
             .merge_from_shards(
                 all_searches_res,
-                Arc::clone(&request),
+                request.clone(),
                 !shard_selection.is_shard_id(),
             )
             .await;
@@ -179,6 +197,7 @@ impl Collection {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fill_search_result_with_payload(
         &self,
         search_result: Vec<ScoredPoint>,
@@ -187,6 +206,7 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         // short-circuit if not needed
         if let (&Some(WithPayloadInterface::Bool(false)), &WithVector::Bool(false)) =
@@ -208,9 +228,16 @@ impl Collection {
             with_vector,
         };
         let retrieved_records = self
-            .retrieve(retrieve_request, read_consistency, shard_selection, timeout)
+            .retrieve(
+                retrieve_request,
+                read_consistency,
+                shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await?;
-        let mut records_map: HashMap<ExtendedPointId, Record> = retrieved_records
+
+        let mut records_map: AHashMap<ExtendedPointId, RecordInternal> = retrieved_records
             .into_iter()
             .map(|rec| (rec.id, rec))
             .collect();
@@ -222,7 +249,7 @@ impl Collection {
                 // So we just filter out them.
                 records_map.remove(&scored_point.id).map(|record| {
                     scored_point.payload = record.payload;
-                    scored_point.vector = record.vector.map(VectorStructInternal::from);
+                    scored_point.vector = record.vector;
                     scored_point
                 })
             })
@@ -242,7 +269,7 @@ impl Collection {
 
         // Merge results from shards in order and deduplicate based on point ID
         let mut top_results: Vec<Vec<ScoredPoint>> = Vec::with_capacity(batch_size);
-        let mut seen_ids = HashSet::new();
+        let mut seen_ids = AHashSet::new();
 
         for (batch_index, request) in request.searches.iter().enumerate() {
             let order = if request.query.is_distance_scored() {
@@ -289,7 +316,7 @@ impl Collection {
         duration: Duration,
         filters: impl IntoIterator<Item = Option<&'a Filter>>,
     ) {
-        if duration > segment::problems::UnindexedField::slow_query_threshold() {
+        if duration > crate::problems::UnindexedField::slow_query_threshold() {
             let filters = filters.into_iter().flatten().cloned().collect_vec();
 
             let schema = self.payload_index_schema.read().schema.clone();

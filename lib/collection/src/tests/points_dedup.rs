@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use api::rest::{OrderByInterface, VectorStruct};
-use common::cpu::CpuBudget;
-use rand::{thread_rng, Rng};
-use segment::data_types::vectors::NamedVectorStruct;
+use api::rest::OrderByInterface;
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use rand::{Rng, rng};
+use segment::data_types::vectors::NamedQuery;
 use segment::types::{
     Distance, ExtendedPointId, Payload, PayloadFieldSchema, PayloadSchemaType, SearchParams,
 };
@@ -13,8 +14,10 @@ use serde_json::{Map, Value};
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
-use crate::config::{CollectionConfig, CollectionParams, WalConfig};
-use crate::operations::point_ops::{PointInsertOperationsInternal, PointOperations, PointStruct};
+use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use crate::operations::point_ops::{
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+};
 use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
@@ -26,7 +29,7 @@ use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
-use crate::shards::replica_set::{AbortShardTransfer, ChangePeerState, ReplicaState};
+use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
 use crate::shards::shard::{PeerId, ShardId};
 
 const DIM: u64 = 4;
@@ -49,13 +52,14 @@ async fn fixture() -> Collection {
         ..CollectionParams::empty()
     };
 
-    let config = CollectionConfig {
+    let config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: OptimizersConfig::fixture(),
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
+        uuid: None,
     };
 
     let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
@@ -77,13 +81,14 @@ async fn fixture() -> Collection {
         &config,
         storage_config.clone(),
         CollectionShardDistribution { shards },
+        None,
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await
@@ -94,6 +99,7 @@ async fn fixture() -> Collection {
         .create_payload_index(
             "num".parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to create payload index");
@@ -101,34 +107,34 @@ async fn fixture() -> Collection {
     // Insert two points into all shards directly, a point matching the shard ID, and point 100
     // We insert into all shards directly to prevent spreading points by the hashring
     // We insert the same point into multiple shards on purpose
-    let mut rng = thread_rng();
+    let mut rng = rng();
     for (shard_id, shard) in collection.shards_holder().write().await.get_shards() {
         let op = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
-                PointStruct {
-                    id: u64::from(*shard_id).into(),
-                    vector: VectorStruct::Single(
-                        (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
+                PointStructPersisted {
+                    id: u64::from(shard_id).into(),
+                    vector: VectorStructPersisted::Single(
+                        (0..DIM).map(|_| rng.random_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
-                        Value::from(-(*shard_id as i32)),
+                        Value::from(-(shard_id as i32)),
                     )]))),
                 },
-                PointStruct {
+                PointStructPersisted {
                     id: DUPLICATE_POINT_ID,
-                    vector: VectorStruct::Single(
-                        (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
+                    vector: VectorStructPersisted::Single(
+                        (0..DIM).map(|_| rng.random_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
-                        Value::from(100 - *shard_id as i32),
+                        Value::from(100 - shard_id as i32),
                     )]))),
                 },
             ])),
         ));
         shard
-            .update_local(op, true)
+            .update_local(op, true, HwMeasurementAcc::new(), false)
             .await
             .expect("failed to insert points");
     }
@@ -136,7 +142,7 @@ async fn fixture() -> Collection {
     // Activate all shards
     for shard_id in 0..SHARD_COUNT {
         collection
-            .set_shard_replica_state(shard_id as ShardId, PEER_ID, ReplicaState::Active, None)
+            .set_shard_replica_state(shard_id, PEER_ID, ReplicaState::Active, None)
             .await
             .expect("failed to active shard");
     }
@@ -162,6 +168,7 @@ async fn test_scroll_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
@@ -189,17 +196,21 @@ async fn test_scroll_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
     assert!(!result.points.is_empty(), "expected some points");
 
     let mut seen = HashSet::new();
-    for point_id in result.points.iter().map(|point| point.id) {
+    for record in result.points.iter() {
         assert!(
-            seen.insert(point_id),
-            "got point id {point_id:?} more than once, they should be deduplicated",
+            seen.insert((record.id, record.order_value)),
+            "got point id {:?} with order value {:?} more than once, they should be deduplicated",
+            record.id,
+            record.order_value,
         );
+        assert!(record.order_value.is_some());
     }
 }
 
@@ -220,6 +231,7 @@ async fn test_retrieve_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
@@ -238,10 +250,11 @@ async fn test_retrieve_dedup() {
 async fn test_search_dedup() {
     let collection = fixture().await;
 
+    let hw_acc = HwMeasurementAcc::new();
     let points = collection
         .search(
             CoreSearchRequest {
-                query: QueryEnum::Nearest(NamedVectorStruct::Default(vec![0.1, 0.2, 0.3, 0.4])),
+                query: QueryEnum::Nearest(NamedQuery::default_dense(vec![0.1, 0.2, 0.3, 0.4])),
                 filter: None,
                 params: Some(SearchParams {
                     exact: true,
@@ -256,6 +269,7 @@ async fn test_search_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            hw_acc,
         )
         .await
         .expect("failed to search");
@@ -270,8 +284,8 @@ async fn test_search_dedup() {
     }
 }
 
-pub fn dummy_on_replica_failure() -> ChangePeerState {
-    Arc::new(move |_peer_id, _shard_id| {})
+pub fn dummy_on_replica_failure() -> ChangePeerFromState {
+    Arc::new(move |_peer_id, _shard_id, _from_state| {})
 }
 
 pub fn dummy_request_shard_transfer() -> RequestShardTransfer {

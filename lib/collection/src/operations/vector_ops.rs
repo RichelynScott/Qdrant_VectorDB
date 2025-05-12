@@ -1,49 +1,23 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use api::rest::PointVectors;
 use api::rest::schema::ShardKeySelector;
 use schemars::JsonSchema;
-use segment::types::{Filter, PointIdType};
+use segment::types::{Filter, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::Validate;
 
-use super::point_ops::PointIdsList;
-use super::{point_to_shards, split_iter_by_shard, OperationToShard, SplitByShard};
+use super::point_ops::{PointIdsList, VectorStructPersisted};
+use super::{OperationToShard, SplitByShard, point_to_shards, split_iter_by_shard};
 use crate::hash_ring::HashRingRouter;
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
-pub struct UpdateVectors {
-    /// Points with named vectors
-    #[validate(nested)]
-    #[validate(length(min = 1, message = "must specify points to update"))]
-    pub points: Vec<PointVectors>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shard_key: Option<ShardKeySelector>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
-pub struct PointVectors {
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct PointVectorsPersisted {
     /// Point id
     pub id: PointIdType,
     /// Vectors
-    #[serde(alias = "vectors")]
-    pub vector: api::rest::VectorStruct,
-}
-
-impl Validate for PointVectors {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        if self.vector.is_empty() {
-            let mut err = ValidationError::new("length");
-            err.message = Some(Cow::from("must specify vectors to update for point"));
-            err.add_param(Cow::from("min"), &1);
-            let mut errors = ValidationErrors::new();
-            errors.add("vector", err);
-            Err(errors)
-        } else {
-            self.vector.validate()
-        }
-    }
+    pub vector: VectorStructPersisted,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate)]
@@ -55,17 +29,15 @@ pub struct DeleteVectors {
     /// Vector names
     #[serde(alias = "vectors")]
     #[validate(length(min = 1, message = "must specify vector names to delete"))]
-    pub vector: HashSet<String>,
+    pub vector: HashSet<VectorNameBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct UpdateVectorsOp {
     /// Points with named vectors
-    #[validate(nested)]
-    #[validate(length(min = 1, message = "must specify points to update"))]
-    pub points: Vec<PointVectors>,
+    pub points: Vec<PointVectorsPersisted>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, EnumDiscriminants)]
@@ -75,9 +47,9 @@ pub enum VectorOperations {
     /// Update vectors
     UpdateVectors(UpdateVectorsOp),
     /// Delete vectors if exists
-    DeleteVectors(PointIdsList, Vec<String>),
+    DeleteVectors(PointIdsList, Vec<VectorNameBuf>),
     /// Delete vectors by given filter criteria
-    DeleteVectorsByFilter(Filter, Vec<String>),
+    DeleteVectorsByFilter(Filter, Vec<VectorNameBuf>),
 }
 
 impl VectorOperations {
@@ -89,11 +61,11 @@ impl VectorOperations {
         }
     }
 
-    pub fn point_ids(&self) -> Vec<PointIdType> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
-            Self::UpdateVectors(op) => op.points.iter().map(|point| point.id).collect(),
-            Self::DeleteVectors(points, _) => points.points.clone(),
-            Self::DeleteVectorsByFilter(_, _) => Vec::new(),
+            Self::UpdateVectors(op) => Some(op.points.iter().map(|point| point.id).collect()),
+            Self::DeleteVectors(points, _) => Some(points.points.clone()),
+            Self::DeleteVectorsByFilter(_, _) => None,
         }
     }
 
@@ -105,16 +77,6 @@ impl VectorOperations {
             Self::UpdateVectors(op) => op.points.retain(|point| filter(&point.id)),
             Self::DeleteVectors(points, _) => points.points.retain(filter),
             Self::DeleteVectorsByFilter(_, _) => (),
-        }
-    }
-}
-
-impl Validate for VectorOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            VectorOperations::UpdateVectors(update_vectors) => update_vectors.validate(),
-            VectorOperations::DeleteVectors(..) => Ok(()),
-            VectorOperations::DeleteVectorsByFilter(..) => Ok(()),
         }
     }
 }
@@ -139,7 +101,7 @@ impl SplitByShard for VectorOperations {
                     })
                     .fold(
                         HashMap::new(),
-                        |mut map: HashMap<u32, Vec<PointVectors>>, (shard_id, points)| {
+                        |mut map: HashMap<u32, Vec<PointVectorsPersisted>>, (shard_id, points)| {
                             map.entry(shard_id).or_default().push(points);
                             map
                         },

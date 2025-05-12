@@ -1,9 +1,9 @@
 use std::cmp::min;
 use std::env;
-use std::io::{stdout, IsTerminal};
+use std::io::{IsTerminal, stdout};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use api::grpc::models::get_git_commit_id;
+use api::rest::models::get_git_commit_id;
 use colored::{Color, ColoredString, Colorize};
 
 use crate::settings::Settings;

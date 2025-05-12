@@ -1,9 +1,9 @@
-use std::collections::HashSet;
-
+use ahash::AHashSet;
 use common::types::PointOffsetType;
 
-use crate::types::{FieldCondition, IsEmptyCondition, IsNullCondition};
+use crate::types::{FieldCondition, VectorNameBuf};
 
+pub mod bool_index;
 pub(super) mod facet_index;
 mod field_index_base;
 pub mod full_text_index;
@@ -14,10 +14,9 @@ mod immutable_point_to_values;
 pub mod index_selector;
 pub mod map_index;
 mod mmap_point_to_values;
+pub mod null_index;
 pub mod numeric_index;
 mod stat_tools;
-
-pub mod binary_index;
 #[cfg(test)]
 mod tests;
 mod utils;
@@ -25,12 +24,10 @@ mod utils;
 pub use field_index_base::*;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum PrimaryCondition {
-    Condition(FieldCondition),
-    IsEmpty(IsEmptyCondition),
-    IsNull(IsNullCondition),
-    Ids(HashSet<PointOffsetType>),
+    Condition(Box<FieldCondition>),
+    Ids(AHashSet<PointOffsetType>),
+    HasVector(VectorNameBuf),
 }
 
 #[derive(Debug, Clone)]

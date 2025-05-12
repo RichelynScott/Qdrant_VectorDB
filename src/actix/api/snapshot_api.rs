@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use actix_multipart::form::tempfile::TempFile;
 use actix_multipart::form::MultipartForm;
-use actix_web::{delete, get, post, put, web, HttpRequest, HttpResponse, Responder, Result};
+use actix_multipart::form::tempfile::TempFile;
+use actix_web::{Responder, Result, delete, get, post, put, web};
 use actix_web_validator as valid;
 use collection::common::file_utils::move_file;
 use collection::common::sha_256::{hash_file, hashes_equal};
@@ -58,18 +58,16 @@ pub struct SnapshottingForm {
 
 // Actix specific code
 pub async fn do_get_full_snapshot(
-    req: HttpRequest,
     toc: &TableOfContent,
     access: Access,
     snapshot_name: &str,
 ) -> Result<SnapshotStream, HttpError> {
     access.check_global_access(AccessRequirements::new())?;
     let snapshots_storage_manager = toc.get_snapshots_storage_manager()?;
-    let snapshot_path = snapshots_storage_manager
-        .get_full_snapshot_path(toc.snapshots_path(), snapshot_name)
-        .await?;
+    let snapshot_path =
+        snapshots_storage_manager.get_full_snapshot_path(toc.snapshots_path(), snapshot_name)?;
     let snapshot_stream = snapshots_storage_manager
-        .get_snapshot_stream(req, &snapshot_path)
+        .get_snapshot_stream(&snapshot_path)
         .await?;
     Ok(snapshot_stream)
 }
@@ -93,10 +91,7 @@ pub async fn do_save_uploaded_snapshot(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let collection_snapshot_path = toc.snapshots_path_for_collection(collection_name);
     if !collection_snapshot_path.exists() {
-        log::debug!(
-            "Creating missing collection snapshots directory for {}",
-            collection_name
-        );
+        log::debug!("Creating missing collection snapshots directory for {collection_name}");
         toc.create_snapshots_path(collection_name).await?;
     }
 
@@ -118,22 +113,20 @@ pub async fn do_save_uploaded_snapshot(
 
 // Actix specific code
 pub async fn do_get_snapshot(
-    req: HttpRequest,
     toc: &TableOfContent,
     access: Access,
     collection_name: &str,
     snapshot_name: &str,
 ) -> Result<SnapshotStream, HttpError> {
-    let collection_pass =
-        access.check_collection_access(collection_name, AccessRequirements::new().whole())?;
+    let collection_pass = access
+        .check_collection_access(collection_name, AccessRequirements::new().whole().extras())?;
     let collection: tokio::sync::RwLockReadGuard<collection::collection::Collection> =
         toc.get_collection(&collection_pass).await?;
     let snapshot_storage_manager = collection.get_snapshots_storage_manager()?;
-    let snapshot_path = snapshot_storage_manager
-        .get_snapshot_path(collection.snapshots_path(), snapshot_name)
-        .await?;
+    let snapshot_path =
+        snapshot_storage_manager.get_snapshot_path(collection.snapshots_path(), snapshot_name)?;
     let snapshot_stream = snapshot_storage_manager
-        .get_snapshot_stream(req, &snapshot_path)
+        .get_snapshot_stream(&snapshot_path)
         .await?;
     Ok(snapshot_stream)
 }
@@ -260,7 +253,6 @@ async fn recover_from_snapshot(
 
 #[get("/collections/{name}/snapshots/{snapshot_name}")]
 async fn get_snapshot(
-    req: HttpRequest,
     dispatcher: web::Data<Dispatcher>,
     path: web::Path<(String, String)>,
     ActixAccess(access): ActixAccess,
@@ -270,7 +262,6 @@ async fn get_snapshot(
 
     let (collection_name, snapshot_name) = path.into_inner();
     do_get_snapshot(
-        req,
         dispatcher.toc(&access, &pass),
         access,
         &collection_name,
@@ -306,7 +297,6 @@ async fn create_full_snapshot(
 
 #[get("/snapshots/{snapshot_name}")]
 async fn get_full_snapshot(
-    req: HttpRequest,
     dispatcher: web::Data<Dispatcher>,
     path: web::Path<String>,
     ActixAccess(access): ActixAccess,
@@ -315,7 +305,7 @@ async fn get_full_snapshot(
     let pass = new_unchecked_verification_pass();
 
     let snapshot_name = path.into_inner();
-    do_get_full_snapshot(req, dispatcher.toc(&access, &pass), access, &snapshot_name).await
+    do_get_full_snapshot(dispatcher.toc(&access, &pass), access, &snapshot_name).await
 }
 
 #[delete("/snapshots/{snapshot_name}")]
@@ -403,20 +393,18 @@ async fn stream_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
     path: web::Path<(String, ShardId)>,
     ActixAccess(access): ActixAccess,
-) -> Result<impl Responder, HttpError> {
+) -> Result<SnapshotStream, HttpError> {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
     let (collection, shard) = path.into_inner();
-    let stream = common::snapshots::stream_shard_snapshot(
+    Ok(common::snapshots::stream_shard_snapshot(
         dispatcher.toc(&access, &pass).clone(),
         access,
         collection,
         shard,
     )
-    .await?;
-
-    Ok(HttpResponse::Ok().streaming(stream))
+    .await?)
 }
 
 // TODO: `PUT` (same as `recover_from_snapshot`) or `POST`!?
@@ -521,7 +509,6 @@ async fn upload_shard_snapshot(
 
 #[get("/collections/{collection}/shards/{shard}/snapshots/{snapshot}")]
 async fn download_shard_snapshot(
-    req: HttpRequest,
     dispatcher: web::Data<Dispatcher>,
     path: web::Path<(String, ShardId, String)>,
     ActixAccess(access): ActixAccess,
@@ -531,22 +518,20 @@ async fn download_shard_snapshot(
 
     let (collection, shard, snapshot) = path.into_inner();
     let collection_pass =
-        access.check_collection_access(&collection, AccessRequirements::new().whole())?;
+        access.check_collection_access(&collection, AccessRequirements::new().whole().extras())?;
     let collection = dispatcher
         .toc(&access, &pass)
         .get_collection(&collection_pass)
         .await?;
     let snapshots_storage_manager = collection.get_snapshots_storage_manager()?;
-    let snapshot_path = snapshots_storage_manager
-        .get_shard_snapshot_path(
-            collection.shards_holder(),
-            shard,
-            collection.snapshots_path(),
-            &snapshot,
-        )
+    let snapshot_path = collection
+        .shards_holder()
+        .read()
+        .await
+        .get_shard_snapshot_path(collection.snapshots_path(), shard, &snapshot)
         .await?;
     let snapshot_stream = snapshots_storage_manager
-        .get_snapshot_stream(req, &snapshot_path)
+        .get_snapshot_stream(&snapshot_path)
         .await?;
     Ok(snapshot_stream)
 }

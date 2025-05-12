@@ -1,4 +1,4 @@
-use actix_web::{post, web, Responder};
+use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::CountRequest;
@@ -9,8 +9,9 @@ use tokio::time::Instant;
 use super::CollectionPath;
 use crate::actix::api::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
-use crate::actix::helpers::{self, process_response_error};
-use crate::common::points::do_count_points;
+use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
+use crate::common::query::do_count_points;
+use crate::settings::ServiceConfig;
 
 #[post("/collections/{name}/points/count")]
 async fn count_points(
@@ -18,6 +19,7 @@ async fn count_points(
     collection: Path<CollectionPath>,
     request: Json<CountRequest>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
 ) -> impl Responder {
     let CountRequest {
@@ -35,7 +37,7 @@ async fn count_points(
     .await
     {
         Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
+        Err(err) => return process_response_error(err, Instant::now(), None),
     };
 
     let shard_selector = match shard_key {
@@ -43,7 +45,16 @@ async fn count_points(
         Some(shard_keys) => ShardSelectorInternal::from(shard_keys),
     };
 
-    helpers::time(do_count_points(
+    let request_hw_counter = get_request_hardware_counter(
+        &dispatcher,
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+
+    let timing = Instant::now();
+
+    let result = do_count_points(
         dispatcher.toc(&access, &pass),
         &collection.name,
         count_request,
@@ -51,6 +62,9 @@ async fn count_points(
         params.timeout(),
         shard_selector,
         access,
-    ))
-    .await
+        request_hw_counter.get_counter(),
+    )
+    .await;
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }

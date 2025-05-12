@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use actix_web::{post, web, Responder};
+use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     RecommendGroupsRequest, RecommendRequest, RecommendRequestBatch,
 };
-use futures_util::TryFutureExt;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::types::ScoredPoint;
 use storage::content_manager::collection_verification::{
@@ -19,10 +19,11 @@ use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 use tokio::time::Instant;
 
-use super::read_params::ReadParams;
 use super::CollectionPath;
+use super::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
-use crate::actix::helpers::{self, process_response_error};
+use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
+use crate::settings::ServiceConfig;
 
 #[post("/collections/{name}/points/recommend")]
 async fn recommend_points(
@@ -30,6 +31,7 @@ async fn recommend_points(
     collection: Path<CollectionPath>,
     request: Json<RecommendRequest>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
 ) -> impl Responder {
     let RecommendRequest {
@@ -47,7 +49,7 @@ async fn recommend_points(
     .await
     {
         Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
+        Err(err) => return process_response_error(err, Instant::now(), None),
     };
 
     let shard_selection = match shard_key {
@@ -55,25 +57,35 @@ async fn recommend_points(
         Some(shard_keys) => shard_keys.into(),
     };
 
-    helpers::time(
-        dispatcher
-            .toc(&access, &pass)
-            .recommend(
-                &collection.name,
-                recommend_request,
-                params.consistency,
-                shard_selection,
-                access,
-                params.timeout(),
-            )
-            .map_ok(|scored_points| {
-                scored_points
-                    .into_iter()
-                    .map(api::rest::ScoredPoint::from)
-                    .collect_vec()
-            }),
-    )
-    .await
+    let request_hw_counter = get_request_hardware_counter(
+        &dispatcher,
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+
+    let timing = Instant::now();
+
+    let result = dispatcher
+        .toc(&access, &pass)
+        .recommend(
+            &collection.name,
+            recommend_request,
+            params.consistency,
+            shard_selection,
+            access,
+            params.timeout(),
+            request_hw_counter.get_counter(),
+        )
+        .await
+        .map(|scored_points| {
+            scored_points
+                .into_iter()
+                .map(api::rest::ScoredPoint::from)
+                .collect_vec()
+        });
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
 async fn do_recommend_batch_points(
@@ -83,6 +95,7 @@ async fn do_recommend_batch_points(
     read_consistency: Option<ReadConsistency>,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = request
         .searches
@@ -97,8 +110,15 @@ async fn do_recommend_batch_points(
         })
         .collect();
 
-    toc.recommend_batch(collection_name, requests, read_consistency, access, timeout)
-        .await
+    toc.recommend_batch(
+        collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+        hw_measurement_acc,
+    )
+    .await
 }
 
 #[post("/collections/{name}/points/recommend/batch")]
@@ -107,6 +127,7 @@ async fn recommend_batch_points(
     collection: Path<CollectionPath>,
     request: Json<RecommendRequestBatch>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
 ) -> impl Responder {
     let pass = match check_strict_mode_batch(
@@ -119,31 +140,40 @@ async fn recommend_batch_points(
     .await
     {
         Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
+        Err(err) => return process_response_error(err, Instant::now(), None),
     };
 
-    helpers::time(
-        do_recommend_batch_points(
-            dispatcher.toc(&access, &pass),
-            &collection.name,
-            request.into_inner(),
-            params.consistency,
-            access,
-            params.timeout(),
-        )
-        .map_ok(|batch_scored_points| {
-            batch_scored_points
-                .into_iter()
-                .map(|scored_points| {
-                    scored_points
-                        .into_iter()
-                        .map(api::rest::ScoredPoint::from)
-                        .collect_vec()
-                })
-                .collect_vec()
-        }),
+    let request_hw_counter = get_request_hardware_counter(
+        &dispatcher,
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+    let timing = Instant::now();
+
+    let result = do_recommend_batch_points(
+        dispatcher.toc(&access, &pass),
+        &collection.name,
+        request.into_inner(),
+        params.consistency,
+        access,
+        params.timeout(),
+        request_hw_counter.get_counter(),
     )
     .await
+    .map(|batch_scored_points| {
+        batch_scored_points
+            .into_iter()
+            .map(|scored_points| {
+                scored_points
+                    .into_iter()
+                    .map(api::rest::ScoredPoint::from)
+                    .collect_vec()
+            })
+            .collect_vec()
+    });
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
 #[post("/collections/{name}/points/recommend/groups")]
@@ -152,6 +182,7 @@ async fn recommend_point_groups(
     collection: Path<CollectionPath>,
     request: Json<RecommendGroupsRequest>,
     params: Query<ReadParams>,
+    service_config: web::Data<ServiceConfig>,
     ActixAccess(access): ActixAccess,
 ) -> impl Responder {
     let RecommendGroupsRequest {
@@ -169,7 +200,7 @@ async fn recommend_point_groups(
     .await
     {
         Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now()),
+        Err(err) => return process_response_error(err, Instant::now(), None),
     };
 
     let shard_selection = match shard_key {
@@ -177,7 +208,15 @@ async fn recommend_point_groups(
         Some(shard_keys) => shard_keys.into(),
     };
 
-    helpers::time(crate::common::points::do_recommend_point_groups(
+    let request_hw_counter = get_request_hardware_counter(
+        &dispatcher,
+        collection.name.clone(),
+        service_config.hardware_reporting(),
+        None,
+    );
+    let timing = Instant::now();
+
+    let result = crate::common::query::do_recommend_point_groups(
         dispatcher.toc(&access, &pass),
         &collection.name,
         recommend_group_request,
@@ -185,8 +224,11 @@ async fn recommend_point_groups(
         shard_selection,
         access,
         params.timeout(),
-    ))
-    .await
+        request_hw_counter.get_counter(),
+    )
+    .await;
+
+    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
 }
 // Configure services
 pub fn config_recommend_api(cfg: &mut web::ServiceConfig) {

@@ -1,10 +1,12 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use bitvec::slice::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
+use memory::fadvise::clear_disk_cache;
 use quantization::encoded_vectors_binary::{EncodedBinVector, EncodedVectorsBin};
 use quantization::{
     EncodedQueryPQ, EncodedQueryU8, EncodedVectors, EncodedVectorsPQ, EncodedVectorsU8,
@@ -12,8 +14,8 @@ use quantization::{
 use serde::{Deserialize, Serialize};
 
 use super::quantized_multivector_storage::{
-    create_offsets_file_from_iter, MultivectorOffset, MultivectorOffsetsStorage,
-    MultivectorOffsetsStorageMmap, QuantizedMultivectorStorage,
+    MultivectorOffset, MultivectorOffsetsStorage, MultivectorOffsetsStorageMmap,
+    QuantizedMultivectorStorage, create_offsets_file_from_iter,
 };
 use super::quantized_scorer_builder::QuantizedScorerBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -103,6 +105,25 @@ pub enum QuantizedVectorStorage {
     BinaryMmapMulti(BinaryMmapMulti),
 }
 
+impl QuantizedVectorStorage {
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            QuantizedVectorStorage::ScalarRam(_) => false,
+            QuantizedVectorStorage::ScalarMmap(_) => true,
+            QuantizedVectorStorage::PQRam(_) => false,
+            QuantizedVectorStorage::PQMmap(_) => true,
+            QuantizedVectorStorage::BinaryRam(_) => false,
+            QuantizedVectorStorage::BinaryMmap(_) => true,
+            QuantizedVectorStorage::ScalarRamMulti(_) => false,
+            QuantizedVectorStorage::ScalarMmapMulti(_) => true,
+            QuantizedVectorStorage::PQRamMulti(_) => false,
+            QuantizedVectorStorage::PQMmapMulti(_) => true,
+            QuantizedVectorStorage::BinaryRamMulti(_) => false,
+            QuantizedVectorStorage::BinaryMmapMulti(_) => true,
+        }
+    }
+}
+
 impl fmt::Debug for QuantizedVectorStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("QuantizedVectorStorage").finish()
@@ -148,7 +169,7 @@ impl QuantizedVectors {
         query: QueryVector,
         point_deleted: &'a BitSlice,
         vec_deleted: &'a BitSlice,
-        is_stopped: &'a AtomicBool,
+        hardware_counter: HardwareCounterCell,
     ) -> OperationResult<Box<dyn RawScorer + 'a>> {
         QuantizedScorerBuilder::new(
             &self.storage_impl,
@@ -156,9 +177,9 @@ impl QuantizedVectors {
             query,
             point_deleted,
             vec_deleted,
-            is_stopped,
             &self.distance,
             self.datatype,
+            hardware_counter,
         )
         .build()
     }
@@ -211,6 +232,10 @@ impl QuantizedVectors {
         files
     }
 
+    pub fn versioned_files(&self) -> Vec<(PathBuf, u64)> {
+        Vec::new() // TODO
+    }
+
     pub fn create(
         vector_storage: &VectorStorageEnum,
         quantization_config: &QuantizationConfig,
@@ -256,6 +281,7 @@ impl QuantizedVectors {
                 Self::create_impl(v.as_ref(), quantization_config, path, max_threads, stopped)
             }
             VectorStorageEnum::SparseSimple(_) => Err(OperationError::WrongSparse),
+            VectorStorageEnum::SparseMmap(_) => Err(OperationError::WrongSparse),
             VectorStorageEnum::MultiDenseSimple(v) => {
                 Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
             }
@@ -619,7 +645,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -634,7 +660,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     scalar_config.quantile,
-                    || stopped.load(Ordering::Relaxed),
+                    stopped,
                 )?,
             ))
         }
@@ -662,7 +688,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             Ok(QuantizedVectorStorage::ScalarRamMulti(
                 QuantizedMultivectorStorage::new(
@@ -684,7 +710,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
@@ -724,7 +750,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -739,7 +765,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         }
     }
@@ -772,7 +798,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             Ok(QuantizedVectorStorage::PQRamMulti(
                 QuantizedMultivectorStorage::new(
@@ -795,7 +821,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
@@ -827,9 +853,7 @@ impl QuantizedVectors {
             let mut storage_builder = ChunkedVectors::<u8>::new(quantized_vector_size);
             storage_builder.try_set_capacity_exact(vector_parameters.count)?;
             Ok(QuantizedVectorStorage::BinaryRam(
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?,
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?,
             ))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -839,9 +863,7 @@ impl QuantizedVectors {
                 quantized_vector_size,
             )?;
             Ok(QuantizedVectorStorage::BinaryMmap(
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?,
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?,
             ))
         }
     }
@@ -866,9 +888,7 @@ impl QuantizedVectors {
             let mut storage_builder = ChunkedVectors::<u8>::new(quantized_vector_size);
             storage_builder.try_set_capacity_exact(vector_parameters.count)?;
             let quantized_storage =
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?;
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?;
             Ok(QuantizedVectorStorage::BinaryRamMulti(
                 QuantizedMultivectorStorage::new(
                     vector_parameters.dim,
@@ -885,9 +905,7 @@ impl QuantizedVectors {
                 quantized_vector_size,
             )?;
             let quantized_storage =
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?;
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
             Ok(QuantizedVectorStorage::BinaryMmapMulti(
@@ -931,5 +949,38 @@ impl QuantizedVectors {
             CompressionRatio::X32 => 8,
             CompressionRatio::X64 => 16,
         }
+    }
+
+    pub fn get_storage(&self) -> &QuantizedVectorStorage {
+        &self.storage_impl
+    }
+
+    pub fn populate(&self) -> OperationResult<()> {
+        match &self.storage_impl {
+            QuantizedVectorStorage::ScalarRam(_) => {} // not mmap
+            QuantizedVectorStorage::ScalarMmap(storage) => storage.storage().populate(),
+            QuantizedVectorStorage::PQRam(_) => {}
+            QuantizedVectorStorage::PQMmap(storage) => storage.storage().populate(),
+            QuantizedVectorStorage::BinaryRam(_) => {}
+            QuantizedVectorStorage::BinaryMmap(storage) => storage.storage().populate(),
+            QuantizedVectorStorage::ScalarRamMulti(_) => {}
+            QuantizedVectorStorage::ScalarMmapMulti(storage) => {
+                storage.storage().storage().populate()
+            }
+            QuantizedVectorStorage::PQRamMulti(_) => {}
+            QuantizedVectorStorage::PQMmapMulti(storage) => storage.storage().storage().populate(),
+            QuantizedVectorStorage::BinaryRamMulti(_) => {}
+            QuantizedVectorStorage::BinaryMmapMulti(storage) => {
+                storage.storage().storage().populate()
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        for file in self.files() {
+            clear_disk_cache(&file)?;
+        }
+        Ok(())
     }
 }

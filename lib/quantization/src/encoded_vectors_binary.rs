@@ -1,10 +1,13 @@
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use io::file_operations::atomic_save_json;
+use memory::mmap_ops::{transmute_from_u8_to_slice, transmute_to_u8_slice};
 use serde::{Deserialize, Serialize};
 
 use crate::encoded_vectors::validate_vector_parameters;
-use crate::utils::{transmute_from_u8_to_slice, transmute_to_u8_slice};
 use crate::{
     DistanceType, EncodedStorage, EncodedStorageBuilder, EncodedVectors, EncodingError,
     VectorParameters,
@@ -164,16 +167,20 @@ impl BitsStoreType for u128 {
 impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     EncodedVectorsBin<TBitsStoreType, TStorage>
 {
+    pub fn storage(&self) -> &TStorage {
+        &self.encoded_vectors
+    }
+
     pub fn encode<'a>(
         orig_data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone,
         mut storage_builder: impl EncodedStorageBuilder<TStorage>,
         vector_parameters: &VectorParameters,
-        stop_condition: impl Fn() -> bool,
+        stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         debug_assert!(validate_vector_parameters(orig_data.clone(), vector_parameters).is_ok());
 
         for vector in orig_data {
-            if stop_condition() {
+            if stopped.load(Ordering::Relaxed) {
                 return Err(EncodingError::Stopped);
             }
 
@@ -253,6 +260,19 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             (DistanceType::L1 | DistanceType::L2, false) => xor_product - zeros_count,
         }
     }
+
+    pub fn get_quantized_vector(&self, i: u32) -> &[u8] {
+        self.encoded_vectors
+            .get_vector_data(i as _, self.get_quantized_vector_size())
+    }
+
+    pub fn get_vector_parameters(&self) -> &VectorParameters {
+        &self.metadata.vector_parameters
+    }
+
+    pub fn vectors_count(&self) -> usize {
+        self.metadata.vector_parameters.count
+    }
 }
 
 impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
@@ -260,9 +280,8 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     for EncodedVectorsBin<TBitsStoreType, TStorage>
 {
     fn save(&self, data_path: &Path, meta_path: &Path) -> std::io::Result<()> {
-        let metadata_bytes = serde_json::to_vec(&self.metadata)?;
         meta_path.parent().map(std::fs::create_dir_all);
-        std::fs::write(meta_path, metadata_bytes)?;
+        atomic_save_json(meta_path, &self.metadata)?;
 
         data_path.parent().map(std::fs::create_dir_all);
         self.encoded_vectors.save_to_file(data_path)?;
@@ -287,21 +306,37 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         Ok(result)
     }
 
+    fn is_on_disk(&self) -> bool {
+        self.encoded_vectors.is_on_disk()
+    }
+
     fn encode_query(&self, query: &[f32]) -> EncodedBinVector<TBitsStoreType> {
         debug_assert!(query.len() == self.metadata.vector_parameters.dim);
         Self::encode_vector(query)
     }
 
-    fn score_point(&self, query: &EncodedBinVector<TBitsStoreType>, i: u32) -> f32 {
+    fn score_point(
+        &self,
+        query: &EncodedBinVector<TBitsStoreType>,
+        i: u32,
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
         let vector_data_1 = self
             .encoded_vectors
             .get_vector_data(i as _, self.get_quantized_vector_size());
+
+        hw_counter.vector_io_read().incr_delta(vector_data_1.len());
+
         let vector_data_usize_1 = transmute_from_u8_to_slice(vector_data_1);
+
+        hw_counter
+            .cpu_counter()
+            .incr_delta(query.encoded_vector.len());
 
         self.calculate_metric(vector_data_usize_1, &query.encoded_vector)
     }
 
-    fn score_internal(&self, i: u32, j: u32) -> f32 {
+    fn score_internal(&self, i: u32, j: u32, hw_counter: &HardwareCounterCell) -> f32 {
         let vector_data_1 = self
             .encoded_vectors
             .get_vector_data(i as _, self.get_quantized_vector_size());
@@ -309,15 +344,23 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             .encoded_vectors
             .get_vector_data(j as _, self.get_quantized_vector_size());
 
+        hw_counter
+            .vector_io_read()
+            .incr_delta(vector_data_1.len() + vector_data_2.len());
+
         let vector_data_usize_1 = transmute_from_u8_to_slice(vector_data_1);
         let vector_data_usize_2 = transmute_from_u8_to_slice(vector_data_2);
+
+        hw_counter
+            .cpu_counter()
+            .incr_delta(vector_data_usize_2.len());
 
         self.calculate_metric(vector_data_usize_1, vector_data_usize_2)
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-extern "C" {
+unsafe extern "C" {
     fn impl_xor_popcnt_sse_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
 
     fn impl_xor_popcnt_sse_uint64(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
@@ -326,9 +369,9 @@ extern "C" {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-extern "C" {
+unsafe extern "C" {
     fn impl_xor_popcnt_neon_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32)
-        -> u32;
+    -> u32;
 
     fn impl_xor_popcnt_neon_uint64(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
 }

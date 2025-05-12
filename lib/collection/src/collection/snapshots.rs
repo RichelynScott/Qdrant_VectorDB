@@ -3,9 +3,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use common::tar_ext::BuilderExt;
-use futures::Stream;
 use io::file_operations::read_json;
 use io::storage_version::StorageVersion as _;
 use segment::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
@@ -13,10 +11,11 @@ use segment::types::SnapshotFormat;
 use tokio::sync::OwnedRwLockReadGuard;
 
 use super::Collection;
-use crate::collection::payload_index_schema::PAYLOAD_INDEX_CONFIG_FILE;
 use crate::collection::CollectionVersion;
+use crate::collection::payload_index_schema::PAYLOAD_INDEX_CONFIG_FILE;
+use crate::common::snapshot_stream::SnapshotStream;
 use crate::common::snapshots_manager::SnapshotStorageManager;
-use crate::config::{CollectionConfig, ShardingMethod, COLLECTION_CONFIG_FILE};
+use crate::config::{COLLECTION_CONFIG_FILE, CollectionConfigInternal, ShardingMethod};
 use crate::operations::snapshot_ops::SnapshotDescription;
 use crate::operations::types::{CollectionError, CollectionResult, NodeType};
 use crate::shards::local_shard::LocalShard;
@@ -24,14 +23,13 @@ use crate::shards::remote_shard::RemoteShard;
 use crate::shards::replica_set::ShardReplicaSet;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_config::{self, ShardConfig};
-use crate::shards::shard_holder::{
-    shard_not_found_error, ShardHolder, ShardKeyMapping, SHARD_KEY_MAPPING_FILE,
-};
-use crate::shards::shard_versioning;
+use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
+use crate::shards::shard_holder::{SHARD_KEY_MAPPING_FILE, ShardHolder, shard_not_found_error};
+use crate::shards::shard_path;
 
 impl Collection {
     pub fn get_snapshots_storage_manager(&self) -> CollectionResult<SnapshotStorageManager> {
-        SnapshotStorageManager::new(self.shared_storage_config.snapshots_config.clone())
+        SnapshotStorageManager::new(&self.shared_storage_config.snapshots_config)
     }
 
     pub async fn list_snapshots(&self) -> CollectionResult<Vec<SnapshotDescription>> {
@@ -65,11 +63,7 @@ impl Collection {
 
         // Final location of snapshot
         let snapshot_path = self.snapshots_path.join(&snapshot_name);
-        log::info!(
-            "Creating collection snapshot {} into {:?}",
-            snapshot_name,
-            snapshot_path
-        );
+        log::info!("Creating collection snapshot {snapshot_name} into {snapshot_path:?}");
 
         // Dedicated temporary file for archiving this snapshot (deleted on drop)
         let snapshot_temp_arc_file = tempfile::Builder::new()
@@ -100,8 +94,7 @@ impl Collection {
             let shards_holder = self.shards_holder.read().await;
             // Create snapshot of each shard
             for (shard_id, replica_set) in shards_holder.get_shards() {
-                let shard_snapshot_path =
-                    shard_versioning::versioned_shard_path(Path::new(""), *shard_id, 0);
+                let shard_snapshot_path = shard_path(Path::new(""), shard_id);
 
                 // If node is listener, we can save whatever currently is in the storage
                 let save_wal = self.shared_storage_config.node_type != NodeType::Listener;
@@ -171,7 +164,7 @@ impl Collection {
         let mut ar = open_snapshot_archive_with_validation(snapshot_path)?;
         ar.unpack(target_dir)?;
 
-        let config = CollectionConfig::load(target_dir)?;
+        let config = CollectionConfigInternal::load(target_dir)?;
         config.validate_and_warn();
         let configured_shards = config.params.shard_number.get();
 
@@ -188,11 +181,7 @@ impl Collection {
                     Vec::new()
                 } else {
                     let shard_key_mapping: ShardKeyMapping = read_json(&mapping_path)?;
-                    shard_key_mapping
-                        .values()
-                        .flat_map(|v| v.iter())
-                        .copied()
-                        .collect()
+                    shard_key_mapping.shard_ids()
                 }
             }
         };
@@ -205,7 +194,7 @@ impl Collection {
         );
 
         for shard_id in shard_ids_list {
-            let shard_path = shard_versioning::versioned_shard_path(target_dir, shard_id, 0);
+            let shard_path = shard_path(target_dir, shard_id);
             let shard_config_opt = ShardConfig::load(&shard_path)?;
             if let Some(shard_config) = shard_config_opt {
                 match shard_config.r#type {
@@ -214,13 +203,11 @@ impl Collection {
                         RemoteShard::restore_snapshot(&shard_path)
                     }
                     shard_config::ShardType::Temporary => {}
-                    shard_config::ShardType::ReplicaSet { .. } => {
-                        ShardReplicaSet::restore_snapshot(
-                            &shard_path,
-                            this_peer_id,
-                            is_distributed,
-                        )?
-                    }
+                    shard_config::ShardType::ReplicaSet => ShardReplicaSet::restore_snapshot(
+                        &shard_path,
+                        this_peer_id,
+                        is_distributed,
+                    )?,
                 }
             } else {
                 return Err(CollectionError::service_error(format!(
@@ -248,11 +235,14 @@ impl Collection {
 
         // `ShardHolder::recover_local_shard_from` is *not* cancel safe
         // (see `ShardReplicaSet::restore_local_replica_from`)
-        self.shards_holder
+        let res = self
+            .shards_holder
             .read()
             .await
-            .recover_local_shard_from(snapshot_shard_path, shard_id, cancel)
-            .await
+            .recover_local_shard_from(snapshot_shard_path, &self.path, shard_id, cancel)
+            .await?;
+
+        Ok(res)
     }
 
     pub async fn list_shard_snapshots(
@@ -282,10 +272,10 @@ impl Collection {
         &self,
         shard_id: ShardId,
         temp_dir: &Path,
-    ) -> CollectionResult<impl Stream<Item = std::io::Result<Bytes>>> {
+    ) -> CollectionResult<SnapshotStream> {
         let shard = OwnedRwLockReadGuard::try_map(
             Arc::clone(&self.shards_holder).read_owned().await,
-            |x| x.get_shard(&shard_id),
+            |x| x.get_shard(shard_id),
         )
         .map_err(|_| shard_not_found_error(shard_id))?;
 
@@ -315,6 +305,7 @@ impl Collection {
             .await
             .restore_shard_snapshot(
                 snapshot_path,
+                &self.path,
                 &self.name(),
                 shard_id,
                 this_peer_id,
@@ -330,6 +321,5 @@ impl Collection {
             .read()
             .await
             .assert_shard_exists(shard_id)
-            .await
     }
 }

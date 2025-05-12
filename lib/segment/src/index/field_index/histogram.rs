@@ -56,25 +56,13 @@ pub trait Numericable: Num + PartialEq + PartialOrd + Copy {
     fn from_f64(x: f64) -> Self;
     fn from_u128(x: u128) -> Self;
     fn min(self, b: Self) -> Self {
-        if self < b {
-            self
-        } else {
-            b
-        }
+        if self < b { self } else { b }
     }
     fn max(self, b: Self) -> Self {
-        if self > b {
-            self
-        } else {
-            b
-        }
+        if self > b { self } else { b }
     }
     fn abs_diff(self, b: Self) -> Self {
-        if self > b {
-            self - b
-        } else {
-            b - self
-        }
+        if self > b { self - b } else { b - self }
     }
 }
 
@@ -383,7 +371,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
 
         let (to_remove, to_create, removed) = match &mut close_neighbors {
             (None, None) => (None, None, false), // histogram is empty
-            (Some((left_border, ref mut left_border_count)), None) => {
+            (Some((left_border, left_border_count)), None) => {
                 if left_border == val {
                     // ....|
                     // ...|
@@ -394,9 +382,8 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     } else {
                         // ...|..|
                         // ...|.|
-                        match &mut far_left_neighbor {
-                            Some((_fln, ref mut fln_count)) => fln_count.right -= 1,
-                            None => {}
+                        if let Some((_fln, fln_count)) = &mut far_left_neighbor {
+                            fln_count.right -= 1
                         }
                         let (new_border, new_border_count) = (
                             left_neighbour(left_border).unwrap(),
@@ -415,7 +402,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     (None, None, false)
                 }
             }
-            (None, Some((right_border, ref mut right_border_count))) => {
+            (None, Some((right_border, right_border_count))) => {
                 if right_border == val {
                     // |...
                     //  |..
@@ -426,9 +413,8 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     } else {
                         // |..|...
                         //  |.|...
-                        match &mut far_right_neighbor {
-                            Some((_frn, ref mut frn_count)) => frn_count.left -= 1,
-                            None => {}
+                        if let Some((_frn, frn_count)) = &mut far_right_neighbor {
+                            frn_count.left -= 1
                         }
                         let (new_border, new_border_count) = (
                             right_neighbour(right_border).unwrap(),
@@ -447,10 +433,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     (None, None, false)
                 }
             }
-            (
-                Some((left_border, ref mut left_border_count)),
-                Some((right_border, ref mut right_border_count)),
-            ) => {
+            (Some((left_border, left_border_count)), Some((right_border, right_border_count))) => {
                 // ...|...x.|...
                 if left_border == val {
                     // ...|....|...
@@ -466,12 +449,9 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     {
                         // ...|.l..r...
                         // ...|. ..r...
-                        match &mut far_left_neighbor {
-                            Some((_fln, ref mut fln_count)) => {
-                                fln_count.right += right_border_count.left;
-                                right_border_count.left = fln_count.right;
-                            }
-                            None => {}
+                        if let Some((_fln, fln_count)) = &mut far_left_neighbor {
+                            fln_count.right += right_border_count.left;
+                            right_border_count.left = fln_count.right;
                         }
                         (Some(left_border.clone()), None, true)
                     } else {
@@ -505,12 +485,9 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     {
                         // ...l..r.|...
                         // ...l.. .|...
-                        match &mut far_right_neighbor {
-                            Some((_frn, ref mut frn_count)) => {
-                                frn_count.left += left_border_count.right;
-                                left_border_count.right = frn_count.left;
-                            }
-                            None => {}
+                        if let Some((_frn, frn_count)) = &mut far_right_neighbor {
+                            frn_count.left += left_border_count.right;
+                            left_border_count.right = frn_count.left;
                         }
                         (Some(right_border.clone()), None, true)
                     } else {
@@ -624,11 +601,8 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                 } else {
                     // x|.....|...
                     // |......|...
-                    match &mut far_right_neighbor {
-                        Some((_frn, frn_count)) => {
-                            frn_count.left = new_count;
-                        }
-                        None => {}
+                    if let Some((_frn, frn_count)) = &mut far_right_neighbor {
+                        frn_count.left = new_count;
                     }
                     (
                         Some(right_border.clone()),
@@ -655,9 +629,8 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                 } else {
                     // ...|.....|x
                     // ...|......|
-                    match &mut far_left_neighbor {
-                        Some((_fln, ref mut fln_count)) => fln_count.right = new_count,
-                        None => {}
+                    if let Some((_fln, fln_count)) = &mut far_left_neighbor {
+                        fln_count.right = new_count
                     }
                     (
                         Some(left_border.clone()),
@@ -666,9 +639,6 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                 }
             }
             (Some((left_border, left_border_count)), Some((right_border, right_border_count))) => {
-                if left_border_count.right != right_border_count.left {
-                    eprintln!("error");
-                }
                 assert_eq!(left_border_count.right, right_border_count.left);
                 let new_count = left_border_count.right + 1;
 
@@ -694,13 +664,9 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                             //we can move
                             //  ...|..x.........|...
                             //  ....|.x.........|...
-                            match &mut far_left_neighbor {
-                                Some((_fln, ref mut fln_count)) => {
-                                    fln_count.right = new_border_count.left
-                                }
-                                None => {}
+                            if let Some((_fln, fln_count)) = &mut far_left_neighbor {
+                                fln_count.right = new_border_count.left
                             }
-
                             (
                                 Some(left_border.clone()),
                                 Some((new_border, new_border_count)),
@@ -730,9 +696,8 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                             // it's ok, we can move
                             //  1: ...|........x...|...
                             //  2: ...|........x..|....
-                            match &mut far_right_neighbor {
-                                Some((_frn, frn_count)) => frn_count.left = new_border_count.right,
-                                None => {}
+                            if let Some((_frn, frn_count)) = &mut far_right_neighbor {
+                                frn_count.left = new_border_count.right
                             }
                             (
                                 Some(right_border.clone()),

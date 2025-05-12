@@ -1,5 +1,6 @@
 use std::backtrace::Backtrace;
 use std::io::Error as IoError;
+use std::time::Duration;
 
 use collection::operations::types::CollectionError;
 use io::file_operations::FileStorageError;
@@ -34,9 +35,22 @@ pub enum StorageError {
     Forbidden { description: String },
     #[error("Pre-condition failure: {description}")]
     PreconditionFailed { description: String }, // system is not in the state to perform the operation
+    #[error("{description}")]
+    InferenceError { description: String },
+    #[error("Rate limiting exceeded: {description}")]
+    RateLimitExceeded {
+        description: String,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl StorageError {
+    pub fn inference_error(description: impl Into<String>) -> StorageError {
+        StorageError::InferenceError {
+            description: description.into(),
+        }
+    }
+
     pub fn service_error(description: impl Into<String>) -> StorageError {
         StorageError::ServiceError {
             description: description.into(),
@@ -134,6 +148,16 @@ impl StorageError {
                 backtrace: None,
             },
             CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded {
+                description,
+                retry_after,
+            } => StorageError::RateLimitExceeded {
+                description,
+                retry_after,
+            },
         }
     }
 }
@@ -183,6 +207,16 @@ impl From<CollectionError> for StorageError {
                 backtrace: None,
             },
             CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded {
+                description,
+                retry_after,
+            } => StorageError::RateLimitExceeded {
+                description,
+                retry_after,
+            },
         }
     }
 }

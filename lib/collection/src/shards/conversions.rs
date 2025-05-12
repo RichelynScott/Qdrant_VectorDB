@@ -1,4 +1,5 @@
-use api::grpc::conversions::{convert_shard_key_from_grpc_opt, payload_to_proto};
+use api::conversions::json::payload_to_proto;
+use api::grpc::conversions::convert_shard_key_from_grpc_opt;
 use api::grpc::qdrant::points_selector::PointsSelectorOneOf;
 use api::grpc::qdrant::{
     ClearPayloadPoints, ClearPayloadPointsInternal, CreateFieldIndexCollection,
@@ -7,11 +8,11 @@ use api::grpc::qdrant::{
     DeletePointVectors, DeletePoints, DeletePointsInternal, DeleteVectorsInternal, PointVectors,
     PointsIdsList, PointsSelector, SetPayloadPoints, SetPayloadPointsInternal, SyncPoints,
     SyncPointsInternal, UpdatePointVectors, UpdateVectorsInternal, UpsertPoints,
-    UpsertPointsInternal, VectorsSelector,
+    UpsertPointsInternal, Vectors, VectorsSelector,
 };
 use segment::data_types::vectors::VectorStructInternal;
 use segment::json_path::JsonPath;
-use segment::types::{Filter, PayloadFieldSchema, PointIdType, ScoredPoint};
+use segment::types::{Filter, PayloadFieldSchema, PointIdType, ScoredPoint, VectorNameBuf};
 use tonic::Status;
 
 use crate::operations::conversions::write_ordering_to_proto;
@@ -32,19 +33,23 @@ pub fn internal_sync_points(
     wait: bool,
     ordering: Option<WriteOrdering>,
 ) -> CollectionResult<SyncPointsInternal> {
+    let PointSyncOperation {
+        points,
+        from_id,
+        to_id,
+    } = points_sync_operation;
     Ok(SyncPointsInternal {
         shard_id,
         clock_tag: clock_tag.map(Into::into),
         sync_points: Some(SyncPoints {
             collection_name,
             wait: Some(wait),
-            points: points_sync_operation
-                .points
+            points: points
                 .into_iter()
-                .map(|x| x.try_into())
+                .map(api::grpc::qdrant::PointStruct::try_from)
                 .collect::<Result<Vec<_>, Status>>()?,
-            from_id: points_sync_operation.from_id.map(|x| x.into()),
-            to_id: points_sync_operation.to_id.map(|x| x.into()),
+            from_id: from_id.map(|x| x.into()),
+            to_id: to_id.map(|x| x.into()),
             ordering: ordering.map(write_ordering_to_proto),
         }),
     })
@@ -65,10 +70,10 @@ pub fn internal_upsert_points(
             collection_name,
             wait: Some(wait),
             points: match point_insert_operations {
-                PointInsertOperationsInternal::PointsBatch(batch) => batch.try_into()?,
+                PointInsertOperationsInternal::PointsBatch(batch) => TryFrom::try_from(batch)?,
                 PointInsertOperationsInternal::PointsList(list) => list
                     .into_iter()
-                    .map(|id| id.try_into())
+                    .map(api::grpc::qdrant::PointStruct::try_from)
                     .collect::<Result<Vec<_>, Status>>()?,
             },
             ordering: ordering.map(write_ordering_to_proto),
@@ -132,25 +137,29 @@ pub fn internal_update_vectors(
     update_vectors: UpdateVectorsOp,
     wait: bool,
     ordering: Option<WriteOrdering>,
-) -> UpdateVectorsInternal {
-    UpdateVectorsInternal {
+) -> CollectionResult<UpdateVectorsInternal> {
+    let UpdateVectorsOp { points } = update_vectors;
+    let points: Result<Vec<_>, _> = points
+        .into_iter()
+        .map(|point| {
+            VectorStructInternal::try_from(point.vector).map(|vector_struct| PointVectors {
+                id: Some(point.id.into()),
+                vectors: Some(Vectors::from(vector_struct)),
+            })
+        })
+        .collect();
+
+    Ok(UpdateVectorsInternal {
         shard_id,
         clock_tag: clock_tag.map(Into::into),
         update_vectors: Some(UpdatePointVectors {
             collection_name,
             wait: Some(wait),
-            points: update_vectors
-                .points
-                .into_iter()
-                .map(|point| PointVectors {
-                    id: Some(point.id.into()),
-                    vectors: Some(VectorStructInternal::from(point.vector).into()),
-                })
-                .collect(),
+            points: points?,
             ordering: ordering.map(write_ordering_to_proto),
             shard_key_selector: None,
         }),
-    }
+    })
 }
 
 pub fn internal_delete_vectors(
@@ -158,7 +167,7 @@ pub fn internal_delete_vectors(
     clock_tag: Option<ClockTag>,
     collection_name: String,
     ids: Vec<PointIdType>,
-    vector_names: Vec<String>,
+    vector_names: Vec<VectorNameBuf>,
     wait: bool,
     ordering: Option<WriteOrdering>,
 ) -> DeleteVectorsInternal {
@@ -187,7 +196,7 @@ pub fn internal_delete_vectors_by_filter(
     clock_tag: Option<ClockTag>,
     collection_name: String,
     filter: Filter,
-    vector_names: Vec<String>,
+    vector_names: Vec<VectorNameBuf>,
     wait: bool,
     ordering: Option<WriteOrdering>,
 ) -> DeleteVectorsInternal {
@@ -389,31 +398,39 @@ pub fn internal_delete_index(
 pub fn try_scored_point_from_grpc(
     point: api::grpc::qdrant::ScoredPoint,
     with_payload: bool,
-) -> Result<ScoredPoint, tonic::Status> {
-    let id = point
-        .id
-        .ok_or_else(|| tonic::Status::invalid_argument("scored point does not have an ID"))?
+) -> Result<ScoredPoint, Status> {
+    let api::grpc::qdrant::ScoredPoint {
+        id,
+        payload,
+        score,
+        version,
+        vectors,
+        shard_key,
+        order_value,
+    } = point;
+    let id = id
+        .ok_or_else(|| Status::invalid_argument("scored point does not have an ID"))?
         .try_into()?;
 
     let payload = if with_payload {
-        Some(api::grpc::conversions::proto_to_payloads(point.payload)?)
+        Some(api::conversions::json::proto_to_payloads(payload)?)
     } else {
-        debug_assert!(point.payload.is_empty());
+        debug_assert!(payload.is_empty());
         None
     };
 
-    let vector = point
-        .vectors
+    let vector = vectors
         .map(|vectors| vectors.try_into())
-        .transpose()?;
+        .transpose()
+        .map_err(|e| Status::invalid_argument(format!("Failed to parse vectors: {e}")))?;
 
     Ok(ScoredPoint {
         id,
-        version: point.version,
-        score: point.score,
+        version,
+        score,
         payload,
         vector,
-        shard_key: convert_shard_key_from_grpc_opt(point.shard_key),
-        order_value: point.order_value.map(TryFrom::try_from).transpose()?,
+        shard_key: convert_shard_key_from_grpc_opt(shard_key),
+        order_value: order_value.map(TryFrom::try_from).transpose()?,
     })
 }

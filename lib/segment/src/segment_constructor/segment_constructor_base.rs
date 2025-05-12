@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::flags::FeatureFlags;
 use io::storage_version::StorageVersion;
 use log::info;
 use parking_lot::{Mutex, RwLock};
@@ -14,27 +15,31 @@ use rocksdb::DB;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
-use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::common::rocksdb_wrapper::{DB_MAPPING_CF, DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::DEFAULT_VECTOR_NAME;
 use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
+use crate::id_tracker::mutable_id_tracker::MutableIdTracker;
 use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
 use crate::id_tracker::{IdTracker, IdTrackerEnum, IdTrackerSS};
+use crate::index::VectorIndexEnum;
+use crate::index::hnsw_index::gpu::gpu_devices_manager::LockedGpuDevice;
 use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use crate::index::plain_payload_index::PlainIndex;
+use crate::index::plain_vector_index::PlainVectorIndex;
 use crate::index::sparse_index::sparse_index_config::SparseIndexType;
 use crate::index::sparse_index::sparse_vector_index::{
     self, SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::index::VectorIndexEnum;
+use crate::payload_storage::mmap_payload_storage::MmapPayloadStorage;
 use crate::payload_storage::on_disk_payload_storage::OnDiskPayloadStorage;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
-use crate::segment::{Segment, SegmentVersion, VectorData, SEGMENT_STATE_FILE};
+use crate::segment::{SEGMENT_STATE_FILE, Segment, SegmentVersion, VectorData};
 use crate::types::{
     Distance, Indexes, PayloadStorageType, SegmentConfig, SegmentState, SegmentType, SeqNumberType,
-    VectorDataConfig, VectorStorageDatatype, VectorStorageType,
+    SparseVectorStorageType, VectorDataConfig, VectorName, VectorStorageDatatype,
+    VectorStorageType,
 };
 use crate::vector_storage::dense::appendable_dense_vector_storage::{
     open_appendable_in_ram_vector_storage, open_appendable_in_ram_vector_storage_byte,
@@ -59,7 +64,8 @@ use crate::vector_storage::multi_dense::simple_multi_dense_vector_storage::{
     open_simple_multi_dense_vector_storage_half,
 };
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use crate::vector_storage::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
+use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
+use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
 use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 pub const PAYLOAD_INDEX_PATH: &str = "payload_index";
@@ -70,7 +76,7 @@ fn sp<T>(t: T) -> Arc<AtomicRefCell<T>> {
     Arc::new(AtomicRefCell::new(t))
 }
 
-fn get_vector_name_with_prefix(prefix: &str, vector_name: &str) -> String {
+fn get_vector_name_with_prefix(prefix: &str, vector_name: &VectorName) -> String {
     if !vector_name.is_empty() {
         format!("{prefix}-{vector_name}")
     } else {
@@ -78,14 +84,14 @@ fn get_vector_name_with_prefix(prefix: &str, vector_name: &str) -> String {
     }
 }
 
-pub fn get_vector_storage_path(segment_path: &Path, vector_name: &str) -> PathBuf {
+pub fn get_vector_storage_path(segment_path: &Path, vector_name: &VectorName) -> PathBuf {
     segment_path.join(get_vector_name_with_prefix(
         VECTOR_STORAGE_PATH,
         vector_name,
     ))
 }
 
-pub fn get_vector_index_path(segment_path: &Path, vector_name: &str) -> PathBuf {
+pub fn get_vector_index_path(segment_path: &Path, vector_name: &VectorName) -> PathBuf {
     segment_path.join(get_vector_name_with_prefix(VECTOR_INDEX_PATH, vector_name))
 }
 
@@ -94,7 +100,7 @@ pub(crate) fn open_vector_storage(
     vector_config: &VectorDataConfig,
     stopped: &AtomicBool,
     vector_storage_path: &Path,
-    vector_name: &str,
+    vector_name: &VectorName,
 ) -> OperationResult<VectorStorageEnum> {
     let storage_element_type = vector_config.datatype.unwrap_or_default();
 
@@ -311,8 +317,14 @@ pub(crate) fn open_segment_db(
         .chain(
             config
                 .sparse_vector_data
-                .keys()
-                .map(|vector_name| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name)),
+                .iter()
+                .filter(|(_, sparse_vector_config)| {
+                    matches!(
+                        sparse_vector_config.storage_type,
+                        SparseVectorStorageType::OnDisk
+                    )
+                })
+                .map(|(vector_name, _)| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name)),
         )
         .collect();
     open_db(segment_path, &vector_db_names)
@@ -322,6 +334,7 @@ pub(crate) fn open_segment_db(
 pub(crate) fn create_payload_storage(
     database: Arc<RwLock<DB>>,
     config: &SegmentConfig,
+    path: &Path,
 ) -> OperationResult<PayloadStorageEnum> {
     let payload_storage = match config.payload_storage_type {
         PayloadStorageType::InMemory => {
@@ -330,11 +343,18 @@ pub(crate) fn create_payload_storage(
         PayloadStorageType::OnDisk => {
             PayloadStorageEnum::from(OnDiskPayloadStorage::open(database)?)
         }
+        PayloadStorageType::Mmap => {
+            PayloadStorageEnum::from(MmapPayloadStorage::open_or_create(path)?)
+        }
     };
     Ok(payload_storage)
 }
 
-pub(crate) fn create_mutable_id_tracker(
+pub(crate) fn create_mutable_id_tracker(segment_path: &Path) -> OperationResult<MutableIdTracker> {
+    MutableIdTracker::open(segment_path)
+}
+
+pub(crate) fn create_rocksdb_id_tracker(
     database: Arc<RwLock<DB>>,
 ) -> OperationResult<SimpleIdTracker> {
     SimpleIdTracker::open(database)
@@ -350,43 +370,82 @@ pub(crate) fn get_payload_index_path(segment_path: &Path) -> PathBuf {
     segment_path.join(PAYLOAD_INDEX_PATH)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn create_vector_index(
-    vector_config: &VectorDataConfig,
-    vector_index_path: &Path,
-    id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
-    vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
-    payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
-    quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
-    permit: Option<Arc<CpuPermit>>,
-    stopped: &AtomicBool,
-) -> OperationResult<VectorIndexEnum> {
-    let vector_index = match &vector_config.index {
-        Indexes::Plain {} => VectorIndexEnum::Plain(PlainIndex::new(
-            id_tracker.clone(),
-            vector_storage.clone(),
-            payload_index.clone(),
-        )),
-        Indexes::Hnsw(vector_hnsw_config) => {
-            let args = HnswIndexOpenArgs {
-                path: vector_index_path,
-                id_tracker: id_tracker.clone(),
-                vector_storage: vector_storage.clone(),
-                quantized_vectors: quantized_vectors.clone(),
-                payload_index: payload_index.clone(),
-                hnsw_config: vector_hnsw_config.clone(),
-                permit,
-                stopped,
-            };
-            if vector_hnsw_config.on_disk == Some(true) {
-                VectorIndexEnum::HnswMmap(HNSWIndex::open(args)?)
-            } else {
-                VectorIndexEnum::HnswRam(HNSWIndex::open(args)?)
-            }
-        }
-    };
+pub(crate) struct VectorIndexOpenArgs<'a> {
+    pub path: &'a Path,
+    pub id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    pub vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
+    pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
+    pub quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
+}
 
-    Ok(vector_index)
+pub struct VectorIndexBuildArgs<'a> {
+    pub permit: Arc<ResourcePermit>,
+    /// Vector indices from other segments, used to speed up index building.
+    /// May or may not contain the same vectors.
+    pub old_indices: &'a [Arc<AtomicRefCell<VectorIndexEnum>>],
+    pub gpu_device: Option<&'a LockedGpuDevice<'a>>,
+    pub stopped: &'a AtomicBool,
+    pub feature_flags: FeatureFlags,
+}
+
+pub(crate) fn open_vector_index(
+    vector_config: &VectorDataConfig,
+    open_args: VectorIndexOpenArgs,
+) -> OperationResult<VectorIndexEnum> {
+    let VectorIndexOpenArgs {
+        path,
+        id_tracker,
+        vector_storage,
+        payload_index,
+        quantized_vectors,
+    } = open_args;
+    Ok(match &vector_config.index {
+        Indexes::Plain {} => VectorIndexEnum::Plain(PlainVectorIndex::new(
+            id_tracker,
+            vector_storage,
+            payload_index,
+        )),
+        Indexes::Hnsw(hnsw_config) => VectorIndexEnum::Hnsw(HNSWIndex::open(HnswIndexOpenArgs {
+            path,
+            id_tracker,
+            vector_storage,
+            quantized_vectors,
+            payload_index,
+            hnsw_config: hnsw_config.clone(),
+        })?),
+    })
+}
+
+pub(crate) fn build_vector_index(
+    vector_config: &VectorDataConfig,
+    open_args: VectorIndexOpenArgs,
+    build_args: VectorIndexBuildArgs,
+) -> OperationResult<VectorIndexEnum> {
+    let VectorIndexOpenArgs {
+        path,
+        id_tracker,
+        vector_storage,
+        payload_index,
+        quantized_vectors,
+    } = open_args;
+    Ok(match &vector_config.index {
+        Indexes::Plain {} => VectorIndexEnum::Plain(PlainVectorIndex::new(
+            id_tracker,
+            vector_storage,
+            payload_index,
+        )),
+        Indexes::Hnsw(hnsw_config) => VectorIndexEnum::Hnsw(HNSWIndex::build(
+            HnswIndexOpenArgs {
+                path,
+                id_tracker,
+                vector_storage,
+                quantized_vectors,
+                payload_index,
+                hnsw_config: hnsw_config.clone(),
+            },
+            build_args,
+        )?),
+    })
 }
 
 #[cfg(feature = "testing")]
@@ -448,11 +507,21 @@ pub(crate) fn create_sparse_vector_index(
 
 pub(crate) fn create_sparse_vector_storage(
     database: Arc<RwLock<DB>>,
-    vector_name: &str,
+    path: &Path,
+    vector_name: &VectorName,
+    storage_type: &SparseVectorStorageType,
     stopped: &AtomicBool,
 ) -> OperationResult<VectorStorageEnum> {
-    let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
-    open_simple_sparse_vector_storage(database, &db_column_name, stopped)
+    match storage_type {
+        SparseVectorStorageType::OnDisk => {
+            let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
+            open_simple_sparse_vector_storage(database, &db_column_name, stopped)
+        }
+        SparseVectorStorageType::Mmap => {
+            let mmap_storage = MmapSparseVectorStorage::open_or_create(path)?;
+            Ok(VectorStorageEnum::SparseMmap(mmap_storage))
+        }
+    }
 }
 
 fn create_segment(
@@ -462,7 +531,11 @@ fn create_segment(
     stopped: &AtomicBool,
 ) -> OperationResult<Segment> {
     let database = open_segment_db(segment_path, config)?;
-    let payload_storage = sp(create_payload_storage(database.clone(), config)?);
+    let payload_storage = sp(create_payload_storage(
+        database.clone(),
+        config,
+        segment_path,
+    )?);
 
     let appendable_flag = config.is_appendable();
 
@@ -470,19 +543,81 @@ fn create_segment(
         appendable_flag || !ImmutableIdTracker::mappings_file_path(segment_path).is_file();
 
     let id_tracker = if mutable_id_tracker {
-        sp(IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(
-            database.clone(),
-        )?))
+        // Determine whether we use the new (file based) or old (RocksDB) mutable ID tracker
+        // Decide based on the feature flag and state on disk
+        let use_new_mutable_tracker = {
+            // New ID tracker is enabled by default, but we still use the old tracker if we have
+            // any mappings stored in RocksDB
+            // TODO(1.15 or later): remove this check and use new mutable ID tracker unconditionally
+            let db = database.read();
+            match db.cf_handle(DB_MAPPING_CF) {
+                Some(cf_handle) => {
+                    let count = db
+                        .property_int_value_cf(cf_handle, rocksdb::properties::ESTIMATE_NUM_KEYS)
+                        .map_err(|err| {
+                            OperationError::service_error(format!(
+                                "Failed to get estimated number of keys from RocksDB: {err}"
+                            ))
+                        })?
+                        .unwrap_or_default();
+                    count == 0
+                }
+                None => true,
+            }
+        };
+
+        if use_new_mutable_tracker {
+            sp(IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(
+                segment_path,
+            )?))
+        } else {
+            sp(IdTrackerEnum::RocksDbIdTracker(create_rocksdb_id_tracker(
+                database.clone(),
+            )?))
+        }
     } else {
         sp(IdTrackerEnum::ImmutableIdTracker(
             create_immutable_id_tracker(segment_path)?,
         ))
     };
 
+    let mut vector_storages = HashMap::new();
+
+    for (vector_name, vector_config) in &config.vector_data {
+        let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+
+        // Select suitable vector storage type based on configuration
+        let vector_storage = sp(open_vector_storage(
+            &database,
+            vector_config,
+            stopped,
+            &vector_storage_path,
+            vector_name,
+        )?);
+
+        vector_storages.insert(vector_name.to_owned(), vector_storage);
+    }
+
+    for (vector_name, sparse_config) in config.sparse_vector_data.iter() {
+        let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+
+        // Select suitable sparse vector storage type based on configuration
+        let vector_storage = sp(create_sparse_vector_storage(
+            database.clone(),
+            &vector_storage_path,
+            vector_name,
+            &sparse_config.storage_type,
+            stopped,
+        )?);
+
+        vector_storages.insert(vector_name.to_owned(), vector_storage);
+    }
+
     let payload_index_path = get_payload_index_path(segment_path);
     let payload_index: Arc<AtomicRefCell<StructPayloadIndex>> = sp(StructPayloadIndex::open(
-        payload_storage,
+        payload_storage.clone(),
         id_tracker.clone(),
+        vector_storages.clone(),
         &payload_index_path,
         appendable_flag,
     )?);
@@ -490,17 +625,9 @@ fn create_segment(
     let mut vector_data = HashMap::new();
     for (vector_name, vector_config) in &config.vector_data {
         let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+        let vector_storage = vector_storages.remove(vector_name).unwrap();
+
         let vector_index_path = get_vector_index_path(segment_path, vector_name);
-
-        // Select suitable vector storage type based on configuration
-        let vector_storage = Arc::new(AtomicRefCell::new(open_vector_storage(
-            &database,
-            vector_config,
-            stopped,
-            &vector_storage_path,
-            vector_name,
-        )?));
-
         // Warn when number of points between ID tracker and storage differs
         let point_count = id_tracker.borrow().total_point_count();
         let vector_count = vector_storage.borrow().total_vector_count();
@@ -524,15 +651,15 @@ fn create_segment(
             None
         });
 
-        let vector_index: Arc<AtomicRefCell<VectorIndexEnum>> = sp(create_vector_index(
+        let vector_index: Arc<AtomicRefCell<VectorIndexEnum>> = sp(open_vector_index(
             vector_config,
-            &vector_index_path,
-            id_tracker.clone(),
-            vector_storage.clone(),
-            payload_index.clone(),
-            quantized_vectors.clone(),
-            None,
-            stopped,
+            VectorIndexOpenArgs {
+                path: &vector_index_path,
+                id_tracker: id_tracker.clone(),
+                vector_storage: vector_storage.clone(),
+                payload_index: payload_index.clone(),
+                quantized_vectors: quantized_vectors.clone(),
+            },
         )?);
 
         check_process_stopped(stopped)?;
@@ -550,12 +677,7 @@ fn create_segment(
     for (vector_name, sparse_vector_config) in &config.sparse_vector_data {
         let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
         let vector_index_path = get_vector_index_path(segment_path, vector_name);
-
-        let vector_storage = sp(create_sparse_vector_storage(
-            database.clone(),
-            vector_name,
-            stopped,
-        )?);
+        let vector_storage = vector_storages.remove(vector_name).unwrap();
 
         // Warn when number of points between ID tracker and storage differs
         let point_count = id_tracker.borrow().total_point_count();
@@ -604,6 +726,7 @@ fn create_segment(
         segment_type,
         appendable_flag,
         payload_index,
+        payload_storage,
         segment_config: config.clone(),
         error_status: None,
         database,
@@ -636,7 +759,7 @@ pub fn load_segment(path: &Path, stopped: &AtomicBool) -> OperationResult<Option
     let app_version = SegmentVersion::current();
 
     if stored_version != app_version {
-        info!("Migrating segment {} -> {}", stored_version, app_version,);
+        info!("Migrating segment {stored_version} -> {app_version}");
 
         if stored_version > app_version {
             return Err(OperationError::service_error(format!(

@@ -18,7 +18,7 @@ pub fn web_ui_folder(settings: &Settings) -> Option<String> {
             .service
             .static_content_dir
             .clone()
-            .unwrap_or(DEFAULT_STATIC_DIR.to_string());
+            .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
         let static_folder_path = Path::new(&static_folder);
         if !static_folder_path.exists() || !static_folder_path.is_dir() {
             // enabled BUT folder does not exist
@@ -37,7 +37,7 @@ pub fn web_ui_folder(settings: &Settings) -> Option<String> {
     }
 }
 
-pub fn web_ui_factory(static_folder: &str) -> impl HttpServiceFactory {
+pub fn web_ui_factory(static_folder: &str) -> impl HttpServiceFactory + use<> {
     web::scope(WEB_UI_PATH)
         .wrap(DefaultHeaders::new().add(("X-Frame-Options", HeaderValue::from_static("DENY"))))
         .service(actix_files::Files::new("/", static_folder).index_file("index.html"))
@@ -45,10 +45,10 @@ pub fn web_ui_factory(static_folder: &str) -> impl HttpServiceFactory {
 
 #[cfg(test)]
 mod tests {
-    use actix_web::http::header::{self, HeaderMap};
-    use actix_web::http::StatusCode;
-    use actix_web::test::{self, TestRequest};
     use actix_web::App;
+    use actix_web::http::StatusCode;
+    use actix_web::http::header::{self, HeaderMap};
+    use actix_web::test::{self, TestRequest};
 
     use super::*;
 

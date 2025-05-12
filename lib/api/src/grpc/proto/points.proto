@@ -46,11 +46,48 @@ message SparseIndices {
   repeated uint32 data = 1;
 }
 
+message Document {
+  string text = 1; // Text of the document
+  string model = 3; // Model name
+  map<string, Value> options = 4; // Model options
+}
+
+message Image {
+  Value image = 1; // Image data, either base64 encoded or URL
+  string model = 2; // Model name
+  map<string, Value> options = 3; // Model options
+}
+
+message InferenceObject {
+  Value object = 1; // Object to infer
+  string model = 2; // Model name
+  map<string, Value> options = 3; // Model options
+}
+
 // Legacy vector format, which determines the vector type by the configuration of its fields.
 message Vector {
-  repeated float data = 1; // Vector data (flatten for multi vectors)
-  optional SparseIndices indices = 2; // Sparse indices for sparse vectors
-  optional uint32 vectors_count = 3; // Number of vectors per multi vector
+  repeated float data = 1; // Vector data (flatten for multi vectors), deprecated
+  optional SparseIndices indices = 2; // Sparse indices for sparse vectors, deprecated
+  optional uint32 vectors_count = 3; // Number of vectors per multi vector, deprecated
+  oneof vector {
+    DenseVector dense = 101; // Dense vector
+    SparseVector sparse = 102; // Sparse vector
+    MultiDenseVector multi_dense = 103; // Multi dense vector
+    Document document = 104;
+    Image image = 105;
+    InferenceObject object = 106;
+  }
+}
+
+message VectorOutput {
+  repeated float data = 1; // Vector data (flatten for multi vectors), deprecated
+  optional SparseIndices indices = 2; // Sparse indices for sparse vectors, deprecated
+  optional uint32 vectors_count = 3; // Number of vectors per multi vector, deprecated
+  oneof vector {
+    DenseVector dense = 101; // Dense vector
+    SparseVector sparse = 102; // Sparse vector
+    MultiDenseVector multi_dense = 103; // Multi dense vector
+  }
 }
 
 message DenseVector {
@@ -73,6 +110,9 @@ message VectorInput {
     DenseVector dense = 2;
     SparseVector sparse = 3;
     MultiDenseVector multi_dense = 4;
+    Document document = 5;
+    Image image = 6;
+    InferenceObject object = 7;
   }
 }
 
@@ -214,10 +254,21 @@ message NamedVectors {
   map<string, Vector> vectors = 1;
 }
 
+message NamedVectorsOutput {
+  map<string, VectorOutput> vectors = 1;
+}
+
 message Vectors {
   oneof vectors_options {
     Vector vector = 1;
     NamedVectors vectors = 2;
+  }
+}
+
+message VectorsOutput {
+  oneof vectors_options {
+    VectorOutput vector = 1;
+    NamedVectorsOutput vectors = 2;
   }
 }
 
@@ -374,6 +425,10 @@ enum RecommendStrategy {
   // examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`.
   // If the `max_neg_score` is chosen then it is squared and negated.
   BestScore = 1;
+  
+  // Uses custom search objective. Compares against all inputs, sums all the scores.
+  // Scores against positive vectors are added, against negatives are subtracted.
+  SumScores = 2;
 }
 
 message LookupLocation {
@@ -521,6 +576,70 @@ enum Sample {
     Random = 0;
 }
 
+message Formula {
+    Expression expression = 1;
+    map<string, Value> defaults = 2;
+}
+
+message Expression {
+    oneof variant {
+        float constant = 1;
+        string variable = 2; // Payload key or reference to score.
+        Condition condition = 3; // Payload condition. If true, becomes 1.0; otherwise 0.0
+        GeoDistance geo_distance = 4; // Geographic distance in meters
+        string datetime = 5; // Date-time constant
+        string datetime_key = 6; // Payload key with date-time values
+        MultExpression mult = 7; // Multiply
+        SumExpression sum = 8; // Sum
+        DivExpression div = 9; // Divide
+        Expression neg = 10; // Negate
+        Expression abs = 11; // Absolute value
+        Expression sqrt = 12; // Square root
+        PowExpression pow = 13; // Power
+        Expression exp = 14; // Exponential
+        Expression log10 = 15; // Logarithm
+        Expression ln = 16; // Natural logarithm
+        DecayParamsExpression exp_decay = 17; // Exponential decay
+        DecayParamsExpression gauss_decay = 18; // Gaussian decay
+        DecayParamsExpression lin_decay = 19; // Linear decay
+    }
+}
+
+message GeoDistance {
+    GeoPoint origin = 1;
+    string to = 2;
+}
+
+message MultExpression {
+    repeated Expression mult = 1;
+}
+
+message SumExpression {
+    repeated Expression sum = 1;
+}
+
+message DivExpression {
+    Expression left = 1;
+    Expression right = 2;
+    optional float by_zero_default = 3;
+}
+
+message PowExpression {
+    Expression base = 1;
+    Expression exponent = 2;
+}
+
+message DecayParamsExpression {
+    // The variable to decay
+    Expression x = 1; 
+    // The target value to start decaying from. Defaults to 0.
+    optional Expression target = 2; 
+    // The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.
+    optional float scale = 3; 
+    // The midpoint of the decay. Defaults to 0.5. Output will be this value when `|x - target| == scale`.
+    optional float midpoint = 4; 
+}
+
 message Query {
   oneof variant {
     VectorInput nearest = 1; // Find the nearest neighbors to this vector.
@@ -530,6 +649,7 @@ message Query {
     OrderBy order_by = 5; // Order the points by a payload field.
     Fusion fusion = 6; // Fuse the results of multiple prefetches.
     Sample sample = 7; // Sample points from the collection.
+    Formula formula = 8; // Score boosting via an arbitrary formula
   }
 }
 
@@ -710,6 +830,7 @@ message UpdateBatchPoints {
 message PointsOperationResponse {
   UpdateResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message UpdateResult {
@@ -737,7 +858,7 @@ message ScoredPoint {
   float score = 3; // Similarity score
   reserved 4; // deprecated "vector" field
   uint64 version = 5; // Last update operation applied to this point
-  optional Vectors vectors = 6; // Vectors to search
+  optional VectorsOutput vectors = 6; // Vectors to search
   optional ShardKey shard_key = 7; // Shard key
   optional OrderValue order_value = 8; // Order by value
 }
@@ -766,21 +887,25 @@ message GroupsResult {
 message SearchResponse {
   repeated ScoredPoint result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message QueryResponse {
   repeated ScoredPoint result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message QueryBatchResponse {
   repeated BatchResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message QueryGroupsResponse {
   GroupsResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message BatchResult {
@@ -790,22 +915,26 @@ message BatchResult {
 message SearchBatchResponse {
   repeated BatchResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message SearchGroupsResponse {
   GroupsResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message CountResponse {
   CountResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message ScrollResponse {
   optional PointId next_page_offset = 1; // Use this offset for the next query
   repeated RetrievedPoint result = 2;
   double time = 3; // Time spent to process
+  optional HardwareUsage usage = 4;
 }
 
 message CountResult {
@@ -816,7 +945,7 @@ message RetrievedPoint {
   PointId id = 1;
   map<string, Value> payload = 2;
   reserved 3; // deprecated "vector" field
-  optional Vectors vectors = 4;
+  optional VectorsOutput vectors = 4;
   optional ShardKey shard_key = 5; // Shard key
   optional OrderValue order_value = 6; // Order-by value
 }
@@ -824,31 +953,37 @@ message RetrievedPoint {
 message GetResponse {
   repeated RetrievedPoint result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message RecommendResponse {
   repeated ScoredPoint result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message RecommendBatchResponse {
   repeated BatchResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message DiscoverResponse {
   repeated ScoredPoint result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message DiscoverBatchResponse {
   repeated BatchResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message RecommendGroupsResponse {
   GroupsResult result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message UpdateBatchResponse {
@@ -864,11 +999,13 @@ message FacetResponse {
 message SearchMatrixPairsResponse {
   SearchMatrixPairs result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 message SearchMatrixOffsetsResponse {
   SearchMatrixOffsets result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 // ---------------------------------------------
@@ -895,6 +1032,7 @@ message Condition {
     Filter filter = 4;
     IsNullCondition is_null = 5;
     NestedCondition nested = 6;
+    HasVectorCondition has_vector = 7;
   }
 }
 
@@ -908,6 +1046,10 @@ message IsNullCondition {
 
 message HasIdCondition {
   repeated PointId has_id = 1;
+}
+
+message HasVectorCondition {
+  string has_vector = 1;
 }
 
 message NestedCondition {
@@ -924,6 +1066,8 @@ message FieldCondition {
   ValuesCount values_count = 6; // Check number of values for a specific field
   GeoPolygon geo_polygon = 7; // Check if geo point is within a given polygon
   DatetimeRange datetime_range = 8; // Check if datetime is within a given range
+  optional bool is_empty = 9; // Check if field is empty
+  optional bool is_null = 10; // Check if field is null
 }
 
 message Match {
@@ -1020,4 +1164,18 @@ message PointStruct {
 message GeoPoint {
   double lon = 1;
   double lat = 2;
+}
+
+// ---------------------------------------------
+// ------------ Hardware measurements ----------
+// ---------------------------------------------
+
+message HardwareUsage {
+  uint64 cpu = 1;
+  uint64 payload_io_read = 2;
+  uint64 payload_io_write = 3;
+  uint64 payload_index_io_read = 4;
+  uint64 payload_index_io_write = 5;
+  uint64 vector_io_read = 6;
+  uint64 vector_io_write = 7;
 }

@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
-use itertools::Itertools;
 
 use crate::data_types::named_vectors::CowMultiVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
@@ -26,6 +26,7 @@ where
     phantom: PhantomData<TEncodedQuery>,
     metric: PhantomData<TMetric>,
     element: PhantomData<TElement>,
+    hardware_counter: HardwareCounterCell,
 }
 
 impl<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors, TQuery>
@@ -40,6 +41,7 @@ where
         raw_query: TInputQuery,
         quantized_storage: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self
     where
         TOriginalQuery: Query<TypedDenseVector<TElement>>
@@ -58,7 +60,6 @@ where
             })
             .unwrap();
         let query: TQuery = original_query
-            .clone()
             .transform(|original_vector| {
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
@@ -69,12 +70,17 @@ where
             })
             .unwrap();
 
+        hardware_counter.set_cpu_multiplier(size_of::<TElement>());
+
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_storage.is_on_disk()));
+
         Self {
             query,
             quantized_storage,
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
+            hardware_counter,
         }
     }
 
@@ -82,6 +88,7 @@ where
         raw_query: TInputQuery,
         quantized_storage: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self
     where
         TOriginalQuery: Query<TypedMultiDenseVector<TElement>>
@@ -92,11 +99,10 @@ where
     {
         let original_query: TOriginalQuery = raw_query
             .transform(|vector| {
-                let slices = vector.multi_vectors();
-                let preprocessed = slices
-                    .into_iter()
-                    .flat_map(|slice| TMetric::preprocess(slice.to_vec()))
-                    .collect_vec();
+                let mut preprocessed = Vec::new();
+                for slice in vector.multi_vectors() {
+                    preprocessed.extend_from_slice(&TMetric::preprocess(slice.to_vec()));
+                }
                 let preprocessed = MultiDenseVectorInternal::new(preprocessed, vector.dim);
                 let converted =
                     TElement::from_float_multivector(CowMultiVector::Owned(preprocessed))
@@ -106,7 +112,6 @@ where
             .unwrap();
 
         let query: TQuery = original_query
-            .clone()
             .transform(|original_vector| {
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
@@ -117,12 +122,17 @@ where
             })
             .unwrap();
 
+        hardware_counter.set_cpu_multiplier(size_of::<TElement>());
+
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_storage.is_on_disk()));
+
         Self {
             query,
             quantized_storage,
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
+            hardware_counter,
         }
     }
 }
@@ -136,8 +146,10 @@ where
     TEncodedVectors: quantization::EncodedVectors<TEncodedQuery>,
 {
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        self.query
-            .score_by(|this| self.quantized_storage.score_point(this, idx))
+        self.query.score_by(|this| {
+            self.quantized_storage
+                .score_point(this, idx, &self.hardware_counter)
+        })
     }
 
     fn score(&self, _v2: &[TElement]) -> ScoreType {

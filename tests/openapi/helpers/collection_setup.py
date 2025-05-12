@@ -1,7 +1,9 @@
-
+from retry import retry
 from .helpers import request_with_validation
+from requests.exceptions import ConnectionError
 
 
+@retry(ConnectionError, delay=1, tries=5, backoff=2)
 def drop_collection(collection_name='test_collection'):
     response = request_with_validation(
         api='/collections/{collection_name}',
@@ -308,10 +310,10 @@ def multipayload_collection_setup(
 
 
 def multivec_collection_setup(
-        collection_name='test_collection',
-        on_disk_payload=False,
-        on_disk_vectors=False,
-        distance=None,
+    collection_name='test_collection',
+    on_disk_payload=False,
+    on_disk_vectors=False,
+    distance=None,
 ):
     response = request_with_validation(
         api='/collections/{collection_name}',
@@ -441,10 +443,10 @@ def multivec_collection_setup(
 
 
 def full_collection_setup(
-        collection_name='test_collection',
-        on_disk_payload=False,
-        on_disk_vectors=False,
-        distance=None,
+    collection_name='test_collection',
+    on_disk_payload=False,
+    on_disk_vectors=False,
+    distance=None,
 ):
     response = request_with_validation(
         api='/collections/{collection_name}',

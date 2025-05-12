@@ -3,13 +3,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use bitvec::vec::BitVec;
+use common::ext::BitSliceExt as _;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
 use super::mutable_numeric_index::{InMemoryNumericIndex, MutableNumericIndex};
 use super::{
-    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
+    Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION, numeric_index_storage_cf_name,
 };
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
@@ -51,8 +52,8 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         self.data.len() - self.deleted_count
     }
 
-    fn remove(&mut self, key: Point<T>) -> bool {
-        if let Ok(index) = self.data.binary_search(&key) {
+    fn remove(&mut self, key: &Point<T>) -> bool {
+        if let Ok(index) = self.data.binary_search(key) {
             if let Some(is_deleted) = self.deleted.get_mut(index).as_deref_mut() {
                 if !*is_deleted {
                     self.deleted_count += 1;
@@ -108,19 +109,13 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
     }
 }
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a, T> {
+impl<T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'_, T> {
     type Item = Point<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.start_index].clone();
-            let deleted = self
-                .set
-                .deleted
-                .get(self.start_index)
-                .as_deref()
-                .copied()
-                .unwrap_or(true);
+            let deleted = self.set.deleted.get_bit(self.start_index).unwrap_or(true);
             self.start_index += 1;
             if deleted {
                 continue;
@@ -131,17 +126,11 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'a, T> {
+impl<T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.end_index - 1].clone();
-            let deleted = self
-                .set
-                .deleted
-                .get(self.end_index - 1)
-                .as_deref()
-                .copied()
-                .unwrap_or(true);
+            let deleted = self.set.deleted.get_bit(self.end_index - 1).unwrap_or(true);
             self.end_index -= 1;
             if deleted {
                 continue;
@@ -182,7 +171,7 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
         idx: PointOffsetType,
         check_fn: impl Fn(&T) -> bool,
     ) -> bool {
-        self.point_to_values.check_values_any(idx, check_fn)
+        self.point_to_values.check_values_any(idx, |v| check_fn(v))
     }
 
     pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
@@ -214,7 +203,7 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
         &self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+    ) -> impl Iterator<Item = PointOffsetType> {
         self.map
             .values_range(start_bound, end_bound)
             .map(|Point { idx, .. }| idx)
@@ -255,7 +244,7 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
             let mut removed_count = 0;
             for value in removed_values {
                 let key = Point::new(*value, idx);
-                Self::remove_from_map(&mut self.map, &mut self.histogram, key);
+                Self::remove_from_map(&mut self.map, &mut self.histogram, &key);
 
                 // update db
                 let encoded = value.encode_key(idx);
@@ -286,11 +275,11 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
     fn remove_from_map(
         map: &mut NumericKeySortedVec<T>,
         histogram: &mut Histogram<T>,
-        key: Point<T>,
+        key: &Point<T>,
     ) {
-        if map.remove(key.clone()) {
+        if map.remove(key) {
             histogram.remove(
-                &key,
+                key,
                 |x| Self::get_histogram_left_neighbor(map, x),
                 |x| Self::get_histogram_right_neighbor(map, x),
             );
@@ -439,14 +428,14 @@ mod tests {
 
         // test deletion and ranges after deletion
         let deleted_key = Point::new(0.4, 2);
-        set_keys.remove(deleted_key.clone());
+        set_keys.remove(&deleted_key);
         set_byte.remove(&deleted_key);
 
         check_ranges(&set_keys, &set_byte);
 
         // test deletion and ranges after deletion
         let deleted_key = Point::new(-5.0, 1);
-        set_keys.remove(deleted_key.clone());
+        set_keys.remove(&deleted_key);
         set_byte.remove(&deleted_key);
 
         check_ranges(&set_keys, &set_byte);

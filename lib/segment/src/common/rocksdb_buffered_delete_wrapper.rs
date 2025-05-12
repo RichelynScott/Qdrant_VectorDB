@@ -1,14 +1,14 @@
-use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
 
+use ahash::AHashSet;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::DB;
 
 use super::rocksdb_wrapper::DatabaseColumnIterator;
+use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, LockedDatabaseColumnWrapper};
-use crate::common::Flusher;
 
 /// Wrapper around `DatabaseColumnWrapper` that ensures, that keys that were removed from the
 /// database are only persisted on flush explicitly.
@@ -16,10 +16,12 @@ use crate::common::Flusher;
 /// This might be required to guarantee consistency of the database component.
 /// E.g. copy-on-write implementation should guarantee that data in the `write` component is
 /// persisted before it is removed from the `copy` component.
+///
+/// WARN: this structure is expected to be write-only.
 #[derive(Debug)]
 pub struct DatabaseColumnScheduledDeleteWrapper {
     db: DatabaseColumnWrapper,
-    deleted_pending_persistence: Arc<Mutex<HashSet<Vec<u8>>>>,
+    deleted_pending_persistence: Arc<Mutex<AHashSet<Vec<u8>>>>,
 }
 
 impl Clone for DatabaseColumnScheduledDeleteWrapper {
@@ -35,7 +37,7 @@ impl DatabaseColumnScheduledDeleteWrapper {
     pub fn new(db: DatabaseColumnWrapper) -> Self {
         Self {
             db,
-            deleted_pending_persistence: Arc::new(Mutex::new(HashSet::new())),
+            deleted_pending_persistence: Arc::new(Mutex::new(AHashSet::new())),
         }
     }
 
@@ -78,8 +80,8 @@ impl DatabaseColumnScheduledDeleteWrapper {
         })
     }
 
-    pub fn lock_db(&self) -> LockedDatabaseColumnSheduledDeleteWrapper<'_> {
-        LockedDatabaseColumnSheduledDeleteWrapper {
+    pub fn lock_db(&self) -> LockedDatabaseColumnScheduledDeleteWrapper<'_> {
+        LockedDatabaseColumnScheduledDeleteWrapper {
             base: self.db.lock_db(),
             deleted_pending_persistence: &self.deleted_pending_persistence,
         }
@@ -114,28 +116,32 @@ impl DatabaseColumnScheduledDeleteWrapper {
     pub fn remove_column_family(&self) -> OperationResult<()> {
         self.db.remove_column_family()
     }
+
+    pub fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        self.db.get_storage_size_bytes()
+    }
 }
 
-pub struct LockedDatabaseColumnSheduledDeleteWrapper<'a> {
+pub struct LockedDatabaseColumnScheduledDeleteWrapper<'a> {
     base: LockedDatabaseColumnWrapper<'a>,
-    deleted_pending_persistence: &'a Mutex<HashSet<Vec<u8>>>,
+    deleted_pending_persistence: &'a Mutex<AHashSet<Vec<u8>>>,
 }
 
-impl LockedDatabaseColumnSheduledDeleteWrapper<'_> {
-    pub fn iter(&self) -> OperationResult<DatabaseColumnSheduledDeleteIterator<'_>> {
-        Ok(DatabaseColumnSheduledDeleteIterator {
+impl LockedDatabaseColumnScheduledDeleteWrapper<'_> {
+    pub fn iter(&self) -> OperationResult<DatabaseColumnScheduledDeleteIterator<'_>> {
+        Ok(DatabaseColumnScheduledDeleteIterator {
             base: self.base.iter()?,
             deleted_pending_persistence: self.deleted_pending_persistence,
         })
     }
 }
 
-pub struct DatabaseColumnSheduledDeleteIterator<'a> {
+pub struct DatabaseColumnScheduledDeleteIterator<'a> {
     base: DatabaseColumnIterator<'a>,
-    deleted_pending_persistence: &'a Mutex<HashSet<Vec<u8>>>,
+    deleted_pending_persistence: &'a Mutex<AHashSet<Vec<u8>>>,
 }
 
-impl<'a> Iterator for DatabaseColumnSheduledDeleteIterator<'a> {
+impl Iterator for DatabaseColumnScheduledDeleteIterator<'_> {
     type Item = (Box<[u8]>, Box<[u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {

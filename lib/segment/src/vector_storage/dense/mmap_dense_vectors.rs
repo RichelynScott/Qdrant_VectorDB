@@ -1,13 +1,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::mem::{self, size_of, transmute};
+use std::mem::{self, MaybeUninit, size_of, transmute};
 use std::path::Path;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::ext::BitSliceExt as _;
+use common::maybe_uninit::maybe_uninit_fill_from;
 use common::types::PointOffsetType;
 use memmap2::Mmap;
-use memory::madvise::AdviceSetting;
+use memory::madvise::{Advice, AdviceSetting, Madviseable};
 use memory::mmap_ops;
 use memory::mmap_type::{MmapBitSlice, MmapFlusher};
 use parking_lot::Mutex;
@@ -19,6 +21,8 @@ use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::vector_storage::async_io::UringReader;
 #[cfg(not(target_os = "linux"))]
 use crate::vector_storage::async_io_mock::UringReader;
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
+use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient_points;
 
 const HEADER_SIZE: usize = 4;
 const VECTORS_HEADER: &[u8; HEADER_SIZE] = b"data";
@@ -33,6 +37,9 @@ pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
     ///
     /// Has an exact size to fit a header and `num_vectors` of vectors.
     mmap: Arc<Mmap>,
+    /// Same as `mmap`, but with `Advice::Sequential` set
+    /// for better performance when reading vectors sequentially.
+    mmap_sequential: Arc<Mmap>,
     /// Context for io_uring-base async IO
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     uring_reader: Mutex<Option<UringReader<T>>>,
@@ -54,6 +61,14 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             .describe("Create mmap data file")?;
         let mmap = mmap_ops::open_read_mmap(vectors_path, AdviceSetting::Global, false)
             .describe("Open mmap for reading")?;
+
+        let seq_mmap = mmap_ops::open_read_mmap(
+            vectors_path,
+            AdviceSetting::Advice(Advice::Sequential),
+            false,
+        )
+        .describe("Open mmap for sequential reading")?;
+
         let num_vectors = (mmap.len() - HEADER_SIZE) / dim / size_of::<T>();
 
         // Allocate/open deleted mmap
@@ -66,7 +81,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         // Advise kernel that we'll need this page soon so the kernel can prepare
         #[cfg(unix)]
         if let Err(err) = deleted_mmap.advise(memmap2::Advice::WillNeed) {
-            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {}", err,);
+            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {err}");
         }
 
         // Transform into mmap BitSlice
@@ -86,6 +101,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             dim,
             num_vectors,
             mmap: mmap.into(),
+            mmap_sequential: seq_mmap.into(),
             uring_reader: Mutex::new(uring_reader),
             deleted,
             deleted_count,
@@ -113,14 +129,20 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         self.dim * size_of::<T>()
     }
 
-    pub fn raw_vector_offset(&self, offset: usize) -> &[T] {
+    fn raw_vector_offset(&self, offset: usize) -> &[T] {
         let byte_slice = &self.mmap[offset..(offset + self.raw_size())];
         let arr: &[T] = unsafe { transmute(byte_slice) };
         &arr[0..self.dim]
     }
 
+    fn raw_vector_offset_sequential(&self, offset: usize) -> &[T] {
+        let byte_slice = &self.mmap_sequential[offset..(offset + self.raw_size())];
+        let arr: &[T] = unsafe { transmute(byte_slice) };
+        &arr[0..self.dim]
+    }
+
     /// Returns reference to vector data by key
-    pub fn get_vector(&self, key: PointOffsetType) -> &[T] {
+    fn get_vector(&self, key: PointOffsetType) -> &[T] {
         self.get_vector_opt(key).expect("vector not found")
     }
 
@@ -130,11 +152,34 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             .map(|offset| self.raw_vector_offset(offset))
     }
 
-    pub fn delete(&mut self, key: PointOffsetType) -> bool {
-        if self.num_vectors <= key as usize {
-            return false;
-        }
+    pub fn get_vector_opt_sequential(&self, key: PointOffsetType) -> Option<&[T]> {
+        self.data_offset(key)
+            .map(|offset| self.raw_vector_offset_sequential(offset))
+    }
 
+    pub fn get_vectors<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &'a mut [MaybeUninit<&'a [T]>],
+    ) -> &'a [&'a [T]] {
+        debug_assert_eq!(keys.len(), vectors.len());
+        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
+        if is_read_with_prefetch_efficient_points(keys) {
+            maybe_uninit_fill_from(
+                vectors,
+                keys.iter()
+                    .map(|key| self.get_vector_opt_sequential(*key).unwrap_or(&[])),
+            )
+            .0
+        } else {
+            maybe_uninit_fill_from(vectors, keys.iter().map(|key| self.get_vector(*key))).0
+        }
+    }
+
+    /// Marks the key as deleted.
+    ///
+    /// Returns true if the key was not deleted before, and it is now deleted.
+    pub fn delete(&mut self, key: PointOffsetType) -> bool {
         let is_deleted = !self.deleted.replace(key as usize, true);
         if is_deleted {
             self.deleted_count += 1;
@@ -143,7 +188,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     }
 
     pub fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     /// Get [`BitSlice`] representation for deleted vectors with deletion flags
@@ -152,10 +197,6 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     /// vectors in this segment.
     pub fn deleted_vector_bitslice(&self) -> &BitSlice {
         &self.deleted
-    }
-
-    pub fn prefault_mmap_pages(&self, path: &Path) -> mmap_ops::PrefaultMmapPages {
-        mmap_ops::PrefaultMmapPages::new(self.mmap.clone(), Some(path))
     }
 
     #[cfg(target_os = "linux")]
@@ -201,6 +242,11 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             self.process_points_simple(points, callback);
             Ok(())
         }
+    }
+
+    pub fn populate(&self) -> OperationResult<()> {
+        self.mmap.populate();
+        Ok(())
     }
 }
 

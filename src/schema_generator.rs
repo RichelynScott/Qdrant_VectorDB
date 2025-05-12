@@ -1,13 +1,16 @@
-use api::grpc::models::{CollectionsResponse, VersionInfo};
+#![allow(dead_code)]
+
+use api::rest::models::{CollectionsResponse, HardwareUsage, VersionInfo};
+use api::rest::schema::PointInsertOperations;
 use api::rest::{
     FacetRequest, FacetResponse, QueryGroupsRequest, QueryRequest, QueryRequestBatch,
     QueryResponse, Record, ScoredPoint, SearchMatrixOffsetsResponse, SearchMatrixPairsResponse,
-    SearchMatrixRequest,
+    SearchMatrixRequest, UpdateVectors,
 };
 use collection::operations::cluster_ops::ClusterOperations;
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::payload_ops::{DeletePayload, SetPayload};
-use collection::operations::point_ops::{PointInsertOperations, PointsSelector, WriteOrdering};
+use collection::operations::point_ops::{PointsSelector, WriteOrdering};
 use collection::operations::snapshot_ops::{
     ShardSnapshotRecover, SnapshotDescription, SnapshotRecover,
 };
@@ -18,9 +21,9 @@ use collection::operations::types::{
     RecommendRequestBatch, ScrollRequest, ScrollResult, SearchGroupsRequest, SearchRequest,
     SearchRequestBatch, UpdateResult,
 };
-use collection::operations::vector_ops::{DeleteVectors, UpdateVectors};
-use schemars::gen::SchemaSettings;
+use collection::operations::vector_ops::DeleteVectors;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaSettings;
 use serde::Serialize;
 use storage::content_manager::collection_meta_ops::{
     ChangeAliasesOperation, CreateCollection, UpdateCollection,
@@ -28,8 +31,8 @@ use storage::content_manager::collection_meta_ops::{
 use storage::types::ClusterStatus;
 
 use crate::common::helpers::LocksOption;
-use crate::common::points::{CreateFieldIndex, UpdateOperations};
 use crate::common::telemetry::TelemetryData;
+use crate::common::update::{CreateFieldIndex, UpdateOperations};
 
 mod actix;
 mod common;
@@ -94,12 +97,13 @@ struct AllDefinitions {
     bk: SearchMatrixPairsResponse,
     bl: FacetRequest,
     bm: FacetResponse,
+    bn: HardwareUsage,
 }
 
 fn save_schema<T: JsonSchema>() {
     let settings = SchemaSettings::draft07();
-    let gen = settings.into_generator();
-    let schema = gen.into_root_schema_for::<T>();
+    let generator = settings.into_generator();
+    let schema = generator.into_root_schema_for::<T>();
     let schema_str = serde_json::to_string_pretty(&schema).unwrap();
     println!("{schema_str}")
 }

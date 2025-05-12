@@ -6,6 +6,7 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::UpdateResult;
 use collection::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use collection::shards::shard::ShardId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 
 use super::TableOfContent;
@@ -19,11 +20,12 @@ impl TableOfContent {
         requests: Vec<ShardQueryRequest>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<ShardQueryResponse>> {
         let collection = self.get_collection_unchecked(collection_name).await?;
 
         let res = collection
-            .query_batch_internal(requests, &shard_selection, timeout)
+            .query_batch_internal(requests, &shard_selection, timeout, hw_measurement_acc)
             .await?;
 
         Ok(res)
@@ -35,11 +37,12 @@ impl TableOfContent {
         request: FacetParams,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<FacetResponse> {
         let collection = self.get_collection_unchecked(collection_name).await?;
 
         let res = collection
-            .facet(request, shard_selection, None, timeout)
+            .facet(request, shard_selection, None, timeout, hw_measurement_acc)
             .await?;
 
         Ok(res)
@@ -50,13 +53,15 @@ impl TableOfContent {
         collection_name: &str,
         shard_id: ShardId,
         access: Access,
+        wait: bool,
+        timeout: Option<Duration>,
     ) -> StorageResult<UpdateResult> {
         let collection_pass = access
             .check_collection_access(collection_name, AccessRequirements::new().write().whole())?;
 
         self.get_collection(&collection_pass)
             .await?
-            .cleanup_local_shard(shard_id)
+            .cleanup_local_shard(shard_id, wait, timeout)
             .await
             .map_err(Into::into)
     }

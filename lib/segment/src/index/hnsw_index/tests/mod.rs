@@ -1,12 +1,10 @@
 mod test_compact_graph_layer;
 mod test_graph_connectivity;
 
-use std::path::Path;
-
 use common::types::PointOffsetType;
 use rand::Rng;
 
-use super::graph_links::GraphLinksRam;
+use super::graph_links::GraphLinksFormat;
 use crate::data_types::vectors::VectorElementType;
 use crate::fixtures::index_fixtures::{FakeFilterContext, TestRawScorerProducer};
 use crate::index::hnsw_index::graph_layers::GraphLayers;
@@ -43,6 +41,7 @@ where
         let fake_filter_context = FakeFilterContext {};
         let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
         let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone()).unwrap();
+
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let level = graph_layers_builder.get_random_layer(rng);
         graph_layers_builder.set_levels(idx, level);
@@ -55,10 +54,10 @@ pub(crate) fn create_graph_layer_fixture<TMetric: Metric<VectorElementType>, R>(
     num_vectors: usize,
     m: usize,
     dim: usize,
+    format: GraphLinksFormat,
     use_heuristic: bool,
     rng: &mut R,
-    links_path: Option<&Path>,
-) -> (TestRawScorerProducer<TMetric>, GraphLayers<GraphLinksRam>)
+) -> (TestRawScorerProducer<TMetric>, GraphLayers)
 where
     R: Rng + ?Sized,
 {
@@ -67,6 +66,6 @@ where
 
     (
         vector_holder,
-        graph_layers_builder.into_graph_layers(links_path).unwrap(),
+        graph_layers_builder.into_graph_layers_ram(format),
     )
 }

@@ -15,6 +15,7 @@ use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::immutable_point_to_values::ImmutablePointToValues;
+use crate::index::field_index::mmap_point_to_values::MmapValue;
 
 pub struct ImmutableMapIndex<N: MapIndexKey + ?Sized> {
     value_to_points: HashMap<N::Owned, ContainerSegment>,
@@ -57,22 +58,24 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
     /// Return mutable slice of a container which holds point_ids for given value.
     ///
     /// The returned slice is sorted and does contain deleted values.
+    /// The returned offset is the start of the range in the container.
     fn get_mut_point_ids_slice<'a>(
         value_to_points: &HashMap<N::Owned, ContainerSegment>,
         value_to_points_container: &'a mut [PointOffsetType],
         value: &N,
-    ) -> Option<&'a mut [PointOffsetType]> {
+    ) -> Option<(&'a mut [PointOffsetType], usize)> {
         match value_to_points.get(value) {
             Some(entry) if entry.count > 0 => {
                 let range = entry.range.start as usize..entry.range.end as usize;
                 let vals = &mut value_to_points_container[range];
-                Some(vals)
+                Some((vals, entry.range.start as usize))
             }
             _ => None,
         }
     }
 
     /// Shrinks the range of values-to-points by one.
+    ///
     /// Returns true if the last element was removed.
     fn shrink_value_range(
         value_to_points: &mut HashMap<N::Owned, ContainerSegment>,
@@ -119,7 +122,7 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
         value: &N,
         idx: PointOffsetType,
     ) {
-        let Some(values) =
+        let Some((values, offset)) =
             Self::get_mut_point_ids_slice(value_to_points, value_to_points_container, value)
         else {
             debug_assert!(false, "value {value} not found in value_to_points");
@@ -128,13 +131,16 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
 
         // Finds the index of `idx` in values-to-points map which we want to remove
         // We mark it as removed in deleted flags
-        if let Ok(pos) = values.binary_search(&idx) {
+        if let Ok(local_pos) = values.binary_search(&idx) {
+            let pos = offset + local_pos;
+
             if deleted_value_to_points_container.len() < pos + 1 {
                 deleted_value_to_points_container.resize(pos + 1, false);
             }
 
-            // TODO: add debug assertion to ensure we actually flip a bit here?
-            deleted_value_to_points_container.set(pos, true);
+            #[allow(unused_variables)]
+            let did_exist = !deleted_value_to_points_container.replace(pos, true);
+            debug_assert!(did_exist, "value {value} was already deleted");
         }
 
         if Self::shrink_value_range(value_to_points, value) {
@@ -222,12 +228,18 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
         // Sort IDs in each slice of points
         // This is very important because we binary search
         for value in self.value_to_points.keys() {
-            if let Some(slice) = Self::get_mut_point_ids_slice(
+            if let Some((slice, _offset)) = Self::get_mut_point_ids_slice(
                 &self.value_to_points,
                 &mut self.value_to_points_container,
                 value.borrow(),
             ) {
                 slice.sort_unstable();
+            } else {
+                debug_assert!(
+                    false,
+                    "value {} not found in value_to_points",
+                    value.borrow(),
+                );
             }
         }
 
@@ -237,8 +249,15 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
     }
 
     pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&N) -> bool) -> bool {
-        self.point_to_values
-            .check_values_any(idx, |v| check_fn(v.borrow()))
+        let mut hw_count_val = 0;
+
+        let res = self.point_to_values.check_values_any(idx, |v| {
+            let v = v.borrow();
+            hw_count_val += <N as MmapValue>::mmapped_size(v.as_referenced());
+            check_fn(v)
+        });
+
+        res
     }
 
     pub fn get_values(&self, idx: PointOffsetType) -> Option<impl Iterator<Item = &N> + '_> {
@@ -273,8 +292,8 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
             .map(|(k, entry)| (k.borrow(), entry.count as usize))
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
-        self.value_to_points.keys().map(|k| {
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter)> {
+        self.value_to_points.keys().map(move |k| {
             (
                 k.borrow(),
                 Box::new(self.get_iterator(k.borrow()).copied()) as IdIter,

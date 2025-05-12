@@ -3,21 +3,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
+use segment::data_types::segment_manifest::SegmentManifests;
+use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, SnapshotFormat, WithPayload, WithPayloadInterface,
-    WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SizeStats, SnapshotFormat, WithPayload,
+    WithPayloadInterface, WithVector,
 };
 use tokio::runtime::Handle;
 
+use crate::operations::OperationWithClockTag;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, Record, ShardStatus, UpdateResult,
+    CountRequestInternal, CountResult, OptimizersStatus, PointRequestInternal, RecordInternal,
+    ShardStatus, UpdateResult,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
-use crate::operations::OperationWithClockTag;
 use crate::shards::shard_trait::ShardOperation;
 use crate::shards::telemetry::LocalShardTelemetry;
 
@@ -43,18 +47,44 @@ impl DummyShard {
         self.dummy()
     }
 
+    pub fn segment_manifests(&self) -> CollectionResult<SegmentManifests> {
+        self.dummy()
+    }
+
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.dummy()
     }
+
+    pub async fn on_strict_mode_config_update(&mut self) {}
 
     pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
         LocalShardTelemetry {
             variant_name: Some("dummy shard".into()),
             status: Some(ShardStatus::Green),
             total_optimized_points: 0,
-            segments: vec![],
+            vectors_size_bytes: None,
+            payloads_size_bytes: None,
+            num_points: None,
+            num_vectors: None,
+            segments: None,
             optimizations: Default::default(),
+            async_scorer: None,
         }
+    }
+
+    pub fn get_optimization_status(&self) -> OptimizersStatus {
+        OptimizersStatus::Ok
+    }
+
+    pub fn get_size_stats(&self) -> SizeStats {
+        SizeStats::default()
+    }
+
+    pub fn estimate_cardinality(
+        &self,
+        _: Option<&Filter>,
+    ) -> CollectionResult<CardinalityEstimation> {
+        self.dummy()
     }
 
     fn dummy<T>(&self) -> CollectionResult<T> {
@@ -64,7 +94,12 @@ impl DummyShard {
 
 #[async_trait]
 impl ShardOperation for DummyShard {
-    async fn update(&self, _: OperationWithClockTag, _: bool) -> CollectionResult<UpdateResult> {
+    async fn update(
+        &self,
+        _: OperationWithClockTag,
+        _: bool,
+        _: HwMeasurementAcc,
+    ) -> CollectionResult<UpdateResult> {
         self.dummy()
     }
 
@@ -79,7 +114,8 @@ impl ShardOperation for DummyShard {
         _: &Handle,
         _: Option<&OrderBy>,
         _: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+        _: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         self.dummy()
     }
 
@@ -92,6 +128,7 @@ impl ShardOperation for DummyShard {
         _: Arc<CoreSearchRequestBatch>,
         _: &Handle,
         _: Option<Duration>,
+        _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         self.dummy()
     }
@@ -101,6 +138,7 @@ impl ShardOperation for DummyShard {
         _: Arc<CountRequestInternal>,
         _: &Handle,
         _: Option<Duration>,
+        _: HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
         self.dummy()
     }
@@ -112,7 +150,8 @@ impl ShardOperation for DummyShard {
         _: &WithVector,
         _: &Handle,
         _: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+        _: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         self.dummy()
     }
 
@@ -121,6 +160,7 @@ impl ShardOperation for DummyShard {
         _requests: Arc<Vec<ShardQueryRequest>>,
         _search_runtime_handle: &Handle,
         _timeout: Option<Duration>,
+        _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
         self.dummy()
     }
@@ -130,6 +170,7 @@ impl ShardOperation for DummyShard {
         _: Arc<FacetParams>,
         _search_runtime_handle: &Handle,
         _: Option<Duration>,
+        _: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
         self.dummy()
     }

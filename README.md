@@ -11,7 +11,7 @@
     <a href="https://api.qdrant.tech/"><img src="https://img.shields.io/badge/Docs-OpenAPI%203.0-success?style=flat-square" alt="OpenAPI Docs"></a>
     <a href="https://github.com/qdrant/qdrant/blob/master/LICENSE"><img src="https://img.shields.io/github/license/qdrant/qdrant?style=flat-square" alt="Apache 2.0 License"></a>
     <a href="https://qdrant.to/discord"><img src="https://img.shields.io/discord/907569970500743200?logo=Discord&style=flat-square&color=7289da" alt="Discord"></a>
-    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2024-bc1439.svg?style=flat-square" alt="Roadmap 2024"></a>
+    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2025-bc1439.svg?style=flat-square" alt="Roadmap 2025"></a>
     <a href="https://cloud.qdrant.io/"><img src="https://img.shields.io/badge/Qdrant-Cloud-24386C.svg?logo=cloud&style=flat-square" alt="Qdrant Cloud"></a>
 </p>
 
@@ -168,7 +168,7 @@ You can also download raw OpenAPI [definitions](https://github.com/qdrant/qdrant
 
 ### gRPC
 
-For faster production-tier searches, Qdrant also provides a gRPC interface. You can find gRPC documentation [here](https://qdrant.tech/documentation/quick-start/#grpc).
+For faster production-tier searches, Qdrant also provides a gRPC interface. You can find gRPC documentation [here](https://qdrant.tech/documentation/interfaces/#grpc-interface).
 
 ## Features
 
@@ -185,7 +185,7 @@ ensuring that you can implement any desired business logic on top of similarity 
 
 To address the limitations of vector embeddings when searching for specific keywords, Qdrant introduces support for sparse vectors in addition to the regular dense ones.
 
-Sparse vectors can be viewed as an generalisation of BM25 or TF-IDF ranking. They enable you to harness the capabilities of transformer-based neural networks to weigh individual tokens effectively.
+Sparse vectors can be viewed as an generalization of BM25 or TF-IDF ranking. They enable you to harness the capabilities of transformer-based neural networks to weigh individual tokens effectively.
 
 
 ### Vector Quantization and On-Disk Storage
@@ -224,7 +224,7 @@ Examples and/or documentation of Qdrant integrations:
 ## Contacts
 
 - Have questions? Join our [Discord channel](https://qdrant.to/discord) or mention [@qdrant_engine on Twitter](https://qdrant.to/twitter)
-- Want to stay in touch with latest releases? Subscribe to our [Newsletters](https://qdrant.to/newsletter)
+- Want to stay in touch with latest releases? Subscribe to our [Newsletters](https://qdrant.tech/subscribe/)
 - Looking for a managed cloud? Check [pricing](https://qdrant.tech/pricing/), need something personalised? We're at [info@qdrant.tech](mailto:info@qdrant.tech)
 
 ## License

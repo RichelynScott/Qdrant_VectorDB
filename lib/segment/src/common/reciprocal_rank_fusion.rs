@@ -1,9 +1,9 @@
 //! Reciprocal Rank Fusion (RRF) is a method for combining rankings from multiple sources.
-//! See https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
+//! See <https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf>
 
 use std::collections::hash_map::Entry;
 
-use ahash::{HashMap, HashMapExt};
+use ahash::AHashMap;
 use ordered_float::OrderedFloat;
 
 use crate::types::{ExtendedPointId, ScoredPoint};
@@ -24,7 +24,7 @@ fn position_score(position: usize) -> f32 {
 /// Does not break ties.
 pub fn rrf_scoring(responses: impl IntoIterator<Item = Vec<ScoredPoint>>) -> Vec<ScoredPoint> {
     // track scored points by id
-    let mut points_by_id: HashMap<ExtendedPointId, ScoredPoint> = HashMap::new();
+    let mut points_by_id: AHashMap<ExtendedPointId, ScoredPoint> = AHashMap::new();
 
     for response in responses {
         for (pos, mut point) in response.into_iter().enumerate() {
@@ -102,7 +102,7 @@ mod tests {
         ];
 
         // top 10
-        let scored_points = rrf_scoring(responses.clone());
+        let scored_points = rrf_scoring(responses);
         assert_eq!(scored_points.len(), 4);
         // assert that the list is sorted
         assert!(scored_points.windows(2).all(|w| w[0].score >= w[1].score));

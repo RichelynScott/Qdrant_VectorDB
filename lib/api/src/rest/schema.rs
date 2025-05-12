@@ -1,16 +1,20 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use common::types::ScoreType;
+use common::validation::validate_multi_vector;
 use schemars::JsonSchema;
 use segment::common::utils::MaybeOneOrMany;
 use segment::data_types::order_by::OrderBy;
 use segment::json_path::JsonPath;
 use segment::types::{
-    Filter, IntPayloadType, PointIdType, SearchParams, ShardKey, WithPayloadInterface, WithVector,
+    Condition, Filter, GeoPoint, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey,
+    VectorNameBuf, WithPayloadInterface, WithVector,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sparse::common::sparse_vector::SparseVector;
-use validator::Validate;
+use validator::{Validate, ValidationErrors};
 
 /// Type for dense vector
 pub type DenseVector = Vec<segment::data_types::vectors::VectorElementType>;
@@ -18,13 +22,40 @@ pub type DenseVector = Vec<segment::data_types::vectors::VectorElementType>;
 /// Type for multi dense vector
 pub type MultiDenseVector = Vec<DenseVector>;
 
+/// Vector Data
+/// Vectors can be described directly with values
+/// Or specified with source "objects" for inference
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum Vector {
     Dense(DenseVector),
-    Sparse(sparse::common::sparse_vector::SparseVector),
+    Sparse(SparseVector),
     MultiDense(MultiDenseVector),
     Document(Document),
+    Image(Image),
+    Object(InferenceObject),
+}
+
+/// Vector Data stored in Point
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged, rename_all = "snake_case")]
+pub enum VectorOutput {
+    Dense(DenseVector),
+    Sparse(SparseVector),
+    MultiDense(MultiDenseVector),
+}
+
+impl Validate for Vector {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        match self {
+            Vector::Dense(_) => Ok(()),
+            Vector::Sparse(v) => v.validate(),
+            Vector::MultiDense(m) => validate_multi_vector(m),
+            Vector::Document(_) => Ok(()),
+            Vector::Image(_) => Ok(()),
+            Vector::Object(_) => Ok(()),
+        }
+    }
 }
 
 fn vector_example() -> DenseVector {
@@ -39,14 +70,15 @@ fn multi_dense_vector_example() -> MultiDenseVector {
     ]
 }
 
-fn named_vector_example() -> HashMap<String, Vector> {
+fn named_vector_example() -> HashMap<VectorNameBuf, Vector> {
     let mut map = HashMap::new();
     map.insert(
-        "image-embeddings".to_string(),
+        "image-embeddings".into(),
         Vector::Dense(vec![0.873, 0.140625, 0.8976]),
     );
     map
 }
+
 /// Full vector data per point separator with single and multiple vector modes
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged, rename_all = "snake_case")]
@@ -56,21 +88,22 @@ pub enum VectorStruct {
     #[schemars(example = "multi_dense_vector_example")]
     MultiDense(MultiDenseVector),
     #[schemars(example = "named_vector_example")]
-    Named(HashMap<String, Vector>),
+    Named(HashMap<VectorNameBuf, Vector>),
     Document(Document),
+    Image(Image),
+    Object(InferenceObject),
 }
 
-/// WARN: Work-in-progress, unimplemented
-///
-/// Text document for embedding. Requires inference infrastructure, unimplemented.
+/// Vector data stored in Point
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
-pub struct Document {
-    /// Text of the document
-    /// This field will be used as input for the embedding model
-    pub text: String,
-    /// Name of the model used to generate the vector
-    /// List of available models depends on a provider
-    pub model: Option<String>,
+#[serde(untagged, rename_all = "snake_case")]
+pub enum VectorStructOutput {
+    #[schemars(example = "vector_example")]
+    Single(DenseVector),
+    #[schemars(example = "multi_dense_vector_example")]
+    MultiDense(MultiDenseVector),
+    #[schemars(example = "named_vector_example")]
+    Named(HashMap<VectorNameBuf, VectorOutput>),
 }
 
 impl VectorStruct {
@@ -84,10 +117,104 @@ impl VectorStruct {
                 Vector::Sparse(vector) => vector.indices.is_empty(),
                 Vector::MultiDense(vector) => vector.is_empty(),
                 Vector::Document(_) => false,
+                Vector::Image(_) => false,
+                Vector::Object(_) => false,
             }),
             VectorStruct::Document(_) => false,
+            VectorStruct::Image(_) => false,
+            VectorStruct::Object(_) => false,
         }
     }
+}
+
+impl Validate for VectorStruct {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        match self {
+            VectorStruct::Single(_) => Ok(()),
+            VectorStruct::MultiDense(v) => validate_multi_vector(v),
+            VectorStruct::Named(v) => common::validation::validate_iter(v.values()),
+            VectorStruct::Document(_) => Ok(()),
+            VectorStruct::Image(_) => Ok(()),
+            VectorStruct::Object(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct Options {
+    /// Parameters for the model
+    /// Values of the parameters are model-specific
+    pub options: Option<HashMap<String, Value>>,
+}
+
+impl Hash for Options {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Order of keys in the map should not affect the hash
+        if let Some(options) = &self.options {
+            let mut keys: Vec<_> = options.keys().collect();
+            keys.sort();
+            for key in keys {
+                key.hash(state);
+                options.get(key).unwrap().hash(state);
+            }
+        }
+    }
+}
+
+/// WARN: Work-in-progress, unimplemented
+///
+/// Text document for embedding. Requires inference infrastructure, unimplemented.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Hash, Validate)]
+pub struct Document {
+    /// Text of the document
+    /// This field will be used as input for the embedding model
+    #[schemars(example = "document_text_example")]
+    pub text: String,
+    /// Name of the model used to generate the vector
+    /// List of available models depends on a provider
+    #[validate(length(min = 1))]
+    #[schemars(length(min = 1), example = "model_example")]
+    pub model: String,
+    #[serde(flatten)]
+    pub options: Options,
+}
+
+/// WARN: Work-in-progress, unimplemented
+///
+/// Image object for embedding. Requires inference infrastructure, unimplemented.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Hash)]
+pub struct Image {
+    /// Image data: base64 encoded image or an URL
+    #[schemars(example = "image_value_example")]
+    pub image: Value,
+    /// Name of the model used to generate the vector
+    /// List of available models depends on a provider
+    #[validate(length(min = 1))]
+    #[schemars(length(min = 1), example = "image_model_example")]
+    pub model: String,
+    /// Parameters for the model
+    /// Values of the parameters are model-specific
+    #[serde(flatten)]
+    pub options: Options,
+}
+
+/// WARN: Work-in-progress, unimplemented
+///
+/// Custom object for embedding. Requires inference infrastructure, unimplemented.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Hash, Validate)]
+pub struct InferenceObject {
+    /// Arbitrary data, used as input for the embedding model
+    /// Used if the model requires more than one input or a custom input
+    pub object: Value,
+    /// Name of the model used to generate the vector
+    /// List of available models depends on a provider
+    #[validate(length(min = 1))]
+    #[schemars(length(min = 1), example = "model_example")]
+    pub model: String,
+    /// Parameters for the model
+    /// Values of the parameters are model-specific
+    #[serde(flatten)]
+    pub options: Options,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -95,12 +222,23 @@ impl VectorStruct {
 pub enum BatchVectorStruct {
     Single(Vec<DenseVector>),
     MultiDense(Vec<MultiDenseVector>),
-    Named(HashMap<String, Vec<Vector>>),
+    Named(HashMap<VectorNameBuf, Vec<Vector>>),
     Document(Vec<Document>),
+    Image(Vec<Image>),
+    Object(Vec<InferenceObject>),
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct Batch {
+    pub ids: Vec<PointIdType>,
+    pub vectors: BatchVectorStruct,
+    pub payloads: Option<Vec<Option<Payload>>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq)]
 #[serde(untagged)]
+#[serde(expecting = "Expected a string or an integer")]
 pub enum ShardKeySelector {
     ShardKey(ShardKey),
     ShardKeys(Vec<ShardKey>),
@@ -113,6 +251,22 @@ fn version_example() -> segment::types::SeqNumberType {
 
 fn score_example() -> common::types::ScoreType {
     0.75
+}
+
+fn document_text_example() -> String {
+    "This is a document text".to_string()
+}
+
+fn model_example() -> String {
+    "jinaai/jina-embeddings-v2-base-en".to_string()
+}
+
+fn image_value_example() -> String {
+    "https://example.com/image.jpg".to_string()
+}
+
+fn image_model_example() -> String {
+    "Qdrant/clip-ViT-B-32-vision".to_string()
 }
 
 /// Search result
@@ -131,7 +285,7 @@ pub struct ScoredPoint {
     pub payload: Option<segment::types::Payload>,
     /// Vector of the point
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector: Option<VectorStruct>,
+    pub vector: Option<VectorStructOutput>,
     /// Shard Key
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKey>,
@@ -151,7 +305,7 @@ pub struct Record {
     pub payload: Option<segment::types::Payload>,
     /// Vector of the point
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector: Option<VectorStruct>,
+    pub vector: Option<VectorStructOutput>,
     /// Shard Key
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<segment::types::ShardKey>,
@@ -186,6 +340,7 @@ pub enum NamedVectorStruct {
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
 #[serde(untagged)]
+#[serde(expecting = "Expected a string, or an object with a key, direction and/or start_from")]
 pub enum OrderByInterface {
     Key(JsonPath),
     Struct(OrderBy),
@@ -212,6 +367,8 @@ pub enum VectorInput {
     MultiDenseVector(MultiDenseVector),
     Id(segment::types::PointIdType),
     Document(Document),
+    Image(Image),
+    Object(InferenceObject),
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -227,7 +384,7 @@ pub struct QueryRequestInternal {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -248,6 +405,7 @@ pub struct QueryRequestInternal {
     pub offset: Option<usize>,
 
     /// Options for specifying which vectors to include into the response. Default is false.
+    #[serde(alias = "with_vectors")]
     pub with_vector: Option<WithVector>,
 
     /// Options for specifying which payload to include or not. Default is false.
@@ -280,6 +438,7 @@ pub struct QueryResponse {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[serde(expecting = "Expected some form of vector, id, or a type of query")]
 pub enum QueryInterface {
     Nearest(VectorInput),
     Query(Query),
@@ -305,6 +464,9 @@ pub enum Query {
 
     /// Fuse the results of multiple prefetches.
     Fusion(FusionQuery),
+
+    /// Score boosting via an arbitrary formula
+    Formula(FormulaQuery),
 
     /// Sample points from the collection, non-deterministically.
     Sample(SampleQuery),
@@ -347,6 +509,14 @@ pub struct FusionQuery {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FormulaQuery {
+    pub formula: Expression,
+
+    #[serde(default)]
+    pub defaults: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SampleQuery {
     pub sample: Sample,
@@ -365,7 +535,7 @@ pub struct Prefetch {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -397,12 +567,16 @@ pub struct Prefetch {
 ///   examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`.
 ///   If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just
 ///   the `max_pos_score`.
+///
+/// * `sum_scores` - Uses custom search objective. Compares against all inputs, sums all the scores.
+///   Scores against positive vectors are added, against negatives are subtracted.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendStrategy {
     #[default]
     AverageVector,
     BestScore,
+    SumScores,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -465,6 +639,143 @@ impl ContextPair {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Expression {
+    Constant(f32),
+    Variable(String),
+    Condition(Box<Condition>),
+    GeoDistance(GeoDistance),
+    Datetime(DatetimeExpression),
+    DatetimeKey(DatetimeKeyExpression),
+    Mult(MultExpression),
+    Sum(SumExpression),
+    Neg(NegExpression),
+    Abs(AbsExpression),
+    Div(DivExpression),
+    Sqrt(SqrtExpression),
+    Pow(PowExpression),
+    Exp(ExpExpression),
+    Log10(Log10Expression),
+    Ln(LnExpression),
+    LinDecay(LinDecayExpression),
+    ExpDecay(ExpDecayExpression),
+    GaussDecay(GaussDecayExpression),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistance {
+    pub geo_distance: GeoDistanceParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistanceParams {
+    /// The origin geo point to measure from
+    pub origin: GeoPoint,
+    /// Payload field with the destination geo point
+    pub to: JsonPath,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DatetimeExpression {
+    pub datetime: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DatetimeKeyExpression {
+    pub datetime_key: JsonPath,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MultExpression {
+    pub mult: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SumExpression {
+    pub sum: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct NegExpression {
+    pub neg: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AbsExpression {
+    pub abs: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DivExpression {
+    pub div: DivParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DivParams {
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+    pub by_zero_default: Option<ScoreType>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SqrtExpression {
+    pub sqrt: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PowExpression {
+    pub pow: PowParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PowParams {
+    pub base: Box<Expression>,
+    pub exponent: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpExpression {
+    pub exp: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Log10Expression {
+    pub log10: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LnExpression {
+    pub ln: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LinDecayExpression {
+    pub lin_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpDecayExpression {
+    pub exp_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GaussDecayExpression {
+    pub gauss_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DecayParamsExpression {
+    /// The variable to decay.
+    pub x: Box<Expression>,
+    /// The target value to start decaying from. Defaults to 0.
+    pub target: Option<Box<Expression>>,
+    /// The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.
+    pub scale: Option<f32>,
+    /// The midpoint of the decay. Defaults to 0.5. Output will be this value when `|x - target| == scale`.
+    pub midpoint: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Sample {
     Random,
@@ -508,7 +819,7 @@ pub struct LookupLocation {
     /// Optional name of the vector field within the collection.
     /// If not provided, the default vector field will be used.
     #[serde(default)]
-    pub vector: Option<String>,
+    pub vector: Option<VectorNameBuf>,
 
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -635,7 +946,7 @@ pub struct QueryGroupsRequestInternal {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -686,7 +997,7 @@ pub struct SearchMatrixRequestInternal {
     #[validate(range(min = 1))]
     pub limit: Option<usize>,
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -781,4 +1092,142 @@ pub struct FacetValueHit {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FacetResponse {
     pub hits: Vec<FacetValueHit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct PointStruct {
+    /// Point id
+    pub id: PointIdType,
+    /// Vectors
+    #[serde(alias = "vectors")]
+    #[validate(nested)]
+    pub vector: VectorStruct,
+    /// Payload values (optional)
+    pub payload: Option<Payload>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, JsonSchema)]
+pub struct PointsBatch {
+    #[validate(nested)]
+    pub batch: Batch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct PointVectors {
+    /// Point id
+    pub id: PointIdType,
+    /// Vectors
+    #[serde(alias = "vectors")]
+    pub vector: VectorStruct,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
+pub struct UpdateVectors {
+    /// Points with named vectors
+    #[validate(nested)]
+    #[validate(length(min = 1, message = "must specify points to update"))]
+    pub points: Vec<PointVectors>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, Validate)]
+pub struct PointsList {
+    #[validate(nested)]
+    pub points: Vec<PointStruct>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+}
+
+impl<'de> serde::Deserialize<'de> for PointInsertOperations {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("batch") {
+                    PointsBatch::deserialize(serde_json::Value::Object(map))
+                        .map(PointInsertOperations::PointsBatch)
+                        .map_err(serde::de::Error::custom)
+                } else if map.contains_key("points") {
+                    PointsList::deserialize(serde_json::Value::Object(map))
+                        .map(PointInsertOperations::PointsList)
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    Err(serde::de::Error::custom(
+                        "Invalid PointInsertOperations format",
+                    ))
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "Invalid PointInsertOperations format",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone, JsonSchema)]
+#[serde(untagged)]
+pub enum PointInsertOperations {
+    /// Insert points from a batch.
+    PointsBatch(PointsBatch),
+    /// Insert points from a list
+    PointsList(PointsList),
+}
+
+impl Validate for PointInsertOperations {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            PointInsertOperations::PointsBatch(batch) => batch.validate(),
+            PointInsertOperations::PointsList(list) => list.validate(),
+        }
+    }
+}
+
+impl PointInsertOperations {
+    /// Amount of vectors in the operation request.
+    pub fn len(&self) -> usize {
+        match self {
+            PointInsertOperations::PointsBatch(batch) => batch.batch.ids.len(),
+            PointInsertOperations::PointsList(list) => list.points.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxOptimizationThreadsSetting {
+    #[default]
+    Auto,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, JsonSchema)]
+#[serde(untagged)]
+pub enum MaxOptimizationThreads {
+    Setting(MaxOptimizationThreadsSetting),
+    Threads(usize),
+}
+
+impl Default for MaxOptimizationThreads {
+    fn default() -> Self {
+        MaxOptimizationThreads::Setting(MaxOptimizationThreadsSetting::Auto)
+    }
+}
+
+impl From<MaxOptimizationThreads> for Option<usize> {
+    fn from(value: MaxOptimizationThreads) -> Self {
+        match value {
+            MaxOptimizationThreads::Setting(MaxOptimizationThreadsSetting::Auto) => None,
+            MaxOptimizationThreads::Threads(threads) => Some(threads),
+        }
+    }
 }

@@ -53,17 +53,17 @@ impl<'a> CompressedPostingVisitor<'a> {
     /// Check if the next value is in the compressed posting list.
     /// This function reuses the decompressed chunk to avoid unnecessary decompression.
     /// It is useful when the visitor is used to check the values in the increasing order.
-    pub fn contains_next_and_advance(&mut self, val: &PointOffsetType) -> bool {
+    pub fn contains_next_and_advance(&mut self, val: PointOffsetType) -> bool {
         #[cfg(test)]
         {
             // check if the checked values are in the increasing order
             if let Some(last_checked) = self.last_checked {
-                assert!(*val > last_checked);
+                assert!(val > last_checked);
             }
-            self.last_checked = Some(*val);
+            self.last_checked = Some(val);
         }
 
-        if !self.chunk_reader.is_in_postings_range(*val) {
+        if !self.chunk_reader.is_in_postings_range(val) {
             return false;
         }
 
@@ -93,14 +93,10 @@ impl<'a> CompressedPostingVisitor<'a> {
         else {
             // value is in the noncompressed postings range
             self.decompressed_chunk_idx = None;
-            return self
-                .chunk_reader
-                .remainder_postings
-                .binary_search(val)
-                .is_ok();
+            return self.chunk_reader.search_in_remainder(val);
         };
         // if the value is the initial value of the chunk, we don't need to decompress the chunk
-        if self.chunk_reader.chunks[chunk_index].initial == *val {
+        if self.chunk_reader.get_chunk_index(chunk_index).initial == val {
             return true;
         }
 
@@ -110,8 +106,8 @@ impl<'a> CompressedPostingVisitor<'a> {
         self.find_in_decompressed_and_advance(val)
     }
 
-    fn find_in_decompressed_and_advance(&mut self, val: &PointOffsetType) -> bool {
-        match self.decompressed_chunk[self.decompressed_chunk_start_index..].binary_search(val) {
+    fn find_in_decompressed_and_advance(&mut self, val: PointOffsetType) -> bool {
+        match self.decompressed_chunk[self.decompressed_chunk_start_index..].binary_search(&val) {
             Ok(idx) => {
                 self.decompressed_chunk_start_index = idx;
                 true
@@ -126,14 +122,10 @@ impl<'a> CompressedPostingVisitor<'a> {
     pub fn get_by_offset(&mut self, offset: usize) -> Option<PointOffsetType> {
         let chunk_idx = offset / BitPackerImpl::BLOCK_LEN;
 
-        if chunk_idx >= self.chunk_reader.chunks.len() {
+        if chunk_idx >= self.chunk_reader.chunks_len() {
             // Reminder postings
-            let reminder_idx = offset - self.chunk_reader.chunks.len() * BitPackerImpl::BLOCK_LEN;
-            return self
-                .chunk_reader
-                .remainder_postings
-                .get(reminder_idx)
-                .copied();
+            let reminder_idx = offset - self.chunk_reader.chunks_len() * BitPackerImpl::BLOCK_LEN;
+            return self.chunk_reader.get_remainder_posting(reminder_idx);
         }
 
         if self.decompressed_chunk_idx != Some(chunk_idx) {
@@ -148,6 +140,7 @@ impl<'a> CompressedPostingVisitor<'a> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
 
@@ -161,7 +154,7 @@ mod tests {
                 let mut visitor = CompressedPostingVisitor::new(compressed_posting_list.reader());
                 for i in 0..build_step * 1000 {
                     if i % search_step == 0 {
-                        assert_eq!(visitor.contains_next_and_advance(&i), set.contains(&i));
+                        assert_eq!(visitor.contains_next_and_advance(i), set.contains(&i));
                     }
                 }
             }
@@ -175,23 +168,23 @@ mod tests {
 
         let reader = posting.reader();
 
-        assert!(reader.contains(&0));
-        assert!(reader.contains(&10));
-        assert!(reader.contains(&400));
-        assert!(reader.contains(&8940));
-        assert!(reader.contains(&8950));
-        assert!(reader.contains(&8960));
-        assert!(reader.contains(&8970));
-        assert!(reader.contains(&8980));
-        assert!(reader.contains(&8990));
-        assert!(reader.contains(&9970));
-        assert!(reader.contains(&9980));
+        assert!(reader.contains(0));
+        assert!(reader.contains(10));
+        assert!(reader.contains(400));
+        assert!(reader.contains(8940));
+        assert!(reader.contains(8950));
+        assert!(reader.contains(8960));
+        assert!(reader.contains(8970));
+        assert!(reader.contains(8980));
+        assert!(reader.contains(8990));
+        assert!(reader.contains(9970));
+        assert!(reader.contains(9980));
 
-        assert!(!reader.contains(&1));
-        assert!(!reader.contains(&11));
-        assert!(!reader.contains(&401));
-        assert!(!reader.contains(&9971));
-        assert!(!reader.contains(&9981));
+        assert!(!reader.contains(1));
+        assert!(!reader.contains(11));
+        assert!(!reader.contains(401));
+        assert!(!reader.contains(9971));
+        assert!(!reader.contains(9981));
 
         let mut visitor = CompressedPostingVisitor::new(reader);
 

@@ -1,13 +1,14 @@
+use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 //use atomic_refcell::{AtomicRef, AtomicRefCell};
-use rocksdb::{ColumnFamily, DBRecoveryMode, LogLevel, Options, WriteOptions, DB};
+use rocksdb::{ColumnFamily, DB, DBRecoveryMode, LogLevel, Options, WriteOptions};
 
+use crate::common::Flusher;
 //use crate::common::arc_rwlock_iterator::ArcRwLockIterator;
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::common::Flusher;
 
 const DB_CACHE_SIZE: usize = 10 * 1024 * 1024; // 10 mb
 const DB_MAX_LOG_SIZE: usize = 1024 * 1024; // 1 mb
@@ -21,10 +22,20 @@ pub const DB_VERSIONS_CF: &str = "version";
 /// If there is no Column Family specified, key-value pair is associated with Column Family "default".
 pub const DB_DEFAULT_CF: &str = "default";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DatabaseColumnWrapper {
     database: Arc<RwLock<DB>>,
     column_name: String,
+    write_options: Arc<WriteOptions>,
+    db_options: Arc<Options>,
+}
+
+impl Debug for DatabaseColumnWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseColumnWrapper")
+            .field("column_name", &self.column_name)
+            .finish()
+    }
 }
 
 pub struct DatabaseColumnIterator<'a> {
@@ -38,7 +49,7 @@ pub struct LockedDatabaseColumnWrapper<'a> {
 }
 
 /// RocksDB options (both global and for column families)
-pub fn db_options() -> Options {
+pub fn make_db_options() -> Options {
     let mut options: Options = Options::default();
     options.set_write_buffer_size(DB_CACHE_SIZE); // write_buffer_size is enforced per column family.
     options.create_if_missing(true);
@@ -64,11 +75,32 @@ pub fn open_db<T: AsRef<str>>(
     path: &Path,
     vector_paths: &[T],
 ) -> Result<Arc<RwLock<DB>>, rocksdb::Error> {
-    let mut column_families = vec![DB_PAYLOAD_CF, DB_MAPPING_CF, DB_VERSIONS_CF, DB_DEFAULT_CF];
+    let options = make_db_options();
+    let mut column_families = vec![DB_PAYLOAD_CF, DB_DEFAULT_CF];
+
+    // We're using new ID tracker, only add RocksDB ID tracker column families if they already exist
+    // Not adding them prevents older Qdrant versions from trying to load the unused RocksDB ID tracker
+    {
+        let exists = check_db_exists(path);
+        let existing_column_families = if exists {
+            DB::list_cf(&options, path)?
+        } else {
+            vec![]
+        };
+
+        // Add column families to create or open
+        // - on database creation: always add CFs
+        // - on database open: only add CFs if they already exist
+        column_families.extend(
+            [DB_MAPPING_CF, DB_VERSIONS_CF]
+                .into_iter()
+                .filter(|cf| !exists || existing_column_families.iter().any(|other| other == cf)),
+        );
+    }
+
     for vector_path in vector_paths {
         column_families.push(vector_path.as_ref());
     }
-    let options = db_options();
     // Make sure that all column families have the same options
     let column_with_options = column_families
         .into_iter()
@@ -84,26 +116,30 @@ pub fn check_db_exists(path: &Path) -> bool {
 }
 
 pub fn open_db_with_existing_cf(path: &Path) -> Result<Arc<RwLock<DB>>, rocksdb::Error> {
+    let options = make_db_options();
     let existing_column_families = if check_db_exists(path) {
-        DB::list_cf(&db_options(), path)?
+        DB::list_cf(&options, path)?
     } else {
         vec![]
     };
-    let options = db_options();
     // Make sure that all column families have the same options
     let column_with_options = existing_column_families
         .into_iter()
         .map(|cf| (cf, options.clone()))
         .collect::<Vec<_>>();
-    let db = DB::open_cf_with_opts(&db_options(), path, column_with_options)?;
+    let db = DB::open_cf_with_opts(&options, path, column_with_options)?;
     Ok(Arc::new(RwLock::new(db)))
 }
 
 impl DatabaseColumnWrapper {
     pub fn new(database: Arc<RwLock<DB>>, column_name: &str) -> Self {
+        let write_options = Arc::new(Self::make_write_options());
+        let db_options = Arc::new(make_db_options());
         Self {
             database,
             column_name: column_name.to_string(),
+            write_options,
+            db_options,
         }
     }
 
@@ -114,7 +150,7 @@ impl DatabaseColumnWrapper {
     {
         let db = self.database.read();
         let cf_handle = self.get_column_family(&db)?;
-        db.put_cf_opt(cf_handle, key, value, &Self::get_write_options())
+        db.put_cf_opt(cf_handle, key, value, &self.write_options)
             .map_err(|err| OperationError::service_error(format!("RocksDB put_cf error: {err}")))?;
         Ok(())
     }
@@ -128,6 +164,16 @@ impl DatabaseColumnWrapper {
         db.get_cf(cf_handle, key)
             .map_err(|err| OperationError::service_error(format!("RocksDB get_cf error: {err}")))?
             .ok_or_else(|| OperationError::service_error("RocksDB get_cf error: key not found"))
+    }
+
+    pub fn get_opt<K>(&self, key: K) -> OperationResult<Option<Vec<u8>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let db = self.database.read();
+        let cf_handle = self.get_column_family(&db)?;
+        db.get_cf(cf_handle, key)
+            .map_err(|err| OperationError::service_error(format!("RocksDB get_cf error: {err}")))
     }
 
     pub fn get_pinned<T, F>(&self, key: &[u8], f: F) -> OperationResult<Option<T>>
@@ -151,7 +197,7 @@ impl DatabaseColumnWrapper {
     {
         let db = self.database.read();
         let cf_handle = self.get_column_family(&db)?;
-        db.delete_cf_opt(cf_handle, key, &Self::get_write_options())
+        db.delete_cf_opt(cf_handle, key, &self.write_options)
             .map_err(|err| {
                 OperationError::service_error(format!("RocksDB delete_cf error: {err}"))
             })?;
@@ -171,15 +217,9 @@ impl DatabaseColumnWrapper {
         Box::new(move || {
             let db = database.read();
             let Some(column_family) = db.cf_handle(&column_name) else {
-                // It is possible, that the index was removed during the flush by user or another thread.
-                // In this case, non-existing column family is not an error, but an expected behavior.
-
-                // Still we want to log this event, for potential debugging.
-                log::warn!(
-                    "Flush: RocksDB cf_handle error: Cannot find column family {}. Ignoring",
-                    &column_name
-                );
-                return Ok(()); // ignore error
+                return Err(OperationError::RocksDbColumnFamilyNotFound {
+                    name: column_name.clone(),
+                });
             };
 
             db.flush_cf(column_family).map_err(|err| {
@@ -192,7 +232,7 @@ impl DatabaseColumnWrapper {
     pub fn create_column_family_if_not_exists(&self) -> OperationResult<()> {
         let mut db = self.database.write();
         if db.cf_handle(&self.column_name).is_none() {
-            db.create_cf(&self.column_name, &db_options())
+            db.create_cf(&self.column_name, &self.db_options)
                 .map_err(|err| {
                     OperationError::service_error(format!("RocksDB create_cf error: {err}"))
                 })?;
@@ -220,7 +260,7 @@ impl DatabaseColumnWrapper {
         Ok(db.cf_handle(&self.column_name).is_some())
     }
 
-    fn get_write_options() -> WriteOptions {
+    fn make_write_options() -> WriteOptions {
         let mut write_options = WriteOptions::default();
         write_options.set_sync(false);
         // RocksDB WAL is required for durability even if data is flushed
@@ -232,12 +272,10 @@ impl DatabaseColumnWrapper {
         &self,
         db: &'a parking_lot::RwLockReadGuard<'_, DB>,
     ) -> OperationResult<&'a ColumnFamily> {
-        db.cf_handle(&self.column_name).ok_or_else(|| {
-            OperationError::service_error(format!(
-                "RocksDB cf_handle error: Cannot find column family {}",
-                &self.column_name
-            ))
-        })
+        db.cf_handle(&self.column_name)
+            .ok_or_else(|| OperationError::RocksDbColumnFamilyNotFound {
+                name: self.column_name.clone(),
+            })
     }
 
     pub fn get_database(&self) -> Arc<RwLock<DB>> {
@@ -247,9 +285,19 @@ impl DatabaseColumnWrapper {
     pub fn get_column_name(&self) -> &str {
         &self.column_name
     }
+
+    /// Get the size of the storage in bytes
+    ///
+    /// The size of this column family in bytes, which is equal to the sum of the file size of its "levels"
+    pub fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        let db = self.database.read();
+        let cf_handle = self.get_column_family(&db)?;
+        let size = db.get_column_family_metadata_cf(cf_handle).size;
+        Ok(size as usize)
+    }
 }
 
-impl<'a> LockedDatabaseColumnWrapper<'a> {
+impl LockedDatabaseColumnWrapper<'_> {
     pub fn iter(&self) -> OperationResult<DatabaseColumnIterator> {
         DatabaseColumnIterator::new(&self.guard, self.column_name)
     }
@@ -268,7 +316,7 @@ impl<'a> DatabaseColumnIterator<'a> {
     }
 }
 
-impl<'a> Iterator for DatabaseColumnIterator<'a> {
+impl Iterator for DatabaseColumnIterator<'_> {
     type Item = (Box<[u8]>, Box<[u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {

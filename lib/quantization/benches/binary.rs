@@ -1,16 +1,15 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use std::sync::atomic::AtomicBool;
+
+use common::counter::hardware_counter::HardwareCounterCell;
+use criterion::{Criterion, criterion_group, criterion_main};
 use permutation_iterator::Permutor;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
 use quantization::encoded_vectors_binary::EncodedVectorsBin;
 use rand::{Rng, SeedableRng};
 
 fn generate_number(rng: &mut rand::rngs::StdRng) -> f32 {
-    let n = f32::signum(rng.gen_range(-1.0..1.0));
-    if n == 0.0 {
-        1.0
-    } else {
-        n
-    }
+    let n = f32::signum(rng.random_range(-1.0..1.0));
+    if n == 0.0 { 1.0 } else { n }
 }
 
 fn generate_vector(dim: usize, rng: &mut rand::rngs::StdRng) -> Vec<f32> {
@@ -27,7 +26,7 @@ fn binary_bench(c: &mut Criterion) {
         .map(|_| generate_vector(vector_dim, &mut rng))
         .collect();
     for _ in 0..vectors_count {
-        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
         vectors.push(vector);
     }
 
@@ -40,18 +39,20 @@ fn binary_bench(c: &mut Criterion) {
             distance_type: DistanceType::Dot,
             invert: false,
         },
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
     let query = generate_vector(vector_dim, &mut rng);
     let encoded_query = encoded_u128.encode_query(&query);
 
+    let hardware_counter = HardwareCounterCell::new();
+
     group.bench_function("score binary linear access u128", |b| {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = encoded_u128.score_point(&encoded_query, i);
+                _s = encoded_u128.score_point(&encoded_query, i, &hardware_counter);
             }
         });
     });
@@ -63,7 +64,7 @@ fn binary_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for &i in &permutation {
-                _s = encoded_u128.score_point(&encoded_query, i);
+                _s = encoded_u128.score_point(&encoded_query, i, &hardware_counter);
             }
         });
     });
@@ -77,7 +78,7 @@ fn binary_bench(c: &mut Criterion) {
             distance_type: DistanceType::Dot,
             invert: false,
         },
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
@@ -88,7 +89,7 @@ fn binary_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = encoded_u8.score_point(&encoded_query, i);
+                _s = encoded_u8.score_point(&encoded_query, i, &hardware_counter);
             }
         });
     });
@@ -100,7 +101,7 @@ fn binary_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for &i in &permutation {
-                _s = encoded_u8.score_point(&encoded_query, i);
+                _s = encoded_u8.score_point(&encoded_query, i, &hardware_counter);
             }
         });
     });

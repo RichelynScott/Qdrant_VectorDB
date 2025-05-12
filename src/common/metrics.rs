@@ -1,13 +1,16 @@
-use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
+use api::rest::models::HardwareUsage;
 use prometheus::TextEncoder;
+use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use segment::common::operation_time_statistics::OperationDurationStatistics;
 
+use super::telemetry_ops::hardware::HardwareTelemetry;
 use crate::common::telemetry::TelemetryData;
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppFeaturesTelemetry};
 use crate::common::telemetry_ops::cluster_telemetry::{ClusterStatusTelemetry, ClusterTelemetry};
 use crate::common::telemetry_ops::collections_telemetry::{
     CollectionTelemetryEnum, CollectionsTelemetry,
 };
+use crate::common::telemetry_ops::memory_telemetry::MemoryTelemetry;
 use crate::common::telemetry_ops::requests_telemetry::{
     GrpcTelemetry, RequestsTelemetry, WebApiTelemetry,
 };
@@ -107,8 +110,18 @@ impl MetricsProvider for TelemetryData {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
         self.app.add_metrics(metrics);
         self.collections.add_metrics(metrics);
-        self.cluster.add_metrics(metrics);
-        self.requests.add_metrics(metrics);
+        if let Some(cluster) = &self.cluster {
+            cluster.add_metrics(metrics);
+        }
+        if let Some(requests) = &self.requests {
+            requests.add_metrics(metrics);
+        }
+        if let Some(hardware) = &self.hardware {
+            hardware.add_metrics(metrics);
+        }
+        if let Some(mem) = &self.memory {
+            mem.add_metrics(metrics);
+        }
     }
 }
 
@@ -181,7 +194,7 @@ impl MetricsProvider for ClusterTelemetry {
             vec![gauge(if *enabled { 1.0 } else { 0.0 }, &[])],
         ));
 
-        if let Some(ref status) = status {
+        if let Some(status) = status {
             status.add_metrics(metrics);
         }
     }
@@ -276,6 +289,112 @@ impl MetricsProvider for GrpcTelemetry {
     }
 }
 
+impl MetricsProvider for MemoryTelemetry {
+    fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        metrics.push(metric_family(
+            "memory_active_bytes",
+            "Total number of bytes in active pages allocated by the application",
+            MetricType::GAUGE,
+            vec![gauge(self.active_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_allocated_bytes",
+            "Total number of bytes allocated by the application",
+            MetricType::GAUGE,
+            vec![gauge(self.allocated_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_metadata_bytes",
+            "Total number of bytes dedicated to metadata",
+            MetricType::GAUGE,
+            vec![gauge(self.metadata_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_resident_bytes",
+            "Maximum number of bytes in physically resident data pages mapped",
+            MetricType::GAUGE,
+            vec![gauge(self.resident_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_retained_bytes",
+            "Total number of bytes in virtual memory mappings",
+            MetricType::GAUGE,
+            vec![gauge(self.retained_bytes as f64, &[])],
+        ));
+    }
+}
+
+impl MetricsProvider for HardwareTelemetry {
+    fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        for (collection, hw_info) in self.collection_data.iter() {
+            let HardwareUsage {
+                cpu,
+                payload_io_read,
+                payload_io_write,
+                payload_index_io_read,
+                payload_index_io_write,
+                vector_io_read,
+                vector_io_write,
+            } = hw_info;
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_cpu",
+                "CPU measurements of a collection",
+                MetricType::COUNTER,
+                vec![counter(*cpu as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_io_read",
+                "Total IO payload read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*payload_io_read as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_index_io_read",
+                "Total IO payload index read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(
+                    *payload_index_io_read as f64,
+                    &[("id", collection)],
+                )],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_index_io_write",
+                "Total IO payload index write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(
+                    *payload_index_io_write as f64,
+                    &[("id", collection)],
+                )],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_io_write",
+                "Total IO payload write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*payload_io_write as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_vector_io_read",
+                "Total IO vector read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*vector_io_read as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_vector_io_write",
+                "Total IO vector write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*vector_io_write as f64, &[("id", collection)])],
+            ));
+        }
+    }
+}
+
 /// A helper struct to build a vector of [`MetricFamily`] out of a collection of
 /// [`OperationDurationStatistics`].
 #[derive(Default)]
@@ -299,7 +418,7 @@ impl OperationDurationMetricsBuilder {
     ) {
         self.total.push(counter(stat.count as f64, labels));
         self.fail_total
-            .push(counter(stat.fail_count as f64, labels));
+            .push(counter(stat.fail_count.unwrap_or_default() as f64, labels));
 
         if !add_timings {
             return;
@@ -319,7 +438,7 @@ impl OperationDurationMetricsBuilder {
         ));
         self.duration_histogram_secs.push(histogram(
             stat.count as u64,
-            stat.total_duration_micros as f64 / 1_000_000.0,
+            stat.total_duration_micros.unwrap_or(0) as f64 / 1_000_000.0,
             &stat
                 .duration_micros_histogram
                 .iter()

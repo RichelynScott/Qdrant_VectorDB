@@ -24,14 +24,13 @@ use segment::json_path::JsonPath;
 use segment::types::{ExtendedPointId, PayloadFieldSchema, PointIdType};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
-use validator::Validate;
 
 use crate::hash_ring::{HashRingRouter, ShardIds};
 use crate::shards::shard::{PeerId, ShardId};
 
 pub type ClockToken = u64;
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateIndex {
     pub field_name: JsonPath,
@@ -114,24 +113,38 @@ impl ClockTag {
 
 impl From<api::grpc::qdrant::ClockTag> for ClockTag {
     fn from(tag: api::grpc::qdrant::ClockTag) -> Self {
+        let api::grpc::qdrant::ClockTag {
+            peer_id,
+            clock_id,
+            clock_tick,
+            token,
+            force,
+        } = tag;
         Self {
-            peer_id: tag.peer_id,
-            clock_id: tag.clock_id,
-            clock_tick: tag.clock_tick,
-            token: tag.token,
-            force: tag.force,
+            peer_id,
+            clock_id,
+            clock_tick,
+            token,
+            force,
         }
     }
 }
 
 impl From<ClockTag> for api::grpc::qdrant::ClockTag {
     fn from(tag: ClockTag) -> Self {
+        let ClockTag {
+            peer_id,
+            clock_id,
+            clock_tick,
+            token,
+            force,
+        } = tag;
         Self {
-            peer_id: tag.peer_id,
-            clock_id: tag.clock_id,
-            clock_tick: tag.clock_tick,
-            token: tag.token,
-            force: tag.force,
+            peer_id,
+            clock_id,
+            clock_tick,
+            token,
+            force,
         }
     }
 }
@@ -161,12 +174,12 @@ impl CollectionUpdateOperations {
         )
     }
 
-    pub fn point_ids(&self) -> Vec<PointIdType> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
             Self::PointOperation(op) => op.point_ids(),
             Self::VectorOperation(op) => op.point_ids(),
             Self::PayloadOperation(op) => op.point_ids(),
-            Self::FieldIndexOperation(_) => Vec::new(),
+            Self::FieldIndexOperation(_) => None,
         }
     }
 
@@ -221,26 +234,6 @@ impl FieldIndexOperations {
         match self {
             FieldIndexOperations::CreateIndex(_) => true,
             FieldIndexOperations::DeleteIndex(_) => false,
-        }
-    }
-}
-
-impl Validate for FieldIndexOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            FieldIndexOperations::CreateIndex(create_index) => create_index.validate(),
-            FieldIndexOperations::DeleteIndex(_) => Ok(()),
-        }
-    }
-}
-
-impl Validate for CollectionUpdateOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            CollectionUpdateOperations::PointOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::VectorOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::PayloadOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::FieldIndexOperation(operation) => operation.validate(),
         }
     }
 }

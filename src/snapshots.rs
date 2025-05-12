@@ -45,7 +45,7 @@ pub fn recover_snapshots(
             split.next().is_none(),
             "Too many parts in snapshot mapping: {snapshot_params}"
         );
-        info!("Recovering snapshot {} from {}", collection_name, path);
+        info!("Recovering snapshot {collection_name} from {path}");
         // check if collection already exists
         // if it does, we need to check if we want to overwrite it
         // if not, we need to abort
@@ -57,7 +57,7 @@ pub fn recover_snapshots(
                     "Collection {collection_name} already exists. Use --force-snapshot to overwrite it."
                 );
             }
-            info!("Overwriting collection {}", collection_name);
+            info!("Overwriting collection {collection_name}");
         }
         let collection_temp_path = temp_dir
             .map(PathBuf::from)
@@ -127,7 +127,7 @@ pub fn recover_full_snapshot(
 
     let alias_path = Path::new(storage_dir).join(ALIASES_PATH);
     let mut alias_persistence =
-        AliasPersistence::open(alias_path).expect("Can't open database by the provided config");
+        AliasPersistence::open(&alias_path).expect("Can't open database by the provided config");
     for (alias, collection_name) in config_json.collections_aliases {
         if alias_persistence.get(&alias).is_some() && !force {
             panic!("Alias {alias} already exists. Use --force-snapshot to overwrite it.");

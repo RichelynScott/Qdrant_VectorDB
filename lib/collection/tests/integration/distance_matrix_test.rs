@@ -1,10 +1,13 @@
 use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
-use collection::operations::point_ops::{Batch, WriteOrdering};
+use collection::operations::point_ops::{
+    BatchPersisted, BatchVectorStructPersisted, WriteOrdering,
+};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::prelude::SmallRng;
 use rand::{Rng, SeedableRng};
-use segment::data_types::vectors::BatchVectorStructInternal;
+use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use tempfile::Builder;
 
 use crate::common::simple_collection_fixture;
@@ -18,16 +21,17 @@ async fn distance_matrix_empty() {
     // empty collection
     let collection = simple_collection_fixture(collection_dir.path(), 1).await;
 
+    let hw_acc = HwMeasurementAcc::new();
     let sample_size = 100;
     let limit_per_sample = 10;
     let request = CollectionSearchMatrixRequest {
         sample_size,
         limit_per_sample,
         filter: None,
-        using: "".to_string(), // default vector name
+        using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None)
+        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
         .await
         .unwrap();
 
@@ -47,33 +51,38 @@ async fn distance_matrix_anonymous_vector() {
     let mut rng = SmallRng::seed_from_u64(SEED);
 
     let vectors = (0..point_count)
-        .map(|_| rng.gen::<[f32; 4]>().to_vec())
+        .map(|_| rng.random::<[f32; 4]>().to_vec())
         .collect_vec();
 
+    let batch = BatchPersisted {
+        ids,
+        vectors: BatchVectorStructPersisted::Single(vectors),
+        payloads: None,
+    };
+
     let upsert_points = collection::operations::CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids,
-            vectors: BatchVectorStructInternal::from(vectors).into(),
-            payloads: None,
-        }
-        .into(),
+        collection::operations::point_ops::PointOperations::UpsertPoints(
+            collection::operations::point_ops::PointInsertOperationsInternal::from(batch),
+        ),
     );
 
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(upsert_points, true, WriteOrdering::default())
+        .update_from_client_simple(upsert_points, true, WriteOrdering::default(), hw_counter)
         .await
         .unwrap();
 
+    let hw_acc = HwMeasurementAcc::new();
     let sample_size = 100;
     let limit_per_sample = 10;
     let request = CollectionSearchMatrixRequest {
         sample_size,
         limit_per_sample,
         filter: None,
-        using: "".to_string(), // default vector name
+        using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None)
+        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
         .await
         .unwrap();
 

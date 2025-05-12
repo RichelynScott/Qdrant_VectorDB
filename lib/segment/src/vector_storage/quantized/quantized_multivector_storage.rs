@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
 use memmap2::MmapMut;
 use memory::mmap_type::MmapSlice;
@@ -25,6 +26,12 @@ pub trait MultivectorOffsetsStorage: Sized {
     fn save(&self, path: &Path) -> OperationResult<()>;
 
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl MultivectorOffsetsStorage for Vec<MultivectorOffset> {
@@ -32,7 +39,6 @@ impl MultivectorOffsetsStorage for Vec<MultivectorOffset> {
         let offsets_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(false)
             .open(path)?;
         let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
         let mut offsets_mmap_type =
@@ -47,6 +53,10 @@ impl MultivectorOffsetsStorage for Vec<MultivectorOffset> {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
         self[idx as usize]
     }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
 }
 
 #[derive(Debug)]
@@ -60,7 +70,6 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageMmap {
         let offsets_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(false)
             .open(path)?;
         let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
         let offsets = unsafe { MmapSlice::<MultivectorOffset>::try_from(offsets_mmap)? };
@@ -81,6 +90,10 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageMmap {
 
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
         self.offsets[idx as usize]
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len()
     }
 }
 
@@ -105,6 +118,10 @@ where
     QuantizedStorage: EncodedVectors<TEncodedQuery>,
     TMultivectorOffsetsStorage: MultivectorOffsetsStorage,
 {
+    pub fn storage(&self) -> &QuantizedStorage {
+        &self.quantized_storage
+    }
+
     pub fn new(
         dim: usize,
         quantized_storage: QuantizedStorage,
@@ -151,6 +168,7 @@ where
         &self,
         query: &Vec<TEncodedQuery>,
         vector_index: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
     ) -> ScoreType {
         let offset = self.offsets.get_offset(vector_index);
         let mut sum = 0.0;
@@ -158,9 +176,9 @@ where
             let mut max_sim = ScoreType::NEG_INFINITY;
             // manual `max_by` for performance
             for i in 0..offset.count {
-                let sim = self
-                    .quantized_storage
-                    .score_point(inner_query, offset.start + i);
+                let sim =
+                    self.quantized_storage
+                        .score_point(inner_query, offset.start + i, hw_counter);
                 if sim > max_sim {
                     max_sim = sim;
                 }
@@ -176,6 +194,7 @@ where
         &self,
         vector_a_index: PointOffsetType,
         vector_b_index: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
     ) -> ScoreType {
         let offset_a = self.offsets.get_offset(vector_a_index);
         let offset_b = self.offsets.get_offset(vector_b_index);
@@ -184,9 +203,11 @@ where
             let mut max_sim = ScoreType::NEG_INFINITY;
             // manual `max_by` for performance
             for b in 0..offset_b.count {
-                let sim = self
-                    .quantized_storage
-                    .score_internal(offset_a.start + a, offset_b.start + b);
+                let sim = self.quantized_storage.score_internal(
+                    offset_a.start + a,
+                    offset_b.start + b,
+                    hw_counter,
+                );
                 if sim > max_sim {
                     max_sim = sim;
                 }
@@ -195,6 +216,18 @@ where
             sum += max_sim;
         }
         sum
+    }
+
+    pub fn inner_storage(&self) -> &QuantizedStorage {
+        &self.quantized_storage
+    }
+
+    pub fn inner_vector_offset(&self, id: PointOffsetType) -> MultivectorOffset {
+        self.offsets.get_offset(id)
+    }
+
+    pub fn vectors_count(&self) -> usize {
+        self.offsets.len()
     }
 }
 
@@ -221,6 +254,10 @@ where
         )
     }
 
+    fn is_on_disk(&self) -> bool {
+        self.quantized_storage.is_on_disk()
+    }
+
     fn encode_query(&self, query: &[VectorElementType]) -> Vec<TEncodedQuery> {
         let multi_vector = TypedMultiDenseVectorRef {
             dim: self.dim,
@@ -232,15 +269,25 @@ where
             .collect()
     }
 
-    fn score_point(&self, query: &Vec<TEncodedQuery>, i: PointOffsetType) -> ScoreType {
+    fn score_point(
+        &self,
+        query: &Vec<TEncodedQuery>,
+        i: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> ScoreType {
         match self.multi_vector_config.comparator {
-            MultiVectorComparator::MaxSim => self.score_point_max_similarity(query, i),
+            MultiVectorComparator::MaxSim => self.score_point_max_similarity(query, i, hw_counter),
         }
     }
 
-    fn score_internal(&self, i: PointOffsetType, j: PointOffsetType) -> ScoreType {
+    fn score_internal(
+        &self,
+        i: PointOffsetType,
+        j: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> ScoreType {
         match self.multi_vector_config.comparator {
-            MultiVectorComparator::MaxSim => self.score_internal_max_similarity(i, j),
+            MultiVectorComparator::MaxSim => self.score_internal_max_similarity(i, j, hw_counter),
         }
     }
 }

@@ -1,21 +1,19 @@
-#[allow(dead_code)] // May contain functions used in different binaries. Not actually dead
 pub mod actix_telemetry;
 pub mod api;
 mod auth;
 mod certificate_helpers;
-#[allow(dead_code)] // May contain functions used in different binaries. Not actually dead
 pub mod helpers;
 pub mod web_ui;
 
 use std::io;
 use std::sync::Arc;
 
-use ::api::grpc::models::{ApiResponse, ApiStatus, VersionInfo};
+use ::api::rest::models::{ApiResponse, ApiStatus, VersionInfo};
 use actix_cors::Cors;
-use actix_multipart::form::tempfile::TempFileConfig;
 use actix_multipart::form::MultipartFormConfig;
-use actix_web::middleware::{Compress, Condition, Logger};
-use actix_web::{error, get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_multipart::form::tempfile::TempFileConfig;
+use actix_web::middleware::{Compress, Condition, Logger, NormalizePath};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, error, get, web};
 use actix_web_extras::middleware::Condition as ConditionEx;
 use api::facet_api::config_facet_api;
 use collection::operations::validation;
@@ -39,13 +37,13 @@ use crate::actix::api::shards_api::config_shards_api;
 use crate::actix::api::snapshot_api::config_snapshots_api;
 use crate::actix::api::update_api::config_update_api;
 use crate::actix::auth::{Auth, WhitelistItem};
-use crate::actix::web_ui::{web_ui_factory, web_ui_folder, WEB_UI_PATH};
+use crate::actix::web_ui::{WEB_UI_PATH, web_ui_factory, web_ui_folder};
 use crate::common::auth::AuthKeys;
 use crate::common::debugger::DebuggerState;
 use crate::common::health;
 use crate::common::http_client::HttpClient;
 use crate::common::telemetry::TelemetryCollector;
-use crate::settings::{max_web_workers, Settings};
+use crate::settings::{Settings, max_web_workers};
 use crate::tracing::LoggerHandle;
 
 #[get("/")]
@@ -53,7 +51,6 @@ pub async fn index() -> impl Responder {
     HttpResponse::Ok().json(VersionInfo::default())
 }
 
-#[allow(dead_code)]
 pub fn init(
     dispatcher: Arc<Dispatcher>,
     telemetry_collector: Arc<tokio::sync::Mutex<TelemetryCollector>>,
@@ -86,6 +83,7 @@ pub fn init(
         let http_client = web::Data::new(HttpClient::from_settings(&settings)?);
         let health_checker = web::Data::new(health_checker);
         let web_ui_available = web_ui_folder(&settings);
+        let service_config = web::Data::new(settings.service.clone());
 
         let mut api_key_whitelist = vec![
             WhitelistItem::exact("/"),
@@ -117,6 +115,8 @@ pub fn init(
                 .wrap(ConditionEx::from_option(auth_keys.as_ref().map(
                     |auth_keys| Auth::new(auth_keys.clone(), api_key_whitelist.clone()),
                 )))
+                // Normalize path
+                .wrap(NormalizePath::trim())
                 .wrap(Condition::new(settings.service.enable_cors, cors))
                 .wrap(
                     // Set up logger, but avoid logging hot status endpoints
@@ -142,6 +142,7 @@ pub fn init(
                 .app_data(validate_json_config)
                 .app_data(TempFileConfig::default().directory(&upload_dir))
                 .app_data(MultipartFormConfig::default().total_limit(usize::MAX))
+                .app_data(service_config.clone())
                 .service(index)
                 .configure(config_collections_api)
                 .configure(config_snapshots_api)
@@ -196,7 +197,7 @@ pub fn init(
             server.bind(bind_addr)?
         };
 
-        log::info!("Qdrant HTTP listening on {}", port);
+        log::info!("Qdrant HTTP listening on {port}");
         server.run().await
     })
 }
@@ -240,6 +241,7 @@ fn validation_error_handler(
         result: None,
         status: ApiStatus::Error(msg),
         time: 0.0,
+        usage: None,
     });
     error::InternalError::from_response(err, response).into()
 }

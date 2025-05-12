@@ -11,7 +11,6 @@ use crate::operations::consistency_params::{ReadConsistency, ReadConsistencyType
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::resolve::{Resolve, ResolveCondition};
-use crate::shards::shard::Shard;
 use crate::shards::shard_trait::ShardOperation;
 
 impl ShardReplicaSet {
@@ -55,8 +54,8 @@ impl ShardReplicaSet {
 
         let read_consistency = read_consistency.unwrap_or_default();
 
-        let local_count = usize::from(self.peer_state(&self.this_peer_id()).is_some());
-        let active_local_count = usize::from(self.peer_is_active(&self.this_peer_id()));
+        let local_count = usize::from(self.peer_state(self.this_peer_id()).is_some());
+        let active_local_count = usize::from(self.peer_is_active(self.this_peer_id()));
 
         let remotes = self.remotes.read().await;
 
@@ -65,7 +64,7 @@ impl ShardReplicaSet {
         // TODO(resharding): Handle resharded shard?
         let active_remotes_count = remotes
             .iter()
-            .filter(|remote| self.peer_is_active(&remote.peer_id))
+            .filter(|remote| self.peer_is_active(remote.peer_id))
             .count();
 
         let total_count = local_count + remotes_count;
@@ -140,35 +139,26 @@ impl ShardReplicaSet {
             None => self.remotes.read().await,
         };
 
-        let (local, is_local_ready, update_watcher) = match self.local.try_read() {
-            Ok(local) => {
-                let update_watcher = local.deref().as_ref().map(Shard::watch_for_update);
+        let local_read = self.local.try_read().ok();
+        let local_read = local_read.as_ref().and_then(|local| local.as_ref());
 
-                let is_local_ready = local
-                    .deref()
-                    .as_ref()
-                    .map_or(false, |local| !local.is_update_in_progress());
-
-                (
-                    future::ready(local).left_future(),
-                    is_local_ready,
-                    update_watcher,
-                )
+        let (local, is_local_ready, update_watcher) = match local_read {
+            Some(local) => {
+                let update_watcher = local.watch_for_update();
+                let is_local_ready = !local.is_update_in_progress();
+                (Some(local), is_local_ready, Some(update_watcher))
             }
-
-            Err(_) => (self.local.read().right_future(), false, None),
+            None => (None, false, None),
         };
 
-        let local_is_active = self.peer_is_active(&self.this_peer_id());
+        let local_is_active = self.peer_is_active(self.this_peer_id());
 
         let local_operation = if local_is_active {
             let local_operation = async {
-                let local = local.await;
-
-                let Some(local) = local.deref() else {
+                let Some(local) = local else {
                     return Err(CollectionError::service_error(format!(
                         "Local shard {} not found",
-                        self.shard_id
+                        self.shard_id,
                     )));
                 };
 
@@ -183,10 +173,10 @@ impl ShardReplicaSet {
         // TODO(resharding): Handle resharded shard?
         let mut active_remotes: Vec<_> = remotes
             .iter()
-            .filter(|remote| self.peer_is_active(&remote.peer_id))
+            .filter(|remote| self.peer_is_active(remote.peer_id))
             .collect();
 
-        active_remotes.shuffle(&mut rand::thread_rng());
+        active_remotes.shuffle(&mut rand::rng());
 
         let remote_operations = active_remotes.into_iter().map(|remote| {
             read_operation(remote)

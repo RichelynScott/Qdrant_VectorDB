@@ -4,13 +4,9 @@ import os
 from .helpers.collection_setup import drop_collection
 from .helpers.helpers import request_with_validation
 
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost:6333")
-
-collection_name = 'test_multi_vector_persistence'
-
 
 @pytest.fixture(autouse=True)
-def setup(on_disk_vectors):
+def setup(on_disk_vectors, collection_name):
     multivector_collection_setup(collection_name=collection_name, on_disk_vectors=on_disk_vectors)
     yield
     drop_collection(collection_name=collection_name)
@@ -48,7 +44,7 @@ def multivector_collection_setup(
     assert response.ok
 
 
-def test_multi_vector_float_persisted():
+def test_multi_vector_float_persisted(collection_name):
     # batch upsert
     response = request_with_validation(
         api='/collections/{collection_name}/points',
@@ -139,7 +135,7 @@ def test_multi_vector_float_persisted():
     assert not response.ok
 
 
-def test_multi_vector_validation():
+def test_multi_vector_validation(collection_name):
     # fails because it uses and empty multi vector
     response = request_with_validation(
         api='/collections/{collection_name}/points',
@@ -231,7 +227,7 @@ def test_multi_vector_validation():
 
 
 # allow multivec upsert on legacy API by emulating a multivec input with a single dense vector
-def test_upsert_legacy_api():
+def test_upsert_legacy_api(collection_name):
     response = request_with_validation(
         api='/collections/{collection_name}/points',
         method="PUT",
@@ -286,7 +282,7 @@ def test_upsert_legacy_api():
 
 
 # allow multivec search on legacy API by emulating a multivec input with a single dense vector
-def test_search_legacy_api():
+def test_search_legacy_api(collection_name):
     # validate input size
     response = request_with_validation(
         api='/collections/{collection_name}/points/search',
@@ -376,3 +372,117 @@ def test_search_legacy_api():
     )
     assert response.ok
     assert len(response.json()['result']) == 3
+
+# document special case for Euclidean distance
+def test_multi_with_euclidean(collection_name):
+    drop_collection(collection_name=collection_name)
+
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        body={
+            "vectors": {
+                "my-multivec": {
+                    "size": 3,
+                    "distance": "Euclid",
+                    "multivector_config": {
+                        "comparator": "max_sim"
+                    }
+                }
+            },
+        }
+    )
+    assert response.ok
+
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="GET",
+        path_params={'collection_name': collection_name},
+    )
+    assert response.ok
+
+    # insert vector
+    response = request_with_validation(
+        api='/collections/{collection_name}/points',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "points": [
+                {
+                    "id": 1,
+                    "vector": {
+                        "my-multivec": [
+                            [1.0, 2.0, 3.0],
+                            [3.0, 3.0, 3.0],
+                            [4.0, 5.0, 6.0]
+                        ]
+                    }
+                },
+                {
+                    "id": 2,
+                    "vector": {
+                        "my-multivec": [
+                            [3.0, 3.0, 3.0],
+                            [4.0, 2.0, 1.0]
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    assert response.ok
+
+    # get by id 1
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/{id}',
+        method="GET",
+        path_params={'collection_name': collection_name, 'id': 1},
+    )
+
+    assert response.ok
+    point = response.json()['result']
+    assert point['id'] == 1
+    assert point['vector']['my-multivec'] == [
+        [1.0, 2.0, 3.0],
+        [3.0, 3.0, 3.0],
+        [4.0, 5.0, 6.0]
+    ]
+
+    # get by id 2
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/{id}',
+        method="GET",
+        path_params={'collection_name': collection_name, 'id': 2},
+    )
+
+    assert response.ok
+    point = response.json()['result']
+    assert point['id'] == 2
+    assert point['vector']['my-multivec'] == [
+        [3.0, 3.0, 3.0],
+        [4.0, 2.0, 1.0]
+    ]
+
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": [
+                [1.0, 2.0, 3.0],
+                [3.0, 3.0, 3.0],
+                [4.0, 5.0, 6.0]
+            ],
+            "using": "my-multivec",
+            "limit": 10
+        }
+    )
+    assert response.ok
+    assert len(response.json()['result']['points']) == 2
+    assert response.json()['result']['points'][0]['id'] == 1
+    assert response.json()['result']['points'][0]['score'] == 0.0
+
+    assert response.json()['result']['points'][1]['id'] == 2
+    assert response.json()['result']['points'][1]['score'] == 4.358899 # see `score_max_similarity` for details
