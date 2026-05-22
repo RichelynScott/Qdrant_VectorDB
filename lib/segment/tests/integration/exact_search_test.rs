@@ -5,22 +5,23 @@ use std::sync::atomic::AtomicBool;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::PointOffsetType;
-use itertools::Itertools;
-use rand::{Rng, rng};
+use ordered_float::OrderedFloat;
+use rand::RngExt;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, PayloadIndexRead, VectorIndexRead};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, PayloadSchemaType, Range,
-    SearchParams, SeqNumberType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig, PayloadSchemaType,
+    Range, SearchParams, SeqNumberType,
 };
 use tempfile::Builder;
 
@@ -38,7 +39,7 @@ fn exact_search_test() {
     let indexing_threshold = 500; // num vectors
     let num_payload_values = 2;
 
-    let mut rnd = rng();
+    let mut rng = rand::rng();
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -46,13 +47,14 @@ fn exact_search_test() {
     let int_key = "int";
 
     let hw_counter = HardwareCounterCell::new();
+    let is_stopped = AtomicBool::new(false);
 
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
 
-        let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
+        let int_payload = random_int_payload(&mut rng, num_payload_values..=num_payload_values);
         let payload = payload_json! {int_key: int_payload};
 
         segment
@@ -78,6 +80,7 @@ fn exact_search_test() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
     payload_index_ptr
@@ -89,10 +92,16 @@ fn exact_search_test() {
         )
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
-    let blocks = borrowed_payload_index
-        .payload_blocks(&JsonPath::new(int_key), indexing_threshold)
-        .collect_vec();
-    for block in blocks.iter() {
+    let mut blocks = Vec::new();
+    borrowed_payload_index
+        .with_view(|v| {
+            v.for_each_payload_block(&JsonPath::new(int_key), indexing_threshold, &mut |block| {
+                blocks.push(block);
+                Ok(())
+            })
+        })
+        .unwrap();
+    for block in &blocks {
         assert!(
             block.condition.range.is_some(),
             "only range conditions should be generated for this type of payload"
@@ -103,7 +112,9 @@ fn exact_search_test() {
     for block in &blocks {
         let px = payload_index_ptr.borrow();
         let filter = Filter::new_must(Condition::Field(block.condition.clone()));
-        let points = px.query_points(&filter, &hw_counter);
+        let points = px
+            .with_view(|v| v.query_points(&filter, &hw_counter, &is_stopped))
+            .unwrap();
         for point in points {
             coverage.insert(point, coverage.get(&point).unwrap_or(&0) + 1);
         }
@@ -122,7 +133,7 @@ fn exact_search_test() {
         "not all points are covered by payload blocks"
     );
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
     let hnsw_index = HNSWIndex::build(
         HnswIndexOpenArgs {
@@ -141,8 +152,11 @@ fn exact_search_test() {
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -150,7 +164,7 @@ fn exact_search_test() {
     let top = 3;
     let attempts = 50;
     for _i in 0..attempts {
-        let query = random_vector(&mut rnd, dim).into();
+        let query = random_vector(&mut rng, dim).into();
 
         let index_result = hnsw_index
             .search(
@@ -177,7 +191,7 @@ fn exact_search_test() {
         );
 
         let range_size = 40;
-        let left_range = rnd.random_range(0..400);
+        let left_range = rng.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
@@ -185,8 +199,8 @@ fn exact_search_test() {
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

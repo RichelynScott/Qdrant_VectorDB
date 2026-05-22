@@ -48,18 +48,13 @@ impl ResourceBudget {
         self.cpu_budget
     }
 
-    /// Returns the total IO budget.
-    pub fn available_io_budget(&self) -> usize {
-        self.io_budget
-    }
-
     /// For the given desired number of CPUs, return the minimum number of required CPUs.
     fn min_cpu_permits(&self, desired_cpus: usize) -> usize {
         desired_cpus.min(self.cpu_budget).div_ceil(2)
     }
 
     fn min_io_permits(&self, desired_io: usize) -> usize {
-        desired_io.min(self.io_budget) // Use as much IO as requested, not less
+        desired_io.min(self.io_budget).div_ceil(2)
     }
 
     fn try_acquire_cpu(
@@ -263,10 +258,12 @@ pub struct ResourcePermit {
     /// Semaphore permit.
     io_permit: Option<OwnedSemaphorePermit>,
 
-    /// A callback, which should be called when the permit is changed.
+    /// A callback, which should be called when the permit is changed manually.
     /// Originally used to notify the task manager that a permit is available
     /// and schedule more optimization tasks.
-    on_release: Option<Box<dyn Fn() + Send + Sync>>,
+    ///
+    /// WARN: is not called on drop, only when `release()` is called.
+    on_manual_release: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl ResourcePermit {
@@ -286,12 +283,12 @@ impl ResourcePermit {
             cpu_permit,
             num_io: io_count,
             io_permit,
-            on_release: None,
+            on_manual_release: None,
         }
     }
 
-    pub fn set_on_release(&mut self, on_release: impl Fn() + Send + Sync + 'static) {
-        self.on_release = Some(Box::new(on_release));
+    pub fn set_on_manual_release(&mut self, on_release: impl Fn() + Send + Sync + 'static) {
+        self.on_manual_release = Some(Box::new(on_release));
     }
 
     /// Merge the other resource permit into this one
@@ -334,7 +331,7 @@ impl ResourcePermit {
             cpu_permit: None,
             num_io: 0,
             io_permit: None,
-            on_release: None,
+            on_manual_release: None,
         }
     }
 
@@ -384,7 +381,7 @@ impl ResourcePermit {
         self.release_cpu_count(cpu);
         self.release_io_count(io);
 
-        if let Some(on_release) = &self.on_release {
+        if let Some(on_release) = &self.on_manual_release {
             on_release();
         }
     }
@@ -397,14 +394,10 @@ impl Drop for ResourcePermit {
             cpu_permit,
             num_io: _,
             io_permit,
-            on_release,
+            on_manual_release: _, // Only explicit release() should call the callback
         } = self;
 
         let _ = cpu_permit.take();
         let _ = io_permit.take();
-
-        if let Some(on_release) = on_release.take() {
-            on_release();
-        }
     }
 }

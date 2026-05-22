@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
 use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
-use segment::common::anonymize::Anonymize;
+use segment::common::anonymize::{Anonymize, anonymize_collection_values_opt};
 use serde::Serialize;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements};
+use storage::rbac::{AccessRequirements, Auth};
 use storage::types::{ClusterStatus, ConsensusThreadStatus, PeerInfo, StateRole};
 
 use crate::settings::Settings;
@@ -59,7 +60,7 @@ pub struct ClusterStatusTelemetry {
     pub pending_operations: usize,
     pub role: Option<StateRole>,
     pub is_voter: bool,
-    #[anonymize(value = None)]
+    #[anonymize(false)]
     pub peer_id: Option<PeerId>,
     pub consensus_thread_status: ConsensusThreadStatus,
 }
@@ -72,21 +73,30 @@ pub struct ClusterTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<ClusterConfigTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[anonymize(false)]
+    #[anonymize(with = anonymize_collection_values_opt)]
     pub peers: Option<HashMap<PeerId, PeerInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub peer_metadata: Option<HashMap<PeerId, PeerMetadata>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resharding_enabled: Option<bool>,
 }
 
 impl ClusterTelemetry {
     pub fn collect(
-        access: &Access,
+        auth: &Auth,
         detail: TelemetryDetail,
         dispatcher: &Dispatcher,
         settings: &Settings,
     ) -> Option<ClusterTelemetry> {
-        let global_access = AccessRequirements::new().whole();
-        if access.check_global_access(global_access).is_err() {
+        let global_access = AccessRequirements::new();
+        if auth
+            .unlogged_access()
+            .check_global_access(global_access)
+            .is_err()
+        {
             return None;
         }
 
@@ -115,6 +125,13 @@ impl ClusterTelemetry {
                     ClusterStatus::Enabled(cluster_info) => Some(cluster_info.peers),
                 })
                 .flatten(),
+            peer_metadata: (detail.level >= DetailsLevel::Level3)
+                .then(|| {
+                    dispatcher
+                        .consensus_state()
+                        .map(|state| state.persistent.read().peer_metadata_by_id())
+                })
+                .flatten(),
             metadata: (detail.level >= DetailsLevel::Level1)
                 .then(|| {
                     dispatcher
@@ -123,6 +140,13 @@ impl ClusterTelemetry {
                         .filter(|metadata| !metadata.is_empty())
                 })
                 .flatten(),
+            resharding_enabled: Some(settings.cluster.resharding_enabled),
         })
+    }
+
+    pub fn this_peer_id(&self) -> Option<PeerId> {
+        self.enabled
+            .then(|| self.status.as_ref().and_then(|j| j.peer_id))
+            .flatten()
     }
 }

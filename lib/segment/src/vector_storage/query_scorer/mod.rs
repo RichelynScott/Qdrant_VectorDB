@@ -1,37 +1,64 @@
+use bytemuck::TransparentWrapper;
+use common::typelevel::{TBool, TOption};
 use common::types::{PointOffsetType, ScoreType};
 
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::TypedMultiDenseVectorRef;
 use crate::spaces::metric::Metric;
 use crate::types::{MultiVectorComparator, MultiVectorConfig};
-use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
+use crate::vector_storage::VectorOffset;
 
 pub mod custom_query_scorer;
 pub mod metric_query_scorer;
 pub mod multi_custom_query_scorer;
 pub mod multi_metric_query_scorer;
 pub mod sparse_custom_query_scorer;
+pub mod sparse_metric_query_scorer;
 
-pub trait QueryScorer<TVector: ?Sized> {
+pub trait QueryScorer {
+    type TVector: ?Sized;
+
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType;
 
     /// Score a batch of points
     ///
-    /// Enable underlying storage to optimize pre-fetching of data
+    /// Enables underlying storage to optimize pre-fetching of data
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
         debug_assert_eq!(ids.len(), scores.len());
 
-        // no specific implementation for batch scoring
         for (idx, id) in ids.iter().enumerate() {
             scores[idx] = self.score_stored(*id);
         }
     }
 
-    fn score(&self, v2: &TVector) -> ScoreType;
+    fn score(&self, v2: &Self::TVector) -> ScoreType;
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType;
+
+    type SupportsBytes: TBool;
+    fn score_bytes(&self, _: Self::SupportsBytes, bytes: &[u8]) -> ScoreType;
+}
+
+pub trait QueryScorerBytes {
+    fn score_bytes(&self, bytes: &[u8]) -> ScoreType;
+}
+
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
+pub struct QueryScorerBytesImpl<TQueryScorer: QueryScorer>(
+    <TQueryScorer::SupportsBytes as TBool>::TOption<TQueryScorer>,
+);
+
+impl<TQueryScorer: QueryScorer> QueryScorerBytesImpl<TQueryScorer> {
+    pub fn new(query_scorer: &TQueryScorer) -> Option<&Self> {
+        TQueryScorer::SupportsBytes::then_some_ref(query_scorer).map(Self::wrap_ref)
+    }
+}
+
+impl<TQueryScorer: QueryScorer> QueryScorerBytes for QueryScorerBytesImpl<TQueryScorer> {
+    fn score_bytes(&self, bytes: &[u8]) -> ScoreType {
+        self.0.get().score_bytes(self.0.is_some(), bytes)
+    }
 }
 
 /// Colbert MaxSim metric, metric for multi-dense vectors
@@ -42,8 +69,8 @@ pub trait QueryScorer<TVector: ?Sized> {
 /// In that case the score value will be different but the ranking will be the same.
 /// We do that because of performance reasons and complex sort ordering of the vectors when applying the post-processing step.
 pub fn score_max_similarity<T: PrimitiveVectorElement, TMetric: Metric<T>>(
-    multi_dense_a: TypedMultiDenseVectorRef<T>,
-    multi_dense_b: TypedMultiDenseVectorRef<T>,
+    multi_dense_a: TypedMultiDenseVectorRef<'_, T>,
+    multi_dense_b: TypedMultiDenseVectorRef<'_, T>,
 ) -> ScoreType {
     debug_assert!(!multi_dense_a.is_empty());
     debug_assert!(!multi_dense_b.is_empty());
@@ -65,8 +92,8 @@ pub fn score_max_similarity<T: PrimitiveVectorElement, TMetric: Metric<T>>(
 
 fn score_multi<T: PrimitiveVectorElement, TMetric: Metric<T>>(
     multi_vector_config: &MultiVectorConfig,
-    multi_dense_a: TypedMultiDenseVectorRef<T>,
-    multi_dense_b: TypedMultiDenseVectorRef<T>,
+    multi_dense_a: TypedMultiDenseVectorRef<'_, T>,
+    multi_dense_b: TypedMultiDenseVectorRef<'_, T>,
 ) -> ScoreType {
     match multi_vector_config.comparator {
         MultiVectorComparator::MaxSim => {
@@ -82,20 +109,13 @@ fn score_multi<T: PrimitiveVectorElement, TMetric: Metric<T>>(
 /// - If the whole batch is less than one page - don't use prefetch
 /// - If one vector is bigger then the prefetch size - don't use prefetch
 /// - ???
-pub fn is_read_with_prefetch_efficient_points(ids: &[PointOffsetType]) -> bool {
-    is_read_with_prefetch_efficient(ids.iter().map(|x| *x as usize))
-}
-
-pub fn is_read_with_prefetch_efficient_vectors(ids: &[VectorOffsetType]) -> bool {
-    is_read_with_prefetch_efficient(ids.iter().copied())
-}
-
-fn is_read_with_prefetch_efficient(ids: impl IntoIterator<Item = usize>) -> bool {
+pub fn is_read_with_prefetch_efficient<O: VectorOffset>(ids: &[O]) -> bool {
     let mut min = usize::MAX;
     let mut max = 0;
     let mut n = 0;
 
     for id in ids {
+        let id = id.offset();
         if id < min {
             min = id;
         }
@@ -122,18 +142,18 @@ mod tests {
 
     #[test]
     fn test_check_ids_rather_contiguous() {
-        assert!(!is_read_with_prefetch_efficient_points(&[]));
-        assert!(!is_read_with_prefetch_efficient_points(&[1]));
-        assert!(is_read_with_prefetch_efficient_points(&[1, 2]));
-        assert!(is_read_with_prefetch_efficient_points(&[2, 1]));
-        assert!(is_read_with_prefetch_efficient_points(&[1, 2, 3, 9, 10]));
-        assert!(is_read_with_prefetch_efficient_points(&[
+        assert!(!is_read_with_prefetch_efficient::<u32>(&[]));
+        assert!(!is_read_with_prefetch_efficient::<u32>(&[1]));
+        assert!(is_read_with_prefetch_efficient::<u32>(&[1, 2]));
+        assert!(is_read_with_prefetch_efficient::<u32>(&[2, 1]));
+        assert!(is_read_with_prefetch_efficient::<u32>(&[1, 2, 3, 9, 10]));
+        assert!(is_read_with_prefetch_efficient::<u32>(&[
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10
         ]));
-        assert!(is_read_with_prefetch_efficient_points(&[
+        assert!(is_read_with_prefetch_efficient::<u32>(&[
             1, 2, 3, 4, 5, 6, 7, 8, 9, 11
         ]));
-        assert!(!is_read_with_prefetch_efficient_points(&[
+        assert!(!is_read_with_prefetch_efficient::<u32>(&[
             1, 2, 3, 4, 9, 1000, 12, 14
         ]));
     }

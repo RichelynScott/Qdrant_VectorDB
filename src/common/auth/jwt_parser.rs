@@ -36,6 +36,7 @@ impl JwtParser {
         let claims = match decode::<Claims>(token, &self.key, &self.validation) {
             Ok(token_data) => token_data.claims,
             Err(e) => {
+                #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
                 return match e.kind() {
                     ErrorKind::ExpiredSignature | ErrorKind::InvalidSignature => {
                         Some(Err(AuthError::Forbidden(e.to_string())))
@@ -53,10 +54,9 @@ impl JwtParser {
 
 #[cfg(test)]
 mod tests {
-    use segment::types::ValueVariants;
+    use serde_json::json;
     use storage::rbac::{
         Access, CollectionAccess, CollectionAccessList, CollectionAccessMode, GlobalAccessMode,
-        PayloadConstraint,
     };
 
     use super::*;
@@ -81,20 +81,11 @@ mod tests {
             access: Access::Collection(CollectionAccessList(vec![CollectionAccess {
                 collection: "collection".to_string(),
                 access: CollectionAccessMode::ReadWrite,
-                payload: Some(PayloadConstraint(
-                    vec![
-                        (
-                            "field1".parse().unwrap(),
-                            ValueVariants::String("value".to_string()),
-                        ),
-                        ("field2".parse().unwrap(), ValueVariants::Integer(42)),
-                        ("field3".parse().unwrap(), ValueVariants::Bool(true)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )),
+                #[expect(deprecated)]
+                payload: None,
             }])),
             value_exists: None,
+            subject: None,
         };
         let token = create_token(&claims);
 
@@ -103,6 +94,35 @@ mod tests {
         let decoded_claims = parser.decode(&token).unwrap().unwrap();
 
         assert_eq!(claims, decoded_claims);
+    }
+
+    #[test]
+    fn test_jwt_parser_with_deprecated_payloads() {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let claims = Claims {
+            sub: None,
+            exp: Some(exp),
+            access: Access::Collection(CollectionAccessList(vec![CollectionAccess {
+                collection: "collection".to_string(),
+                access: CollectionAccessMode::ReadWrite,
+                #[expect(deprecated)]
+                payload: Some(json!({
+                    "field1": "value",
+                    "field2": 42,
+                    "field3": true,
+                })),
+            }])),
+            value_exists: None,
+            subject: None,
+        };
+        let token = create_token(&claims);
+
+        let secret = "secret";
+        let parser = JwtParser::new(secret);
+        assert!(parser.decode(&token).unwrap().is_err()); // Validation should fail due to PayloadConstraint
     }
 
     #[test]
@@ -118,6 +138,7 @@ mod tests {
             exp: Some(exp),
             access: Access::Global(GlobalAccessMode::Read),
             value_exists: None,
+            subject: None,
         };
 
         let token = create_token(&claims);
@@ -139,12 +160,31 @@ mod tests {
     }
 
     #[test]
+    fn test_no_exp() {
+        let claims = Claims {
+            sub: None,
+            exp: None,
+            access: Access::Global(GlobalAccessMode::Read),
+            value_exists: None,
+            subject: None,
+        };
+
+        let token = create_token(&claims);
+
+        let secret = "secret";
+        let parser = JwtParser::new(secret);
+
+        assert!(matches!(parser.decode(&token), Some(Ok(_))));
+    }
+
+    #[test]
     fn test_invalid_token() {
         let claims = Claims {
             sub: None,
             exp: None,
             access: Access::Global(GlobalAccessMode::Read),
             value_exists: None,
+            subject: None,
         };
         let token = create_token(&claims);
 

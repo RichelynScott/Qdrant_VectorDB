@@ -5,9 +5,11 @@ use std::sync::atomic::AtomicBool;
 use atomic_refcell::AtomicRefCell;
 use common::budget::ResourcePermit;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, DenseVector, QueryVector, only_default_vector,
@@ -16,17 +18,18 @@ use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_dense_byte_vector, random_int_payload};
 use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::segment_constructor::build_segment;
 use segment::types::{
     BinaryQuantizationConfig, CompressionRatio, Condition, Distance, FieldCondition, Filter,
-    HnswConfig, Indexes, PayloadSchemaType, ProductQuantizationConfig, QuantizationSearchParams,
-    Range, ScalarQuantizationConfig, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig,
-    VectorStorageDatatype, VectorStorageType,
+    HnswConfig, HnswGlobalConfig, Indexes, PayloadSchemaType, ProductQuantizationConfig,
+    QuantizationSearchParams, Range, ScalarQuantizationConfig, SearchParams, SegmentConfig,
+    SeqNumberType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
 use segment::vector_storage::VectorStorageEnum;
-use segment::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use segment::vector_storage::quantized::quantized_vectors::{
+    QuantizedVectors, QuantizedVectorsStorageType,
+};
 use tempfile::Builder;
 
 enum QuantizationVariant {
@@ -88,8 +91,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     32, // ef
     5., // min_acc out of 100
 )]
-#[case::discovery_binary_dot(
-    QueryVariant::Discovery,
+#[case::discover_binary_dot(
+    QueryVariant::Discover,
     VectorStorageDatatype::Uint8,
     QuantizationVariant::Binary,
     Distance::Dot,
@@ -124,8 +127,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     32, // ef
     25., // min_acc out of 100
 )]
-#[case::discovery_binary_cosine(
-    QueryVariant::Discovery,
+#[case::discover_binary_cosine(
+    QueryVariant::Discover,
     VectorStorageDatatype::Uint8,
     QuantizationVariant::Binary,
     Distance::Cosine,
@@ -209,7 +212,7 @@ fn test_byte_storage_binary_quantization_hnsw(
     let full_scan_threshold = 16; // KB
     let num_payload_values = 2;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let dir_byte = Builder::new().prefix("segment_dir_byte").tempdir().unwrap();
     let quantized_data_path = dir_byte.path();
@@ -221,7 +224,7 @@ fn test_byte_storage_binary_quantization_hnsw(
             VectorDataConfig {
                 size: dim,
                 distance,
-                storage_type: VectorStorageType::Memory,
+                storage_type: VectorStorageType::default(),
                 index: Indexes::Plain {},
                 quantization_config: None,
                 multivector_config: None,
@@ -234,26 +237,27 @@ fn test_byte_storage_binary_quantization_hnsw(
 
     let int_key = "int";
 
-    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, true).unwrap();
+    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
     // check that `segment_byte` uses byte or half storage
     {
         let borrowed_storage = segment_byte.vector_data[DEFAULT_VECTOR_NAME]
             .vector_storage
             .borrow();
         let raw_storage: &VectorStorageEnum = &borrowed_storage;
-        assert!(
-            matches!(raw_storage, &VectorStorageEnum::DenseSimpleByte(_))
-                | matches!(raw_storage, &VectorStorageEnum::DenseSimpleHalf(_))
-        );
+        assert!(matches!(
+            raw_storage,
+            &VectorStorageEnum::DenseAppendableMemmapByte(_)
+                | &VectorStorageEnum::DenseAppendableMemmapHalf(_),
+        ));
     }
 
     let hw_counter = HardwareCounterCell::new();
 
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim, storage_data_type);
+        let vector = random_vector(&mut rng, dim, storage_data_type);
 
-        let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
+        let int_payload = random_int_payload(&mut rng, num_payload_values..=num_payload_values);
         let payload = payload_json! {int_key: int_payload};
 
         segment_byte
@@ -291,7 +295,12 @@ fn test_byte_storage_binary_quantization_hnsw(
             always_ram: None,
         }
         .into(),
-        QuantizationVariant::Binary => BinaryQuantizationConfig { always_ram: None }.into(),
+        QuantizationVariant::Binary => BinaryQuantizationConfig {
+            always_ram: None,
+            encoding: None,
+            query_encoding: None,
+        }
+        .into(),
     };
 
     segment_byte
@@ -301,6 +310,7 @@ fn test_byte_storage_binary_quantization_hnsw(
             let quantized_vectors = QuantizedVectors::create(
                 &vector_storage.vector_storage.borrow(),
                 &quantization_config,
+                QuantizedVectorsStorageType::Immutable,
                 quantized_data_path,
                 4,
                 &stopped,
@@ -317,9 +327,10 @@ fn test_byte_storage_binary_quantization_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = 1; // single-threaded for deterministic build
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
     let hnsw_index_byte = HNSWIndex::build(
         HnswIndexOpenArgs {
@@ -338,8 +349,11 @@ fn test_byte_storage_binary_quantization_hnsw(
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -348,10 +362,10 @@ fn test_byte_storage_binary_quantization_hnsw(
     let mut sames = 0;
     let attempts = 100;
     for _ in 0..attempts {
-        let query = random_query(&query_variant, &mut rnd, dim, storage_data_type);
+        let query = random_query(&query_variant, &mut rng, dim, storage_data_type);
 
         let range_size = 40;
-        let left_range = rnd.random_range(0..400);
+        let left_range = rng.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
@@ -359,8 +373,8 @@ fn test_byte_storage_binary_quantization_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

@@ -68,12 +68,14 @@ def update_points_payload(
         points,
         collection_name="test_collection",
         wait="true",
+        shard_key=None,
 ):
     r_batch = requests.post(
         f"{peer_url}/collections/{collection_name}/points/payload?wait={wait}",
         json={
             "points": points,
             "payload": {"city": random.choice(CITIES)},
+            "shard_key": shard_key,
         },
     )
     assert_http_ok(r_batch)
@@ -91,8 +93,12 @@ def upsert_random_points(
     ordering="weak",
     with_sparse_vector=True,
     shard_key=None,
+    num_cities=None,
     headers={},
+    extra_payload=None,
+    timeout=None,
 ):
+    extra_payload = extra_payload or {}
 
     def get_vector():
         # Create points in first peer's collection
@@ -114,13 +120,17 @@ def upsert_random_points(
                     {
                         "id": i + offset,
                         "vector": get_vector(),
-                        "payload": {"city": random.choice(CITIES)},
+                        "payload": {
+                            **extra_payload,
+                            "city": random.choice(CITIES[:num_cities]) if num_cities is not None else random.choice(CITIES)
+                        },
                     }
                     for i in range(size)
                 ],
                 "shard_key": shard_key,
             },
             headers=headers,
+            timeout=timeout,
         )
         if fail_on_error:
             assert_http_ok(r_batch)
@@ -143,6 +153,7 @@ def create_collection(
     sparse_vectors=True,
     default_segment_number=None,
     on_disk_payload=None,
+    fail_on_error=True,
 ):
     payload = {
         "vectors": {"size": DENSE_VECTOR_SIZE, "distance": "Dot"},
@@ -167,7 +178,8 @@ def create_collection(
         json=payload,
         headers=headers,
     )
-    assert_http_ok(r_batch)
+    if fail_on_error:
+        assert_http_ok(r_batch)
 
 
 def drop_collection(peer_url, collection="test_collection", timeout=10, headers={}):
@@ -210,6 +222,15 @@ def search(peer_url, vector, city, collection="test_collection"):
     assert_http_ok(r_search)
     return r_search.json()["result"]
 
+def scroll(peer_url, city, collection="test_collection"):
+    q = {
+        "with_vector": False,
+        "with_payload": True,
+        "filter": {"must": [{"key": "city", "match": {"value": city}}]},
+    }
+    r_search = requests.post(f"{peer_url}/collections/{collection}/points/scroll", json=q)
+    assert_http_ok(r_search)
+    return r_search.json()["result"]["points"]
 
 def count_counts(peer_url, collection="test_collection"):
     r_search = requests.post(
@@ -241,3 +262,10 @@ def get_telemetry_hw_info(peer_url, collection):
         return hw[collection]
     else:
         return None
+
+def get_telemetry_collections(peer_url):
+    r_search = requests.get(
+        f"{peer_url}/telemetry", params="details_level=3"
+    )
+    assert_http_ok(r_search)
+    return r_search.json()["result"]['collections']['collections']

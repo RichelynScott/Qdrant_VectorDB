@@ -3,18 +3,15 @@ const NUM_VECTORS_2: u64 = 500;
 
 use std::sync::atomic::AtomicBool;
 
-use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::entry::entry_point::SegmentEntry;
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::segment::Segment;
+use segment::entry::entry_point::{NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry};
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::segment_constructor::simple_segment_constructor::{
     VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment,
 };
-use segment::types::Distance;
-use segment::vector_storage::VectorStorage;
+use segment::types::{Distance, HnswGlobalConfig};
+use segment::vector_storage::VectorStorageRead;
 use tempfile::Builder;
 
 #[test]
@@ -86,20 +83,24 @@ fn test_rebuild_with_removed_vectors() {
             continue;
         }
         let idx = NUM_VECTORS_1 + i;
-        let vec = segment2.all_vectors(idx.into()).unwrap();
+        let vec = segment2.all_vectors(idx.into(), &hw_counter).unwrap();
         reference.push(vec);
     }
 
-    let mut builder =
-        SegmentBuilder::new(dir.path(), temp_dir.path(), &segment1.segment_config).unwrap();
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &segment1.segment_config,
+        &HnswGlobalConfig::default(),
+    )
+    .unwrap();
 
-    builder.update(&[&segment1, &segment2], &stopped).unwrap();
-
-    let permit_cpu_count = num_rayon_threads(0);
-    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    builder
+        .update(&[&segment1, &segment2], &stopped, &hw_counter)
+        .unwrap();
+
+    let merged_segment = builder.build_for_test(dir.path());
 
     let merged_points_count = merged_segment.available_point_count();
 
@@ -137,7 +138,7 @@ fn test_rebuild_with_removed_vectors() {
             continue;
         }
         let idx = NUM_VECTORS_1 + i;
-        let vec = merged_segment.all_vectors(idx.into()).unwrap();
+        let vec = merged_segment.all_vectors(idx.into(), &hw_counter).unwrap();
         merged_reference.push(vec);
     }
 

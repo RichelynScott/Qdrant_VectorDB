@@ -5,20 +5,21 @@ use std::sync::atomic::AtomicBool;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_multi_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_multi_vector;
-use segment::index::VectorIndex;
+use segment::index::VectorIndexRead;
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
 use segment::segment_constructor::{VectorIndexBuildArgs, build_segment};
 use segment::types::Distance::{Dot, Euclid};
 use segment::types::{
-    Distance, HnswConfig, Indexes, MultiVectorConfig, SegmentConfig, SeqNumberType,
-    VectorDataConfig, VectorStorageType,
+    Distance, HnswConfig, HnswGlobalConfig, Indexes, MultiVectorConfig, SegmentConfig,
+    SeqNumberType, VectorDataConfig, VectorStorageType,
 };
 use tempfile::Builder;
 
@@ -66,7 +67,7 @@ fn multi_vector_search_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-fn make_segment_index<R: Rng + ?Sized>(rnd: &mut R, distance: Distance) -> HNSWIndex {
+fn make_segment_index<R: Rng + ?Sized>(rng: &mut R, distance: Distance) -> HNSWIndex {
     let stopped = AtomicBool::new(false);
     let segment_dir = Builder::new().prefix("data_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -77,7 +78,7 @@ fn make_segment_index<R: Rng + ?Sized>(rnd: &mut R, distance: Distance) -> HNSWI
             VectorDataConfig {
                 size: VECTOR_DIM,
                 distance,
-                storage_type: VectorStorageType::Memory,
+                storage_type: VectorStorageType::default(),
                 index: Indexes::Plain {},
                 quantization_config: None,
                 multivector_config: Some(MultiVectorConfig::default()), // uses multivec config
@@ -90,10 +91,10 @@ fn make_segment_index<R: Rng + ?Sized>(rnd: &mut R, distance: Distance) -> HNSWI
 
     let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(segment_dir.path(), &segment_config, true).unwrap();
+    let mut segment = build_segment(segment_dir.path(), &segment_config, None, true).unwrap();
     for n in 0..NUM_POINTS {
         let idx = (n as u64).into();
-        let multi_vec = random_multi_vector(rnd, VECTOR_DIM, NUM_VECTORS_PER_POINT);
+        let multi_vec = random_multi_vector(rng, VECTOR_DIM, NUM_VECTORS_PER_POINT);
         let named_vectors = only_default_multi_vector(&multi_vec);
         segment
             .upsert_point(n as SeqNumberType, idx, named_vectors, &hw_counter)
@@ -108,8 +109,9 @@ fn make_segment_index<R: Rng + ?Sized>(rnd: &mut R, distance: Distance) -> HNSWI
         max_indexing_threads: 0,
         on_disk: None,
         payload_m: None,
+        inline_storage: None,
     };
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
@@ -127,7 +129,10 @@ fn make_segment_index<R: Rng + ?Sized>(rnd: &mut R, distance: Distance) -> HNSWI
             old_indices: &[],
             gpu_device: None,
             stopped: &stopped,
+            rng,
+            hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();

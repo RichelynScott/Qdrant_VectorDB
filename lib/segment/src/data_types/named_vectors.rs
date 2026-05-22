@@ -10,9 +10,7 @@ use super::vectors::{
     VectorElementType, VectorElementTypeByte, VectorElementTypeHalf, VectorInternal, VectorRef,
 };
 use crate::common::operation_error::OperationError;
-use crate::spaces::metric::Metric;
-use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
-use crate::types::{Distance, VectorDataConfig, VectorName, VectorNameBuf, VectorStorageDatatype};
+use crate::types::{VectorDataConfig, VectorName, VectorNameBuf, VectorStorageDatatype};
 
 type CowKey<'a> = Cow<'a, VectorName>;
 
@@ -26,11 +24,23 @@ impl<TElement> CowMultiVector<'_, TElement>
 where
     TElement: PrimitiveVectorElement,
 {
-    pub fn dim(&self) -> usize {
+    pub fn as_ref(&self) -> TypedMultiDenseVectorRef<'_, TElement> {
         match self {
-            CowMultiVector::Owned(typed_multi_dense_vector) => typed_multi_dense_vector.dim,
+            CowMultiVector::Owned(owned) => TypedMultiDenseVectorRef {
+                flattened_vectors: &owned.flattened_vectors,
+                dim: owned.dim,
+            },
+            CowMultiVector::Borrowed(borrowed) => *borrowed,
+        }
+    }
+
+    fn flattened_len(&self) -> usize {
+        match self {
+            CowMultiVector::Owned(typed_multi_dense_vector) => {
+                typed_multi_dense_vector.flattened_len()
+            }
             CowMultiVector::Borrowed(typed_multi_dense_vector_ref) => {
-                typed_multi_dense_vector_ref.dim
+                typed_multi_dense_vector_ref.flattened_len()
             }
         }
     }
@@ -50,16 +60,14 @@ impl Default for CowVector<'_> {
 }
 
 impl CowVector<'_> {
-    pub fn dim(&self) -> usize {
-        match self {
-            CowVector::Dense(cow) => cow.len(),
-            CowVector::Sparse(cow) => cow.indices.len(),
-            CowVector::MultiDense(cow_multi_vector) => cow_multi_vector.dim(),
-        }
-    }
-
     pub fn estimate_size_in_bytes(&self) -> usize {
-        self.dim() * size_of::<VectorElementType>()
+        match self {
+            CowVector::Dense(cow) => cow.len() * size_of::<VectorElementType>(),
+            CowVector::Sparse(cow) => cow.indices.len() * size_of::<VectorElementType>() * 2, // indices & values
+            CowVector::MultiDense(cow_multi_vector) => {
+                cow_multi_vector.flattened_len() * size_of::<VectorElementType>()
+            }
+        }
     }
 }
 
@@ -68,12 +76,6 @@ type TinyMap<'a> = tiny_map::TinyMap<CowKey<'a>, CowVector<'a>>;
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct NamedVectors<'a> {
     map: TinyMap<'a>,
-}
-
-impl NamedVectors<'_> {
-    pub fn estimate_size_in_bytes(&self) -> usize {
-        self.map.iter().map(|i| i.1.estimate_size_in_bytes()).sum()
-    }
 }
 
 impl<'a, TElement: PrimitiveVectorElement> CowMultiVector<'a, TElement> {
@@ -108,7 +110,7 @@ impl CowVector<'_> {
         }
     }
 
-    pub fn as_vec_ref(&self) -> VectorRef {
+    pub fn as_vec_ref(&self) -> VectorRef<'_> {
         match self {
             CowVector::Dense(v) => VectorRef::Dense(v.as_ref()),
             CowVector::Sparse(v) => VectorRef::Sparse(v.as_ref()),
@@ -245,24 +247,6 @@ impl<'a> NamedVectors<'a> {
         }
     }
 
-    pub fn from_map(map: HashMap<VectorNameBuf, VectorInternal>) -> Self {
-        Self {
-            map: map
-                .into_iter()
-                .map(|(k, v)| (CowKey::from(k), v.into()))
-                .collect(),
-        }
-    }
-
-    pub fn from_map_ref(map: &'a HashMap<VectorNameBuf, DenseVector>) -> Self {
-        Self {
-            map: map
-                .iter()
-                .map(|(k, v)| (CowKey::from(k), CowVector::Dense(Cow::Borrowed(v))))
-                .collect(),
-        }
-    }
-
     pub fn merge(&mut self, other: NamedVectors<'a>) {
         for (key, value) in other {
             self.map.insert(key, value);
@@ -274,9 +258,8 @@ impl<'a> NamedVectors<'a> {
             .insert(CowKey::Owned(name), CowVector::from(vector));
     }
 
-    pub fn insert_ref(&mut self, name: &'a VectorName, vector: VectorRef<'a>) {
-        self.map
-            .insert(CowKey::Borrowed(name), CowVector::from(vector));
+    pub fn remove_ref(&mut self, key: &VectorName) {
+        self.map.remove(key);
     }
 
     pub fn contains_key(&self, key: &VectorName) -> bool {
@@ -354,48 +337,15 @@ impl<'a> NamedVectors<'a> {
         config: &VectorDataConfig,
     ) -> DenseVector {
         match config.datatype {
-            Some(VectorStorageDatatype::Float32) | None => match config.distance {
-                Distance::Cosine => {
-                    <CosineMetric as Metric<VectorElementType>>::preprocess(dense_vector)
-                }
-                Distance::Euclid => {
-                    <EuclidMetric as Metric<VectorElementType>>::preprocess(dense_vector)
-                }
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementType>>::preprocess(dense_vector)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementType>>::preprocess(dense_vector)
-                }
-            },
-            Some(VectorStorageDatatype::Uint8) => match config.distance {
-                Distance::Cosine => {
-                    <CosineMetric as Metric<VectorElementTypeByte>>::preprocess(dense_vector)
-                }
-                Distance::Euclid => {
-                    <EuclidMetric as Metric<VectorElementTypeByte>>::preprocess(dense_vector)
-                }
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementTypeByte>>::preprocess(dense_vector)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementTypeByte>>::preprocess(dense_vector)
-                }
-            },
-            Some(VectorStorageDatatype::Float16) => match config.distance {
-                Distance::Cosine => {
-                    <CosineMetric as Metric<VectorElementTypeHalf>>::preprocess(dense_vector)
-                }
-                Distance::Euclid => {
-                    <EuclidMetric as Metric<VectorElementTypeHalf>>::preprocess(dense_vector)
-                }
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementTypeHalf>>::preprocess(dense_vector)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementTypeHalf>>::preprocess(dense_vector)
-                }
-            },
+            Some(VectorStorageDatatype::Float32) | None => config
+                .distance
+                .preprocess_vector::<VectorElementType>(dense_vector),
+            Some(VectorStorageDatatype::Uint8) => config
+                .distance
+                .preprocess_vector::<VectorElementTypeByte>(dense_vector),
+            Some(VectorStorageDatatype::Float16) => config
+                .distance
+                .preprocess_vector::<VectorElementTypeHalf>(dense_vector),
         }
     }
 }

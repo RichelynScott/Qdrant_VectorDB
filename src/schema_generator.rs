@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use api::rest::models::{CollectionsResponse, HardwareUsage, VersionInfo};
+use api::rest::models::{CollectionsResponse, ShardKeysResponse, Usage, VersionInfo};
 use api::rest::schema::PointInsertOperations;
 use api::rest::{
     FacetRequest, FacetResponse, QueryGroupsRequest, QueryRequest, QueryRequestBatch,
@@ -25,13 +25,14 @@ use collection::operations::vector_ops::DeleteVectors;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaSettings;
 use serde::Serialize;
+use shard::operations::optimization::OptimizationsResponse;
 use storage::content_manager::collection_meta_ops::{
     ChangeAliasesOperation, CreateCollection, UpdateCollection,
 };
 use storage::types::ClusterStatus;
 
-use crate::common::helpers::LocksOption;
 use crate::common::telemetry::TelemetryData;
+use crate::common::telemetry_ops::distributed_telemetry::DistributedTelemetryData;
 use crate::common::update::{CreateFieldIndex, UpdateOperations};
 
 mod actix;
@@ -70,7 +71,6 @@ struct AllDefinitions {
     ar: ClusterOperations,
     at: SearchRequestBatch,
     au: RecommendRequestBatch,
-    av: LocksOption,
     aw: SnapshotRecover,
     ax: CollectionsAliasesResponse,
     ay: AliasDescription,
@@ -97,7 +97,11 @@ struct AllDefinitions {
     bk: SearchMatrixPairsResponse,
     bl: FacetRequest,
     bm: FacetResponse,
-    bn: HardwareUsage,
+    bn: Usage,
+    bo: ShardKeysResponse,
+    bp: OptimizationsResponse,
+    bq: DistributedTelemetryData,
+    br: segment::data_types::vector_name_config::VectorNameConfig,
 }
 
 fn save_schema<T: JsonSchema>() {

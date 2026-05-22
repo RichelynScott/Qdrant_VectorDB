@@ -6,13 +6,13 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::TelemetryDetail;
 use itertools::Itertools;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::query_context::{QueryContext, VectorQueryContext};
 use segment::data_types::vectors::{QueryVector, VectorElementType, VectorInternal};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
-use segment::index::VectorIndex;
+use segment::index::VectorIndexRead;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
 use segment::segment_constructor::{build_segment, create_sparse_vector_index_test};
@@ -21,7 +21,7 @@ use segment::types::{
     HasIdCondition, Indexes, PointIdType, SegmentConfig, SeqNumberType, SparseVectorDataConfig,
     SparseVectorStorageType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
-use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
+use segment::vector_storage::query::{ContextPair, DiscoverQuery};
 use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 
@@ -38,7 +38,10 @@ fn convert_to_sparse_vector(vector: &[VectorElementType]) -> SparseVector {
     sparse_vector
 }
 
-fn random_named_vector<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (NamedVectors, NamedVectors) {
+fn random_named_vector<R: Rng + ?Sized>(
+    rnd: &mut R,
+    dim: usize,
+) -> (NamedVectors<'_>, NamedVectors<'_>) {
     let dense_vector = random_vector(rnd, dim);
     let sparse_vector = convert_to_sparse_vector(&dense_vector);
 
@@ -51,7 +54,7 @@ fn random_named_vector<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (NamedVector
     (sparse_result, dense_result)
 }
 
-fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (QueryVector, QueryVector) {
+fn random_discover_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (QueryVector, QueryVector) {
     let num_pairs: usize = rnd.random_range(1..MAX_EXAMPLE_PAIRS);
     let dense_target = random_vector(rnd, dim);
     let sparse_target = convert_to_sparse_vector(&dense_target);
@@ -71,7 +74,7 @@ fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (QueryVec
         })
         .collect_vec();
 
-    let dense_query = DiscoveryQuery::new(
+    let dense_query = DiscoverQuery::new(
         dense_target.into(),
         dense_pairs
             .into_iter()
@@ -82,7 +85,7 @@ fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (QueryVec
             .collect(),
     )
     .into();
-    let sparse_query = DiscoveryQuery::new(
+    let sparse_query = DiscoverQuery::new(
         sparse_target.into(),
         sparse_pairs
             .into_iter()
@@ -127,6 +130,7 @@ fn sparse_index_discover_test() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::default(),
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -137,7 +141,7 @@ fn sparse_index_discover_test() {
             VectorDataConfig {
                 size: dim,
                 distance,
-                storage_type: VectorStorageType::Memory,
+                storage_type: VectorStorageType::default(),
                 index: Indexes::Plain {},
                 quantization_config: None,
                 multivector_config: None,
@@ -148,8 +152,8 @@ fn sparse_index_discover_test() {
         sparse_vector_data: Default::default(),
     };
 
-    let mut sparse_segment = build_segment(dir.path(), &sparse_config, true).unwrap();
-    let mut dense_segment = build_segment(dir.path(), &dense_config, true).unwrap();
+    let mut sparse_segment = build_segment(dir.path(), &sparse_config, None, true).unwrap();
+    let mut dense_segment = build_segment(dir.path(), &dense_config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -186,15 +190,15 @@ fn sparse_index_discover_test() {
     let top = 3;
     let attempts = 100;
     for i in 0..attempts {
-        // do discovery search
-        let (sparse_query, dense_query) = random_discovery_query(&mut rnd, dim);
+        // do discover search
+        let (sparse_query, dense_query) = random_discover_query(&mut rnd, dim);
 
         let vec_context = VectorQueryContext::default();
-        let sparse_discovery_result = sparse_index
+        let sparse_discover_result = sparse_index
             .search(&[&sparse_query], None, top, None, &vec_context)
             .unwrap();
 
-        let dense_discovery_result = dense_segment.vector_data[SPARSE_VECTOR_NAME]
+        let dense_discover_result = dense_segment.vector_data[SPARSE_VECTOR_NAME]
             .vector_index
             .borrow()
             .search(&[&dense_query], None, top, None, &vec_context)
@@ -202,14 +206,11 @@ fn sparse_index_discover_test() {
 
         // check id only because scores can be epsilon-size different
         assert_eq!(
-            sparse_discovery_result[0]
+            sparse_discover_result[0]
                 .iter()
                 .map(|r| r.idx)
                 .collect_vec(),
-            dense_discovery_result[0]
-                .iter()
-                .map(|r| r.idx)
-                .collect_vec(),
+            dense_discover_result[0].iter().map(|r| r.idx).collect_vec(),
         );
 
         // do regular nearest search
@@ -267,12 +268,13 @@ fn sparse_index_hardware_measurement_test() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::default(),
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
     };
 
-    let mut sparse_segment = build_segment(dir.path(), &sparse_config, true).unwrap();
+    let mut sparse_segment = build_segment(dir.path(), &sparse_config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 

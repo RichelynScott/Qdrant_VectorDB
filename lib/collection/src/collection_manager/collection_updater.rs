@@ -1,11 +1,13 @@
-use common::counter::hardware_counter::HardwareCounterCell;
-use parking_lot::RwLock;
-use segment::types::SeqNumberType;
+use std::sync::Arc;
 
-use crate::collection_manager::holders::segment_holder::SegmentHolder;
-use crate::collection_manager::segments_updater::*;
+use common::counter::hardware_counter::HardwareCounterCell;
+use segment::types::SeqNumberType;
+use shard::segment_holder::locked::LockedSegmentHolder;
+use shard::update::*;
+
 use crate::operations::CollectionUpdateOperations;
-use crate::operations::types::CollectionResult;
+use crate::operations::types::{CollectionError, CollectionResult};
+use crate::shards::update_tracker::UpdateTracker;
 
 /// Implementation of the update operation
 #[derive(Default)]
@@ -13,7 +15,7 @@ pub struct CollectionUpdater {}
 
 impl CollectionUpdater {
     fn handle_update_result(
-        segments: &RwLock<SegmentHolder>,
+        segments: &LockedSegmentHolder,
         op_num: SeqNumberType,
         operation_result: &CollectionResult<usize>,
     ) {
@@ -37,65 +39,97 @@ impl CollectionUpdater {
     }
 
     pub fn update(
-        segments: &RwLock<SegmentHolder>,
+        segments: &LockedSegmentHolder,
         op_num: SeqNumberType,
         operation: CollectionUpdateOperations,
+        update_operation_lock: Arc<tokio::sync::RwLock<()>>,
+        update_tracker: UpdateTracker,
         hw_counter: &HardwareCounterCell,
     ) -> CollectionResult<usize> {
-        // Allow only one update at a time, ensure no data races between segments.
-        // let _lock = self.update_lock.lock().unwrap();
-        let scroll_lock = segments.read().scroll_read_lock.clone();
-
         // Use block_in_place here to avoid blocking the current async executor
-        let _scroll_lock = tokio::task::block_in_place(|| scroll_lock.blocking_write());
+        let operation_result = tokio::task::block_in_place(|| {
+            // Allow only one update at a time, ensure no data races between segments.
+            // let _update_lock = self.update_lock.lock().unwrap();
 
-        let operation_result = match operation {
-            CollectionUpdateOperations::PointOperation(point_operation) => {
-                process_point_operation(segments, op_num, point_operation, hw_counter)
-            }
-            CollectionUpdateOperations::VectorOperation(vector_operation) => {
-                process_vector_operation(segments, op_num, vector_operation, hw_counter)
-            }
-            CollectionUpdateOperations::PayloadOperation(payload_operation) => {
-                process_payload_operation(segments, op_num, payload_operation, hw_counter)
-            }
-            CollectionUpdateOperations::FieldIndexOperation(index_operation) => {
-                process_field_index_operation(segments, op_num, &index_operation, hw_counter)
-            }
-        };
+            let _update_operation_lock = update_operation_lock.blocking_write();
+            let _update_guard = update_tracker.update();
+            // Similar to `_update_operation_lock`, but used for operations inside segment holder
+            // E.g. optimization finalization may require update operation lock
+            // Needs to be acquired before locking segments.
+            let _another_update_lock = segments.acquire_updates_lock();
 
+            let segments_guard = segments.read();
+
+            match operation {
+                CollectionUpdateOperations::PointOperation(point_operation) => {
+                    process_point_operation(&segments_guard, op_num, point_operation, hw_counter)
+                }
+                CollectionUpdateOperations::VectorOperation(vector_operation) => {
+                    process_vector_operation(&segments_guard, op_num, vector_operation, hw_counter)
+                }
+                CollectionUpdateOperations::PayloadOperation(payload_operation) => {
+                    process_payload_operation(
+                        &segments_guard,
+                        op_num,
+                        payload_operation,
+                        hw_counter,
+                    )
+                }
+                CollectionUpdateOperations::FieldIndexOperation(index_operation) => {
+                    process_field_index_operation(
+                        &segments_guard,
+                        op_num,
+                        &index_operation,
+                        hw_counter,
+                    )
+                }
+                CollectionUpdateOperations::VectorNameOperation(vector_name_operation) => {
+                    process_vector_name_operation(&segments_guard, op_num, &vector_name_operation)
+                }
+                #[cfg(feature = "staging")]
+                CollectionUpdateOperations::StagingOperation(staging_operation) => {
+                    shard::update::process_staging_operation(
+                        &segments_guard,
+                        op_num,
+                        staging_operation,
+                    )
+                }
+            }
+        });
+
+        let operation_result = operation_result.map_err(CollectionError::from);
         CollectionUpdater::handle_update_result(segments, op_num, &operation_result);
-
         operation_result
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     use common::counter::hardware_accumulator::HwMeasurementAcc;
+    use common::types::DeferredBehavior;
     use itertools::Itertools;
     use parking_lot::RwLockUpgradableReadGuard;
     use segment::data_types::vectors::{
         DEFAULT_VECTOR_NAME, VectorStructInternal, only_default_vector,
     };
-    use segment::entry::entry_point::SegmentEntry;
+    use segment::entry::NonAppendableSegmentEntry as _;
     use segment::json_path::JsonPath;
     use segment::payload_json;
     use segment::types::PayloadSchemaType::Keyword;
     use segment::types::{Payload, PayloadContainer, PayloadFieldSchema, WithPayload};
     use serde_json::json;
+    use shard::retrieve::retrieve_blocking::retrieve_blocking;
+    use shard::update::upsert_points;
     use tempfile::Builder;
 
     use super::*;
     use crate::collection_manager::fixtures::{
-        build_segment_1, build_segment_2, build_test_holder,
+        TEST_TIMEOUT, build_segment_1, build_segment_2, build_test_holder,
     };
     use crate::collection_manager::holders::segment_holder::LockedSegment::Original;
-    use crate::collection_manager::segments_searcher::SegmentsSearcher;
-    use crate::collection_manager::segments_updater::upsert_points;
+    use crate::collection_manager::holders::segment_holder::SegmentHolder;
     use crate::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
     use crate::operations::point_ops::{
         PointOperations, PointStructPersisted, VectorStructPersisted,
@@ -181,14 +215,15 @@ mod tests {
         let res = upsert_points(&segments.read(), 100, &points, &hw_counter);
         assert!(matches!(res, Ok(1)));
 
-        let segments = Arc::new(segments);
-        let records = SegmentsSearcher::retrieve_blocking(
+        let records = retrieve_blocking(
             segments.clone(),
             &[1.into(), 2.into(), 500.into()],
             &WithPayload::from(true),
             &true.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -210,7 +245,7 @@ mod tests {
         }
 
         process_point_operation(
-            &segments,
+            &segments.read(),
             101,
             PointOperations::DeletePoints {
                 ids: vec![500.into()],
@@ -219,13 +254,15 @@ mod tests {
         )
         .unwrap();
 
-        let records = SegmentsSearcher::retrieve_blocking(
+        let records = retrieve_blocking(
             segments,
             &[1.into(), 2.into(), 500.into()],
             &WithPayload::from(true),
             &true.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -249,7 +286,7 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         process_payload_operation(
-            &segments,
+            &segments.read(),
             100,
             PayloadOps::SetPayload(SetPayloadOp {
                 payload,
@@ -261,14 +298,15 @@ mod tests {
         )
         .unwrap();
 
-        let segments = Arc::new(segments);
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments.clone(),
             &points,
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -288,7 +326,7 @@ mod tests {
 
         // Test payload delete
         process_payload_operation(
-            &segments,
+            &segments.read(),
             101,
             PayloadOps::DeletePayload(DeletePayloadOp {
                 points: Some(vec![3.into()]),
@@ -299,13 +337,15 @@ mod tests {
         )
         .unwrap();
 
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments.clone(),
             &[3.into()],
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -316,13 +356,15 @@ mod tests {
 
         // Test clear payload
 
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments.clone(),
             &[2.into()],
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -332,7 +374,7 @@ mod tests {
         assert!(res[0].payload.as_ref().unwrap().contains_key("color"));
 
         process_payload_operation(
-            &segments,
+            &segments.read(),
             102,
             PayloadOps::ClearPayload {
                 points: vec![2.into()],
@@ -340,13 +382,15 @@ mod tests {
             &hw_counter,
         )
         .unwrap();
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments,
             &[2.into()],
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -389,8 +433,7 @@ mod tests {
         let mut holder = SegmentHolder::default();
         let segment_ids = vec![holder.add_new(segment1), holder.add_new(segment2)];
 
-        let segments_guard = RwLock::new(holder);
-        let segments = Arc::new(segments_guard);
+        let segments = LockedSegmentHolder::new(holder);
 
         // payload with nested structure
         let payload: Payload = serde_json::from_str(r#"{"color":"red"}"#).unwrap();
@@ -400,7 +443,7 @@ mod tests {
         let points = vec![11.into(), 12.into(), 13.into()];
 
         process_payload_operation(
-            &segments,
+            &segments.read(),
             102,
             PayloadOps::SetPayload(SetPayloadOp {
                 payload,
@@ -412,13 +455,15 @@ mod tests {
         )
         .unwrap();
 
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments.clone(),
             &points,
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()
@@ -456,14 +501,13 @@ mod tests {
             holder.add_new(segment);
         }
 
-        let segments_guard = RwLock::new(holder);
-        let segments = Arc::new(segments_guard);
+        let segments = LockedSegmentHolder::new(holder);
 
         // update points nested values
         let payload: Payload = serde_json::from_str(r#"{ "color":"blue"}"#).unwrap();
 
         process_payload_operation(
-            &segments,
+            &segments.read(),
             103,
             PayloadOps::SetPayload(SetPayloadOp {
                 payload,
@@ -475,13 +519,15 @@ mod tests {
         )
         .unwrap();
 
-        let res = SegmentsSearcher::retrieve_blocking(
+        let res = retrieve_blocking(
             segments,
             &points,
             &WithPayload::from(true),
             &false.into(),
+            TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::Exclude,
         )
         .unwrap()
         .into_values()

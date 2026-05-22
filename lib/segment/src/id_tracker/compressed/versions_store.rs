@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use common::types::PointOffsetType;
 
 use crate::types::SeqNumberType;
 
@@ -92,6 +93,31 @@ impl CompressedVersions {
             upper_bytes,
         }
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (PointOffsetType, SeqNumberType)> + '_ {
+        self.lower_bytes.iter().enumerate().map(|(index, &lower)| {
+            let upper = *self.upper_bytes.get(&(index as u32)).unwrap_or(&0);
+            (
+                index as PointOffsetType,
+                Self::version_from_parts(lower, upper),
+            )
+        })
+    }
+
+    /// Approximate RAM usage in bytes.
+    pub fn ram_usage_bytes(&self) -> usize {
+        let Self {
+            lower_bytes,
+            upper_bytes,
+        } = self;
+
+        let lower = lower_bytes.capacity() * std::mem::size_of::<u32>();
+        // AHashMap per-entry overhead: key + value + hash (u64) + metadata pointer
+        let hashmap_entry_overhead = std::mem::size_of::<u64>() + std::mem::size_of::<usize>();
+        let upper = upper_bytes.capacity()
+            * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + hashmap_entry_overhead);
+        lower + upper
+    }
 }
 
 #[cfg(test)]
@@ -99,7 +125,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use proptest::prelude::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     use super::*;
     use crate::types::SeqNumberType;

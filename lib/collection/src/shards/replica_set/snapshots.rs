@@ -1,62 +1,77 @@
-use std::collections::HashSet;
 use std::path::Path;
-use std::{fs, io};
 
+use common::fs::{safe_delete_with_suffix, sync_parent_dir_async};
+use common::save_on_disk::SaveOnDisk;
 use common::tar_ext;
-use segment::data_types::segment_manifest::{SegmentManifest, SegmentManifests};
-use segment::segment::destroy_rocksdb;
-use segment::segment::snapshot::{PAYLOAD_INDEX_ROCKS_DB_VIRT_FILE, ROCKS_DB_VIRT_FILE};
-use segment::segment_constructor::PAYLOAD_INDEX_PATH;
+use fs_err::tokio as tokio_fs;
 use segment::types::SnapshotFormat;
+use shard::snapshots::snapshot_manifest::{RecoveryType, SnapshotManifest};
+use shard::snapshots::snapshot_utils::{SnapshotMergePlan, SnapshotUtils};
 
-use super::{REPLICA_STATE_FILE, ReplicaSetState, ReplicaState, ShardReplicaSet};
+use super::{REPLICA_STATE_FILE, ShardReplicaSet};
+use crate::common::file_utils::{move_dir, move_file};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::save_on_disk::SaveOnDisk;
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::local_shard::LocalShard;
+use crate::shards::replica_set::replica_set_state::ReplicaSetState;
 use crate::shards::shard::{PeerId, Shard};
 use crate::shards::shard_config::ShardConfig;
 use crate::shards::shard_initializing_flag_path;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum RecoveryType {
-    Full,
-    Partial,
-}
-
-impl RecoveryType {
-    pub fn is_full(self) -> bool {
-        matches!(self, Self::Full)
-    }
-
-    pub fn is_partial(self) -> bool {
-        matches!(self, Self::Partial)
-    }
-}
 
 impl ShardReplicaSet {
     pub async fn create_snapshot(
         &self,
         temp_path: &Path,
-        tar: &tar_ext::BuilderExt,
+        tar: tar_ext::BuilderExt,
         format: SnapshotFormat,
+        manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
+        // Track concurrent `create_partial_snapshot` requests, so that cluster manager can load-balance them
+        let partial_snapshot_create_request_guard = if manifest.is_some() {
+            Some(self.partial_snapshot_meta.track_create_snapshot_request())
+        } else {
+            None
+        };
+
+        let replica_state = self.replica_state.clone();
+        let temp_path = temp_path.to_path_buf();
+
         let local_read = self.local.read().await;
 
-        if let Some(local) = &*local_read {
-            local
-                .create_snapshot(temp_path, tar, format, save_wal)
-                .await?
-        }
+        let maybe_local_snapshot_future = if let Some(local) = &*local_read {
+            Some(
+                local
+                    .get_snapshot_creator(&temp_path, &tar, format, manifest, save_wal)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
-        self.replica_state
-            .save_to_tar(tar, REPLICA_STATE_FILE)
-            .await?;
+        drop(local_read);
 
-        let shard_config = ShardConfig::new_replica_set();
-        shard_config.save_to_tar(tar).await?;
-        Ok(())
+        let future = async move {
+            let _partial_snapshot_create_request_guard = partial_snapshot_create_request_guard;
+
+            if let Some(local_snapshot_future) = maybe_local_snapshot_future {
+                local_snapshot_future.await?;
+            }
+
+            replica_state.save_to_tar(&tar, REPLICA_STATE_FILE).await?;
+
+            let shard_config = ShardConfig::new_replica_set();
+            shard_config.save_to_tar(&tar).await?;
+            Ok(())
+        };
+
+        Ok(future)
+    }
+
+    pub fn try_take_partial_snapshot_recovery_lock(
+        &self,
+    ) -> CollectionResult<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.partial_snapshot_meta.try_take_recovery_lock()
     }
 
     pub fn restore_snapshot(
@@ -78,16 +93,9 @@ impl ShardReplicaSet {
         }
 
         replica_state.write(|state| {
-            state.this_peer_id = this_peer_id;
-            if is_distributed {
-                state
-                    .peers
-                    .remove(&this_peer_id)
-                    .and_then(|replica_state| state.peers.insert(this_peer_id, replica_state));
-            } else {
-                // In local mode we don't want any remote peers
-                state.peers.clear();
-                state.peers.insert(this_peer_id, ReplicaState::Active);
+            state.switch_peer_id(this_peer_id);
+            if !is_distributed {
+                state.force_local_active()
             }
         })?;
 
@@ -113,87 +121,19 @@ impl ShardReplicaSet {
             return Ok(false);
         }
 
-        let segments_path = LocalShard::segments_path(replica_path);
-
-        let mut snapshot_segments = HashSet::new();
-        let mut snapshot_manifests = SegmentManifests::default();
-
-        for segment_entry in segments_path.read_dir()? {
-            let segment_path = segment_entry?.path();
-
-            if !segment_path.is_dir() {
-                log::warn!(
-                    "segment path {} in extracted snapshot {} is not a directory",
-                    segment_path.display(),
-                    replica_path.display(),
-                );
-
-                continue;
-            }
-
-            let segment_id = segment_path
-                .file_name()
-                .and_then(|segment_id| segment_id.to_str())
-                .expect("segment path ends with a valid segment id");
-
-            let added = snapshot_segments.insert(segment_id.to_string());
-            debug_assert!(added);
-
-            let manifest_path = segment_path.join("segment_manifest.json");
-
-            if recovery_type.is_full() {
-                if manifest_path.exists() {
-                    return Err(CollectionError::bad_request(format!(
-                        "invalid shard snapshot: \
-                         segment {segment_id} contains segment manifest; \
-                         ensure you are not recovering partial snapshot on shard snapshot endpoint",
-                    )));
-                }
-
-                continue;
-            }
-
-            if !manifest_path.exists() {
-                return Err(CollectionError::bad_request(format!(
-                    "invalid partial snapshot: \
-                     segment {segment_id} does not contain segment manifest; \
-                     ensure you are not recovering shard snapshot on partial snapshot endpoint",
-                )));
-            }
-
-            let manifest = fs::File::open(&manifest_path).map_err(|err| {
-                CollectionError::service_error(format!(
-                    "failed to open segment {segment_id} manifest: {err}",
-                ))
-            })?;
-
-            let manifest = io::BufReader::new(manifest);
-
-            let manifest: SegmentManifest = serde_json::from_reader(manifest).map_err(|err| {
-                CollectionError::bad_request(format!(
-                    "failed to deserialize segment {segment_id} manifest: {err}",
-                ))
-            })?;
-
-            if segment_id != manifest.segment_id {
-                return Err(CollectionError::bad_request(format!(
-                    "invalid partial snapshot: \
-                     segment {segment_id} contains segment manifest with segment ID {}",
-                    manifest.segment_id,
-                )));
-            }
-
-            let added = snapshot_manifests.add(manifest);
-            debug_assert!(added);
-        }
-
-        snapshot_manifests.validate().map_err(|err| {
-            CollectionError::bad_request(format!("invalid partial snapshot: {err}"))
-        })?;
+        let snapshot_manifest =
+            SnapshotManifest::load_from_snapshot(replica_path, Some(recovery_type))?;
 
         // TODO:
         //   Check that shard snapshot is compatible with the collection
         //   (see `VectorsConfig::check_compatible_with_segment_config`)
+
+        let _partial_snapshot_search_lock = match recovery_type {
+            RecoveryType::Full => None,
+            RecoveryType::Partial => {
+                Some(self.partial_snapshot_meta.take_search_write_lock().await)
+            }
+        };
 
         let mut local = cancel::future::cancel_on_token(cancel.clone(), self.local.write()).await?;
 
@@ -201,32 +141,43 @@ impl ShardReplicaSet {
         // the file is removed after full recovery to indicate a well-formed shard
         // for example: some of the files may go missing if node gets killed during shard directory move/replace
         let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
-        let flag_file = tokio::fs::File::create(&shard_flag).await?;
+        let flag_file = tokio_fs::File::create(&shard_flag).await?;
         flag_file.sync_all().await?;
+        sync_parent_dir_async(&shard_flag).await?;
 
         // Check `cancel` token one last time before starting non-cancellable section
         if cancel.is_cancelled() {
             return Err(cancel::Error::Cancelled.into());
         }
 
-        let local_manifests = match local.take() {
-            _ if snapshot_manifests.is_empty() => None,
+        let local_manifest = match local.take() {
+            Some(shard) if snapshot_manifest.is_empty() => {
+                // Shard is no longer needed and can be dropped
+                shard.stop_gracefully().await;
 
+                None
+            }
             Some(shard) => {
-                let local_manifests = shard.segment_manifests();
+                let local_manifest = shard.snapshot_manifest().await;
 
-                match local_manifests {
-                    Ok(local_manifests) => {
-                        local_manifests.validate().map_err(|err| {
+                // If local shard produces a valid manifest, it can be replaced and no longer needed
+                // If it fails, we return it back.
+
+                match local_manifest {
+                    Ok(local_manifest) => {
+                        local_manifest.validate().map_err(|err| {
                             CollectionError::service_error(format!(
                                 "failed to restore partial shard snapshot for shard {}:{}: \
-                                 local shard produces invalid segment manifests: \
+                                 local shard produces invalid snapshot manifest: \
                                  {err}",
                                 self.collection_id, self.shard_id,
                             ))
                         })?;
 
-                        Some(local_manifests)
+                        // Shard is no longer needed and can be dropped
+                        shard.stop_gracefully().await;
+
+                        Some(local_manifest)
                     }
 
                     Err(err) => {
@@ -234,82 +185,91 @@ impl ShardReplicaSet {
 
                         return Err(CollectionError::service_error(format!(
                             "failed to restore partial shard snapshot for shard {}:{}: \
-                             failed to collect segment manifests: \
+                             failed to collect snapshot manifest: \
                              {err}",
                             self.collection_id, self.shard_id,
                         )));
                     }
                 }
             }
-
-            None => {
-                return Err(CollectionError::bad_request(format!(
-                    "failed to restore partial shard snapshot for shard {}:{}: \
-                     shard does not exist on peer {}",
-                    self.collection_id,
-                    self.shard_id,
-                    self.this_peer_id(),
-                )));
-            }
+            None => None,
         };
 
         // Try to restore local replica from specified shard snapshot directory
         let restore = async {
-            if let Some(local_manifests) = local_manifests {
-                for (segment_id, local_manifest) in local_manifests.iter() {
-                    let segment_path = segments_path.join(segment_id);
+            if let Some(local_manifest) = local_manifest {
+                // ToDo: Replace with `partial_snapshot_merge_plan` when rocksdb is removed
+                let merge_plan = SnapshotUtils::partial_snapshot_merge_plan(
+                    &self.shard_path,
+                    &local_manifest,
+                    replica_path,
+                    &snapshot_manifest,
+                );
 
-                    // Delete local segment, if it's not present in partial snapshot
-                    let Some(snapshot_manifest) = snapshot_manifests.get(segment_id) else {
-                        tokio::fs::remove_dir_all(&segment_path).await?;
+                let SnapshotMergePlan {
+                    move_files,
+                    replace_directories,
+                    merge_directories,
+                    delete_files,
+                    delete_directories,
+                } = merge_plan;
+
+                // Clean up files and directories according to merge plan
+                for path in delete_files {
+                    if !path.exists() {
                         continue;
-                    };
-
-                    for (file, &local_version) in &local_manifest.file_versions {
-                        let snapshot_version = snapshot_manifest.file_versions.get(file).copied();
-
-                        let is_removed = snapshot_version.is_none();
-
-                        let is_outdated = snapshot_version.is_none_or(|snapshot_version| {
-                            let local_version =
-                                local_version.or_segment_version(local_manifest.segment_version);
-
-                            let snapshot_version = snapshot_version
-                                .or_segment_version(snapshot_manifest.segment_version);
-
-                            // Compare versions to determine local file is outdated relative to snapshot
-                            local_version < snapshot_version
-                        });
-
-                        let is_rocksdb = file == Path::new(ROCKS_DB_VIRT_FILE);
-                        let is_payload_index_rocksdb =
-                            file == Path::new(PAYLOAD_INDEX_ROCKS_DB_VIRT_FILE);
-
-                        if is_removed {
-                            // If `file` is a regular file, delete it from disk, if it was
-                            // *removed* from the snapshot
-
-                            if !is_rocksdb && !is_payload_index_rocksdb {
-                                tokio::fs::remove_file(segment_path.join(file)).await?;
-                            }
-                        } else if is_outdated {
-                            // If `file` is a RocksDB "virtual" file, remove RocksDB from disk,
-                            // if it was *updated* in or *removed* from the snapshot
-
-                            if is_rocksdb {
-                                destroy_rocksdb(&segment_path)?;
-                            } else if is_payload_index_rocksdb {
-                                destroy_rocksdb(&segment_path.join(PAYLOAD_INDEX_PATH))?;
-                            }
-                        }
                     }
+                    log::debug!("Deleting file {}", path.display());
+                    tokio_fs::remove_file(&path).await?;
+                }
+
+                for path in delete_directories {
+                    if !path.exists() {
+                        continue;
+                    }
+                    log::debug!("Deleting directory {}", path.display());
+                    tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || safe_delete_with_suffix(&path)
+                    })
+                    .await??;
+                }
+
+                // Execute merge plan
+                for (from, to) in move_files {
+                    log::debug!("Moving file from {} to {}", from.display(), to.display());
+                    move_file(&from, &to).await?;
+                }
+
+                for (from, to) in replace_directories {
+                    log::debug!(
+                        "Replacing directory {} with {}",
+                        to.display(),
+                        from.display()
+                    );
+                    if to.exists() {
+                        tokio::task::spawn_blocking({
+                            let to = to.clone();
+                            move || safe_delete_with_suffix(&to)
+                        })
+                        .await??;
+                    }
+                    move_dir(from, to).await?;
+                }
+
+                for (from, to) in merge_directories {
+                    log::debug!(
+                        "Merging directory from {} to {}",
+                        from.display(),
+                        to.display()
+                    );
+                    move_dir(from, to).await?;
                 }
             } else {
                 // Remove shard data but not configuration files
                 LocalShard::clear(&self.shard_path).await?;
+                LocalShard::move_data(replica_path, &self.shard_path).await?;
             }
-
-            LocalShard::move_data(replica_path, &self.shard_path).await?;
 
             LocalShard::load(
                 self.shard_id,
@@ -319,6 +279,7 @@ impl ShardReplicaSet {
                 self.optimizers_config.clone(),
                 self.shared_storage_config.clone(),
                 self.payload_index_schema.clone(),
+                recovery_type.is_full(),
                 self.update_runtime.clone(),
                 self.search_runtime.clone(),
                 self.optimizer_resource_budget.clone(),
@@ -330,7 +291,12 @@ impl ShardReplicaSet {
             Ok(new_local) => {
                 local.replace(Shard::Local(new_local));
                 // remove shard_id initialization flag because shard is fully recovered
-                tokio::fs::remove_file(&shard_flag).await?;
+                tokio_fs::remove_file(&shard_flag).await?;
+
+                if recovery_type.is_partial() {
+                    self.partial_snapshot_meta.snapshot_recovered();
+                }
+
                 Ok(true)
             }
 
@@ -341,10 +307,7 @@ impl ShardReplicaSet {
                 )));
 
                 // Mark local replica as Dead since it's dummy and dirty
-                {
-                    let replica_state = self.replica_state.read();
-                    self.add_locally_disabled(&replica_state, self.this_peer_id(), None);
-                }
+                self.add_locally_disabled(None, self.this_peer_id(), None);
 
                 // Remove inner shard data but keep the shard folder with its configuration files.
                 // This way the shard can be read on startup and the user can decide what to do next.
@@ -365,5 +328,85 @@ impl ShardReplicaSet {
                 }
             }
         }
+    }
+
+    /// Replace the in-memory local shard (if any) with a dummy and remove its on-disk
+    /// data files.
+    ///
+    /// Used by shard snapshot transfers to free disk space before the receiving node
+    /// downloads the new snapshot, avoiding having both the old data and the incoming
+    /// snapshot on disk at the same time. The configuration files and replica state
+    /// are preserved, so the shard directory remains a valid (empty) shard.
+    ///
+    /// A dummy shard is left in place of the real one so that APIs still report a local
+    /// shard while the data is being cleared and recovered, rather than reporting none.
+    /// The subsequent `restore_local_replica_from` call drops this dummy and installs
+    /// the recovered shard.
+    ///
+    /// Only safe to call while the shard is in a state that prevents user requests
+    /// (`PartialSnapshot` during a shard transfer). Do NOT call this from a
+    /// user-triggered URL recovery path, where the shard may still be serving queries.
+    ///
+    /// Writes the shard initializing flag before clearing, so that a crash between
+    /// here and the end of the subsequent `restore_local_replica_from` call causes
+    /// the shard to be loaded as a dummy on startup and re-recovered.
+    pub async fn clear_local_for_snapshot_recovery(
+        &self,
+        collection_path: &Path,
+    ) -> CollectionResult<()> {
+        // Callers must only invoke this while the shard is in a state that cannot
+        // be a source of truth (e.g. `PartialSnapshot` during a shard transfer).
+        // Clearing a source-of-truth replica would silently drop data that may
+        // still be serving queries.
+        if self
+            .peer_state(self.this_peer_id())
+            .is_some_and(|s| s.can_be_source_of_truth())
+        {
+            return Err(CollectionError::service_error(format!(
+                "clear_local_for_snapshot_recovery called on a peer that can be source-of-truth {}:{}",
+                self.collection_id, self.shard_id,
+            )));
+        }
+
+        let mut local = self.local.write().await;
+
+        // Mark the shard as initializing before touching disk, so a crash during or
+        // after clearing is detected on next startup and the shard is reloaded as a
+        // dummy that triggers recovery.
+        let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
+        let flag_file = tokio_fs::File::create(&shard_flag).await?;
+        flag_file.sync_all().await?;
+        sync_parent_dir_async(&shard_flag).await?;
+
+        // Replace the local shard with a dummy rather than removing it entirely, so APIs
+        // keep reporting a local shard while the data is cleared and the replacement
+        // snapshot is recovered. `restore_local_replica_from` drops this dummy afterwards.
+        let dummy = Shard::Dummy(DummyShard::new(
+            "Local shard is being cleared for snapshot recovery",
+        ));
+        if let Some(shard) = local.replace(dummy) {
+            shard.stop_gracefully().await;
+        }
+
+        LocalShard::clear(&self.shard_path).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_partial_snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+        self.local
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| {
+                CollectionError::not_found(format!(
+                    "local shard {}:{} does not exist on peer {}",
+                    self.collection_id,
+                    self.shard_id,
+                    self.this_peer_id(),
+                ))
+            })?
+            .snapshot_manifest()
+            .await
     }
 }

@@ -137,7 +137,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 4,
                         distance: Distance::Dot,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -149,7 +149,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 1,
                         distance: Distance::Dot,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -161,7 +161,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 4,
                         distance: Distance::Euclid,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -172,6 +172,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
             sparse_vector_data: Default::default(),
             payload_storage_type: Default::default(),
         },
+        None,
         true,
     )
     .unwrap();
@@ -263,10 +264,12 @@ pub fn build_segment_sparse_1(path: &Path) -> Segment {
                 SparseVectorDataConfig {
                     index: SparseIndexConfig::new(None, SparseIndexType::MutableRam, None),
                     storage_type: SparseVectorStorageType::default(),
+                    modifier: None,
                 },
             )]),
             payload_storage_type: Default::default(),
         },
+        None,
         true,
     )
     .unwrap();
@@ -355,10 +358,12 @@ pub fn build_segment_sparse_2(path: &Path) -> Segment {
                 SparseVectorDataConfig {
                     index: SparseIndexConfig::new(None, SparseIndexType::MutableRam, None),
                     storage_type: SparseVectorStorageType::default(),
+                    modifier: None,
                 },
             )]),
             payload_storage_type: Default::default(),
         },
+        None,
         true,
     )
     .unwrap();

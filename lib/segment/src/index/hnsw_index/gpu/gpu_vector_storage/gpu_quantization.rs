@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use common::types::PointOffsetType;
 use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin};
-use quantization::{EncodedStorage, EncodedVectorsPQ, EncodedVectorsU8};
+use quantization::{EncodedStorage, EncodedVectors, EncodedVectorsPQ, EncodedVectorsU8};
 
 use super::{GpuVectorStorage, STORAGES_COUNT};
 use crate::common::operation_error::OperationResult;
@@ -213,7 +213,7 @@ impl GpuScalarQuantization {
     ) -> OperationResult<Self> {
         Ok(GpuScalarQuantization {
             multiplier: quantized_storage.get_multiplier(),
-            diff: quantized_storage.get_diff(),
+            diff: quantized_storage.get_shift(),
             offsets_buffer: GpuScalarQuantization::create_sq_offsets_buffer(
                 device,
                 quantized_storage,
@@ -243,7 +243,8 @@ impl GpuScalarQuantization {
         let mut upload_context = gpu::Context::new(device.clone())?;
 
         for i in 0..quantized_storage.vectors_count() {
-            let (offset, _) = quantized_storage.get_quantized_vector(i as PointOffsetType);
+            let (offset, _) =
+                quantized_storage.get_quantized_vector_offset_and_code(i as PointOffsetType);
             sq_offsets_staging_buffer.upload(&offset, i * std::mem::size_of::<f32>())?;
         }
 

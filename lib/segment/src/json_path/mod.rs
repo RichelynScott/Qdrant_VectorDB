@@ -15,13 +15,13 @@ use crate::common::utils::{MultiValue, merge_map};
 
 mod parse;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Anonymize)]
+#[derive(Debug, Clone, PartialEq, Eq, Anonymize, Ord, Hash, PartialOrd)]
 pub struct JsonPath {
     pub first_key: String,
     pub rest: Vec<JsonPathItem>,
 }
 
-#[derive(Debug, PartialEq, Clone, Hash, Eq, Anonymize)]
+#[derive(Debug, PartialEq, Clone, Eq, Anonymize, Ord, Hash, PartialOrd)]
 pub enum JsonPathItem {
     /// A key in a JSON object, e.g. `.foo`
     Key(String),
@@ -295,7 +295,7 @@ impl JsonPath {
         let mut result = String::with_capacity(MAX_LENGTH);
 
         BASE32_DNSSEC.encode_append(
-            &Sha256::digest(text.as_bytes()).as_slice()[0..(HASH_LENGTH * 5).div_ceil(8)],
+            &Sha256::digest(text.as_bytes())[0..(HASH_LENGTH * 5).div_ceil(8)],
             &mut result,
         );
         debug_assert_eq!(result.len(), HASH_LENGTH);

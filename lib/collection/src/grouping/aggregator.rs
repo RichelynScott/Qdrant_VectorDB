@@ -53,19 +53,21 @@ impl GroupsAggregator {
                     .into_iter()
                     .flat_map(|v| match v {
                         Value::Array(arr) => arr.iter().collect(),
-                        _ => vec![v],
+                        Value::Null
+                        | Value::Bool(_)
+                        | Value::Number(_)
+                        | Value::String(_)
+                        | Value::Object(_) => vec![v],
                     })
                     .collect()
             })
             .ok_or(AggregatorError::KeyNotFound)?;
 
-        let group_keys = payload_values
-            .into_iter()
-            .map(GroupId::try_from)
-            .collect::<Result<Vec<GroupId>, ()>>()
+        let unique_group_keys: Vec<_> =
+            itertools::process_results(payload_values.into_iter().map(GroupId::try_from), |iter| {
+                iter.unique().collect()
+            })
             .map_err(|_| AggregatorError::BadKeyType)?;
-
-        let unique_group_keys: Vec<_> = group_keys.into_iter().unique().collect();
 
         for group_key in unique_group_keys {
             let group = self
@@ -374,7 +376,7 @@ mod unit_tests {
         ];
 
         for ((expected_key, expected_group_points), group) in
-            expected_groups.into_iter().zip(groups.into_iter())
+            expected_groups.into_iter().zip(groups)
         {
             assert_eq!(expected_key, group.key);
             let expected_id_score: Vec<_> = expected_group_points
@@ -441,9 +443,7 @@ mod unit_tests {
                 ],
             ),
         ];
-        for ((key, expected_group_points), group) in
-            expected_groups.into_iter().zip(groups.into_iter())
-        {
+        for ((key, expected_group_points), group) in expected_groups.into_iter().zip(groups) {
             assert_eq!(key, group.key);
             let expected_id_score: Vec<_> = expected_group_points
                 .into_iter()

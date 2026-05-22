@@ -6,20 +6,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
-use io::file_operations::{atomic_save_json, read_json};
-use io::storage_version::StorageVersion;
-use memmap2::Mmap;
-use memory::fadvise::clear_disk_cache;
-use memory::madvise::{Advice, AdviceSetting, Madviseable};
-use memory::mmap_ops::{
+use common::fs::{atomic_save_json, read_json};
+use common::mmap::{Advice, AdviceSetting, Madviseable};
+#[expect(deprecated, reason = "legacy code")]
+use common::mmap::{
     create_and_ensure_length, open_read_mmap, transmute_from_u8_to_slice, transmute_to_u8,
     transmute_to_u8_slice,
 };
+use common::storage_version::StorageVersion;
+use common::types::PointOffsetType;
+use common::universal_io::{Result, UniversalIoError};
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
-use super::INDEX_FILE_NAME;
 use super::inverted_index_compressed_immutable_ram::InvertedIndexCompressedImmutableRam;
+use super::{INDEX_FILE_NAME, out_of_bounds};
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset, Weight};
 use crate::index::compressed_posting_list::{
@@ -83,7 +84,7 @@ impl<W: Weight> InvertedIndex for InvertedIndexCompressedMmap<W> {
         true
     }
 
-    fn open(path: &Path) -> std::io::Result<Self> {
+    fn open(path: &Path) -> Result<Self> {
         Self::load(path)
     }
 
@@ -104,18 +105,16 @@ impl<W: Weight> InvertedIndex for InvertedIndexCompressedMmap<W> {
         &'a self,
         id: DimOffset,
         hw_counter: &'a HardwareCounterCell,
-    ) -> Option<CompressedPostingListIterator<'a, W>> {
-        self.get(id, hw_counter)
-            .map(|posting_list| posting_list.iter())
+    ) -> Result<CompressedPostingListIterator<'a, W>> {
+        Ok(self.get(id, hw_counter)?.iter())
     }
 
     fn len(&self) -> usize {
         self.file_header.posting_count
     }
 
-    fn posting_list_len(&self, id: &DimOffset, hw_counter: &HardwareCounterCell) -> Option<usize> {
-        self.get(*id, hw_counter)
-            .map(|posting_list| posting_list.len())
+    fn posting_list_len(&self, id: DimOffset, hw_counter: &HardwareCounterCell) -> Result<usize> {
+        Ok(self.get(id, hw_counter)?.len())
     }
 
     fn files(path: &Path) -> Vec<PathBuf> {
@@ -123,6 +122,11 @@ impl<W: Weight> InvertedIndex for InvertedIndexCompressedMmap<W> {
             Self::index_file_path(path),
             Self::index_config_file_path(path),
         ]
+    }
+
+    fn immutable_files(path: &Path) -> Vec<PathBuf> {
+        // `InvertedIndexCompressedMmap` is always immutable
+        Self::files(path)
     }
 
     fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {
@@ -181,15 +185,19 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
         &'a self,
         id: DimId,
         hw_counter: &'a HardwareCounterCell,
-    ) -> Option<CompressedPostingListView<'a, W>> {
+    ) -> Result<CompressedPostingListView<'a, W>> {
         // check that the id is not out of bounds (posting_count includes the empty zeroth entry)
         if id >= self.file_header.posting_count as DimId {
-            return None;
+            return Err(out_of_bounds(id, self.file_header.posting_count));
         }
 
-        let header: PostingListFileHeader<W> = self
-            .slice_part::<PostingListFileHeader<W>>(u64::from(id) * Self::HEADER_SIZE as u64, 1u32)
-            [0]
+        // TODO Safety.
+        let header: PostingListFileHeader<W> = unsafe {
+            self.slice_part::<PostingListFileHeader<W>>(
+                u64::from(id) * Self::HEADER_SIZE as u64,
+                1u32,
+            )
+        }[0]
         .clone();
 
         hw_counter.vector_io_read().incr_delta(Self::HEADER_SIZE);
@@ -199,11 +207,14 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             + u64::from(header.chunks_count) * size_of::<CompressedPostingChunk<W>>() as u64;
 
         let remainders_end = if id + 1 < self.file_header.posting_count as DimId {
-            self.slice_part::<PostingListFileHeader<W>>(
-                u64::from(id + 1) * Self::HEADER_SIZE as u64,
-                1u32,
-            )[0]
-            .ids_start
+            // TODO Safety
+            (unsafe {
+                self.slice_part::<PostingListFileHeader<W>>(
+                    u64::from(id + 1) * Self::HEADER_SIZE as u64,
+                    1u32,
+                )
+            })[0]
+                .ids_start
         } else {
             self.mmap.len() as u64
         };
@@ -212,28 +223,44 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             .checked_sub(remainders_start)
             .is_some_and(|len| len % size_of::<GenericPostingElement<W>>() as u64 != 0)
         {
-            return None;
+            return Err(UniversalIoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Sparse index is corrupted",
+            )));
         }
 
-        Some(CompressedPostingListView::new(
-            self.slice_part(header.ids_start, header.ids_len),
-            self.slice_part(
-                header.ids_start + u64::from(header.ids_len),
-                header.chunks_count,
-            ),
-            transmute_from_u8_to_slice(
-                &self.mmap[remainders_start as usize..remainders_end as usize],
-            ),
+        Ok(CompressedPostingListView::new(
+            // TODO Safety
+            unsafe { self.slice_part(header.ids_start, header.ids_len) },
+            // TODO Safety
+            unsafe {
+                self.slice_part(
+                    header.ids_start + u64::from(header.ids_len),
+                    header.chunks_count,
+                )
+            },
+            // TODO Safety
+            unsafe {
+                #[expect(deprecated, reason = "legacy code")]
+                transmute_from_u8_to_slice(
+                    &self.mmap[remainders_start as usize..remainders_end as usize],
+                )
+            },
             header.last_id.checked_sub(1),
             header.quantization_params,
             hw_counter,
         ))
     }
 
-    fn slice_part<T>(&self, start: impl Into<u64>, count: impl Into<u64>) -> &[T] {
+    // TODO Safety
+    unsafe fn slice_part<T>(&self, start: impl Into<u64>, count: impl Into<u64>) -> &[T] {
         let start = start.into() as usize;
         let end = start + count.into() as usize * size_of::<T>();
-        transmute_from_u8_to_slice(&self.mmap[start..end])
+        // Safety: safe because of the method safety invariants.
+        #[expect(deprecated, reason = "legacy code")]
+        unsafe {
+            transmute_from_u8_to_slice(&self.mmap[start..end])
+        }
     }
 
     pub fn convert_and_save<P: AsRef<Path>>(
@@ -256,7 +283,7 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
         let file_path = Self::index_file_path(path.as_ref());
         let file = create_and_ensure_length(file_path.as_ref(), file_length)?;
 
-        let mut buf = BufWriter::new(&file);
+        let mut buf = BufWriter::new(file);
 
         // Save posting headers
         let mut offset: usize = total_posting_headers_size;
@@ -269,7 +296,9 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
                 last_id: posting.view(&hw_counter).last_id().map_or(0, |id| id + 1),
                 quantization_params: posting.view(&hw_counter).multiplier(),
             };
-            buf.write_all(transmute_to_u8(&posting_header))?;
+            // TODO Safety
+            #[expect(deprecated, reason = "legacy code")]
+            buf.write_all(unsafe { transmute_to_u8(&posting_header) })?;
             offset += store_size.total;
         }
 
@@ -278,13 +307,17 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             let posting_view = posting.view(&hw_counter);
             let (id_data, chunks, remainders) = posting_view.parts();
             buf.write_all(id_data)?;
-            buf.write_all(transmute_to_u8_slice(chunks))?;
-            buf.write_all(transmute_to_u8_slice(remainders))?;
+            // TODO Safety
+            #[expect(deprecated, reason = "legacy code")]
+            buf.write_all(unsafe { transmute_to_u8_slice(chunks) })?;
+            // TODO Safety
+            #[expect(deprecated, reason = "legacy code")]
+            buf.write_all(unsafe { transmute_to_u8_slice(remainders) })?;
         }
 
+        // Explicitly fsync file contents to ensure durability
         buf.flush()?;
-        drop(buf);
-
+        let file = buf.into_inner().unwrap();
         file.sync_all()?;
 
         // save header properties
@@ -308,7 +341,7 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
         })
     }
 
-    pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         // read index config file
         let config_file_path = Self::index_config_file_path(path.as_ref());
         // if the file header does not exist, the index is malformed
@@ -344,6 +377,7 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             .filter_map(|id| {
                 self.get(id, hw_counter)
                     .map(|posting| posting.store_size().total)
+                    .ok()
             })
             .sum()
     }
@@ -357,7 +391,14 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
 
     /// Drop disk cache.
     pub fn clear_cache(&self) -> std::io::Result<()> {
-        clear_disk_cache(&self.path)
+        let Self {
+            path: _,
+            mmap,
+            file_header: _,
+            _phantom,
+        } = self;
+        mmap.clear_cache();
+        Ok(())
     }
 }
 
@@ -444,8 +485,8 @@ mod tests {
         assert!(inverted_index_mmap.get(4, &hw_counter).unwrap().is_empty()); // return empty posting list info for intermediary empty ids
         assert_eq!(inverted_index_mmap.get(5, &hw_counter).unwrap().len(), 2);
         // index after the last values are None
-        assert!(inverted_index_mmap.get(6, &hw_counter).is_none());
-        assert!(inverted_index_mmap.get(7, &hw_counter).is_none());
-        assert!(inverted_index_mmap.get(100, &hw_counter).is_none());
+        assert!(inverted_index_mmap.get(6, &hw_counter).is_err());
+        assert!(inverted_index_mmap.get(7, &hw_counter).is_err());
+        assert!(inverted_index_mmap.get(100, &hw_counter).is_err());
     }
 }

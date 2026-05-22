@@ -32,7 +32,7 @@ pub fn build_simple_segment(
                 VectorDataConfig {
                     size: dim,
                     distance,
-                    storage_type: VectorStorageType::Memory,
+                    storage_type: VectorStorageType::default(),
                     index: Indexes::Plain {},
                     quantization_config: None,
                     multivector_config: None,
@@ -42,6 +42,7 @@ pub fn build_simple_segment(
             sparse_vector_data: Default::default(),
             payload_storage_type: Default::default(),
         },
+        None,
         true,
     )
 }
@@ -60,7 +61,7 @@ pub fn build_simple_segment_with_payload_storage(
                 VectorDataConfig {
                     size: dim,
                     distance,
-                    storage_type: VectorStorageType::Memory,
+                    storage_type: VectorStorageType::default(),
                     index: Indexes::Plain {},
                     quantization_config: None,
                     multivector_config: None,
@@ -70,6 +71,7 @@ pub fn build_simple_segment_with_payload_storage(
             sparse_vector_data: Default::default(),
             payload_storage_type,
         },
+        None,
         true,
     )
 }
@@ -86,7 +88,7 @@ pub fn build_multivec_segment(
         VectorDataConfig {
             size: dim1,
             distance,
-            storage_type: VectorStorageType::Memory,
+            storage_type: VectorStorageType::default(),
             index: Indexes::Plain {},
             quantization_config: None,
             multivector_config: None,
@@ -98,7 +100,7 @@ pub fn build_multivec_segment(
         VectorDataConfig {
             size: dim2,
             distance,
-            storage_type: VectorStorageType::Memory,
+            storage_type: VectorStorageType::default(),
             index: Indexes::Plain {},
             quantization_config: None,
             multivector_config: None,
@@ -113,6 +115,7 @@ pub fn build_multivec_segment(
             sparse_vector_data: Default::default(),
             payload_storage_type: Default::default(),
         },
+        None,
         true,
     )
 }
@@ -125,7 +128,7 @@ mod tests {
     use super::*;
     use crate::common::operation_error::OperationError;
     use crate::data_types::vectors::only_default_vector;
-    use crate::entry::entry_point::SegmentEntry;
+    use crate::entry::entry_point::{ReadSegmentEntry as _, SegmentEntry as _};
     use crate::payload_json;
 
     #[test]

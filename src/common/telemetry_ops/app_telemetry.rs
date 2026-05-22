@@ -1,11 +1,15 @@
 use std::path::Path;
 
 use chrono::{DateTime, SubsecRound, Utc};
+use common::flags::FeatureFlags;
+use common::low_memory::LowMemoryMode;
 use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
+use segment::types::HnswGlobalConfig;
 use serde::Serialize;
 
+use crate::common::audit::{AuditConfig, AuditRotation};
 use crate::settings::Settings;
 
 pub struct AppBuildTelemetryCollector {
@@ -23,10 +27,11 @@ impl AppBuildTelemetryCollector {
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct AppFeaturesTelemetry {
     pub debug: bool,
-    pub web_feature: bool,
     pub service_debug_feature: bool,
     pub recovery_mode: bool,
     pub gpu: bool,
+    pub rocksdb: bool,
+    pub staging: bool,
 }
 
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
@@ -38,6 +43,12 @@ pub struct RunningEnvironmentTelemetry {
     is_docker: bool,
     #[anonymize(false)]
     cores: Option<usize>,
+    /// Average number of CPU cores used by this process over roughly the last
+    /// two seconds. `None` on unsupported platforms, before two samples are
+    /// collected, or on transient failures reading process CPU time.
+    #[anonymize(false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_cores_used: Option<f32>,
     ram_size: Option<usize>,
     disk_size: Option<usize>,
     #[anonymize(false)]
@@ -49,6 +60,19 @@ pub struct RunningEnvironmentTelemetry {
 }
 
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+pub struct AuditTelemetry {
+    #[anonymize(false)]
+    pub dir: String,
+    #[anonymize(false)]
+    pub rotation: String,
+    pub max_log_files: usize,
+    pub trust_forwarded_headers: bool,
+    pub log_api: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir_size_bytes: Option<usize>,
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct AppBuildTelemetry {
     #[anonymize(false)]
     pub name: String,
@@ -56,12 +80,22 @@ pub struct AppBuildTelemetry {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<AppFeaturesTelemetry>,
+    #[anonymize(value = None)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_features: Option<FeatureFlags>,
+    #[anonymize(value = None)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_memory_mode: Option<LowMemoryMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hnsw_global_config: Option<HnswGlobalConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<RunningEnvironmentTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwt_rbac: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_jwt_dashboard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditTelemetry>,
     pub startup: DateTime<Utc>,
 }
 
@@ -76,17 +110,51 @@ impl AppBuildTelemetry {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: (detail.level >= DetailsLevel::Level1).then(|| AppFeaturesTelemetry {
                 debug: cfg!(debug_assertions),
-                web_feature: cfg!(feature = "web"),
                 service_debug_feature: cfg!(feature = "service_debug"),
                 recovery_mode: settings.storage.recovery_mode.is_some(),
                 gpu: cfg!(feature = "gpu"),
+                rocksdb: false,
+                staging: cfg!(feature = "staging"),
             }),
+            runtime_features: (detail.level >= DetailsLevel::Level1)
+                .then(common::flags::feature_flags),
+            low_memory_mode: (detail.level >= DetailsLevel::Level1)
+                .then(common::low_memory::low_memory_mode),
+            hnsw_global_config: (detail.level >= DetailsLevel::Level1)
+                .then(|| settings.storage.hnsw_global_config.clone()),
             system: (detail.level >= DetailsLevel::Level1).then(get_system_data),
             jwt_rbac: settings.service.jwt_rbac,
             hide_jwt_dashboard: settings.service.hide_jwt_dashboard,
+            audit: collect_audit_telemetry(settings.audit.as_ref(), detail),
             startup: collector.startup,
         }
     }
+}
+
+fn collect_audit_telemetry(
+    audit: Option<&AuditConfig>,
+    detail: TelemetryDetail,
+) -> Option<AuditTelemetry> {
+    let config = audit.filter(|c| c.enabled)?;
+    let dir_size_bytes = (detail.level > DetailsLevel::Level2)
+        .then(|| {
+            common::disk::dir_disk_size(&config.dir)
+                .ok()
+                .map(|v| v as usize)
+        })
+        .flatten();
+    let rotation = match config.rotation {
+        AuditRotation::Daily => "daily",
+        AuditRotation::Hourly => "hourly",
+    };
+    Some(AuditTelemetry {
+        dir: config.dir.display().to_string(),
+        rotation: rotation.to_string(),
+        max_log_files: config.max_log_files,
+        trust_forwarded_headers: config.trust_forwarded_headers,
+        log_api: config.log_api,
+        dir_size_bytes,
+    })
 }
 
 fn get_system_data() -> RunningEnvironmentTelemetry {
@@ -124,6 +192,12 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         if std::arch::is_x86_feature_detected!("avx512f") {
             cpu_flags.push("avx512f");
         }
+        if std::arch::is_x86_feature_detected!("avx512vl") {
+            cpu_flags.push("avx512vl");
+        }
+        if std::arch::is_x86_feature_detected!("avx512vpopcntdq") {
+            cpu_flags.push("avx512vpopcntdq");
+        }
     }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
@@ -155,6 +229,7 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         distribution_version,
         is_docker: cfg!(unix) && Path::new("/.dockerenv").exists(),
         cores: sys_info::cpu_num().ok().map(|x| x as usize),
+        cpu_cores_used: common::process_cpu_usage::process_cpu_usage_cores(),
         ram_size: sys_info::mem_info().ok().map(|x| x.total as usize),
         disk_size: sys_info::disk_info().ok().map(|x| x.total as usize),
         cpu_flags: cpu_flags.join(","),

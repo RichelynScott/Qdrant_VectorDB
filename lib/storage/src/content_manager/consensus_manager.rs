@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
+use std::path::Path;
 use std::str;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::error::Elapsed;
+use tokio_util::task::AbortOnDropHandle;
 use tonic::transport::Uri;
 
 use super::CollectionContainer;
@@ -107,12 +109,33 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         persistent_state: Persistent,
         toc: Arc<C>,
         propose_sender: OperationSender,
-        storage_path: &str,
-    ) -> Self {
-        Self {
+        storage_path: &Path,
+    ) -> Result<Self, StorageError> {
+        let mut wal = ConsensusOpWal::new(storage_path);
+
+        // When our Raft index and last snapshot index match, the last thing we did is apply a Raft
+        // snapshot. It is possible that we crashed before clearing the WAL, so we still do it now.
+        // Specifically, if the last operation was applying a snapshot and our WAL does still have
+        // older Raft entries, we clear the whole WAL. Consensus will take care of us catching up
+        // with the rest.
+        // See `apply_snapshot` function and <https://github.com/qdrant/qdrant/pull/7577>.
+        let raft_index = persistent_state.state().hard_state.commit;
+        let snapshot_index = persistent_state.latest_snapshot_meta.index;
+        let last_operation_was_snapshot = raft_index == persistent_state.latest_snapshot_meta.index;
+        if last_operation_was_snapshot
+            && let Ok(Some(last)) = wal.last_entry()
+            && last.index < snapshot_index
+        {
+            log::warn!(
+                "Consensus WAL was not cleared after applying consensus snapshot, clearing it now"
+            );
+            wal.clear()?;
+        }
+
+        Ok(Self {
             persistent: RwLock::new(persistent_state),
             is_leader_established: Arc::new(IsReady::default()),
-            wal: Mutex::new(ConsensusOpWal::new(storage_path)),
+            wal: Mutex::new(wal),
             soft_state: RwLock::new(None),
             toc,
             on_consensus_op_apply: Default::default(),
@@ -122,7 +145,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             }),
             message_send_failures: Default::default(),
             next_peer_metadata_update_attempt: Mutex::new(Instant::now()),
-        }
+        })
     }
 
     pub fn report_snapshot(
@@ -277,6 +300,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 }
                 Ok(true)
             }
+            #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
             Err(err) => match err {
                 err @ StorageError::ServiceError { .. } => {
                     return Err(err);
@@ -286,12 +310,12 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         };
         let operation = ConsensusOperations::RemovePeer(peer_id);
         let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
-        if let Some(on_apply) = on_apply {
-            if on_apply.send(report).is_err() {
-                log::warn!(
-                    "Failed to notify on consensus operation completion: channel receiver is dropped",
-                )
-            }
+        if let Some(on_apply) = on_apply
+            && on_apply.send(report).is_err()
+        {
+            log::warn!(
+                "Failed to notify on consensus operation completion: channel receiver is dropped",
+            )
         }
         Ok(stop_consensus)
     }
@@ -371,7 +395,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                         stop_consensus
                     }
                     ty @ EntryType::EntryConfChange => {
-                        return Err(anyhow!("Unexpected entry type: {:?}", ty));
+                        return Err(anyhow!("Unexpected entry type: {ty:?}"));
                     }
                 }
             };
@@ -454,12 +478,12 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                                 uri: peer_uri.to_string(),
                             };
                             let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
-                            if let Some(on_apply) = on_apply {
-                                if on_apply.send(Ok(true)).is_err() {
-                                    log::warn!(
-                                        "Failed to notify on consensus operation completion: channel receiver is dropped",
-                                    )
-                                }
+                            if let Some(on_apply) = on_apply
+                                && on_apply.send(Ok(true)).is_err()
+                            {
+                                log::warn!(
+                                    "Failed to notify on consensus operation completion: channel receiver is dropped",
+                                )
                             }
                         }
                     } else if entry.get_context().is_empty() {
@@ -527,12 +551,12 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             }
         };
 
-        if let Some(on_apply) = on_apply {
-            if on_apply.send(result.clone()).is_err() {
-                log::warn!(
-                    "Failed to notify on consensus operation completion: channel receiver is dropped",
-                )
-            }
+        if let Some(on_apply) = on_apply
+            && on_apply.send(result.clone()).is_err()
+        {
+            log::warn!(
+                "Failed to notify on consensus operation completion: channel receiver is dropped",
+            )
         }
         result
     }
@@ -552,7 +576,6 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         } = snapshot.get_data().try_into()?;
 
         self.toc.apply_collections_snapshot(collections_data)?;
-        self.wal.lock().clear()?;
         self.persistent.write().update_from_snapshot(
             meta,
             address_by_id,
@@ -560,7 +583,65 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             cluster_metadata,
         )?;
 
+        // Clear now obsolete WAL entries after persisting new Raft state
+        // This way we prevent a crash due to an empty WAL if we crash right after clearing it,
+        // without bumping the Raft state. If we now crash after persisting the new state but
+        // before clearing the WAL, we will clear the WAL on next startup by truncating all entries
+        // above our commit.
+        self.wal.lock().clear()?;
+
+        // Notify any awaiting consensus operations that are now observably satisfied by the
+        // snapshot state. Without this, an operation that was proposed locally and then committed
+        // remotely can be delivered via snapshot (instead of as a log entry) — in which case it
+        // never flows through `apply_conf_change_entry` / `apply_normal_entry`, so the waiter in
+        // `propose_consensus_op_with_await` would block until the timeout.
+        self.notify_pending_ops_from_snapshot();
+
         Ok(Ok(()))
+    }
+
+    /// Inspect pending awaiters and resolve those whose effect is visible in the current
+    /// persistent state. Only operations whose result can be directly read off the snapshot
+    /// state are eligible — others remain pending and may still time out.
+    fn notify_pending_ops_from_snapshot(&self) {
+        let persistent = self.persistent.read();
+        let address_by_id = persistent.peer_address_by_id.read();
+        let metadata_by_id = persistent.peer_metadata_by_id.read();
+
+        self.on_consensus_op_apply
+            .lock()
+            .retain(|operation, sender| {
+                let satisfied = match operation {
+                    ConsensusOperations::AddPeer { peer_id, uri } => {
+                        address_by_id
+                            .get(peer_id)
+                            .map(|known| known.to_string())
+                            .as_deref()
+                            == Some(uri.as_str())
+                    }
+                    ConsensusOperations::RemovePeer(peer_id) => {
+                        !address_by_id.contains_key(peer_id)
+                    }
+                    ConsensusOperations::UpdatePeerMetadata { peer_id, metadata } => {
+                        metadata_by_id.get(peer_id) == Some(metadata)
+                    }
+                    ConsensusOperations::UpdateClusterMetadata { key, value } => {
+                        persistent.cluster_metadata.get(key) == Some(value)
+                    }
+                    // Snapshot state can't be inspected to confirm these are satisfied — leave
+                    // their awaiters pending so they fall back to the regular timeout path.
+                    ConsensusOperations::CollectionMeta(_)
+                    | ConsensusOperations::RequestSnapshot
+                    | ConsensusOperations::ReportSnapshot { .. } => false,
+                };
+
+                if satisfied {
+                    let _ = sender.send(Ok(true));
+                    false
+                } else {
+                    true
+                }
+            });
     }
 
     pub fn set_hard_state(&self, hard_state: raft::eraftpb::HardState) -> Result<(), StorageError> {
@@ -592,6 +673,16 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.persistent
             .write()
             .apply_state_update(|state| state.hard_state.commit = index)
+    }
+
+    pub fn peer_has_shards(&self, peer_id: PeerId) -> bool {
+        self.toc
+            .collections_snapshot()
+            .collections
+            .values()
+            .flat_map(|state| state.shards.values())
+            .flat_map(|shard_info| shard_info.replicas.keys())
+            .any(|&id| id == peer_id)
     }
 
     pub fn add_peer(&self, peer_id: PeerId, uri: Uri) -> Result<(), StorageError> {
@@ -727,9 +818,10 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
         let is_leader_established = self.is_leader_established.clone();
 
-        let await_ready_for_timeout_future = tokio::task::spawn_blocking(move || {
-            is_leader_established.await_ready_for_timeout(wait_timeout)
-        });
+        let await_ready_for_timeout_future =
+            AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+                is_leader_established.await_ready_for_timeout(wait_timeout)
+            }));
 
         let is_leader_established = await_ready_for_timeout_future
             .await
@@ -737,8 +829,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
         if !is_leader_established {
             return Err(StorageError::service_error(format!(
-                "Failed to propose operation: leader is not established within {} secs",
-                wait_timeout.as_secs()
+                "Failed to propose operation: leader is not established within {wait_timeout:?}"
             )));
         }
 
@@ -807,12 +898,13 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         };
 
         debug_assert!(
-            last_applied_index >= first_entry.index - 1,
+            first_entry.index <= last_applied_index + 1,
             "Raft WAL is missing {} unapplied entries (last applied index: {}, first WAL entry index: {})",
             first_entry.index - last_applied_index - 1,
             last_applied_index,
             first_entry.index,
         );
+
         if last_applied_index.saturating_sub(first_entry.index) < min_entries_to_compact {
             return Ok(false);
         }
@@ -1124,7 +1216,7 @@ mod tests {
     #[test]
     fn update_is_applied() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut state = Persistent::load_or_init(dir.path(), false, false).unwrap();
+        let mut state = Persistent::load_or_init(dir.path(), false, false, None).unwrap();
         assert_eq!(state.state().hard_state.commit, 0);
         state
             .apply_state_update(|state| state.hard_state.commit = 1)
@@ -1148,14 +1240,25 @@ mod tests {
     #[test]
     fn state_is_loaded() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut state = Persistent::load_or_init(dir.path(), false, false).unwrap();
+        let mut state = Persistent::load_or_init(dir.path(), false, false, None).unwrap();
         state
             .apply_state_update(|state| state.hard_state.commit = 1)
             .unwrap();
         assert_eq!(state.state().hard_state.commit, 1);
 
-        let state_loaded = Persistent::load_or_init(dir.path(), false, false).unwrap();
+        let state_loaded = Persistent::load_or_init(dir.path(), false, false, None).unwrap();
         assert_eq!(state_loaded.state().hard_state.commit, 1);
+    }
+
+    #[test]
+    fn default_peer_id_is_persisted() {
+        let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
+        let peer_id = Some(101);
+        let state = Persistent::load_or_init(dir.path(), false, false, peer_id).unwrap();
+        assert_eq!(state.this_peer_id, 101);
+
+        let state_loaded = Persistent::load_or_init(dir.path(), false, false, None).unwrap();
+        assert_eq!(state_loaded.this_peer_id, 101);
     }
 
     #[test]
@@ -1177,7 +1280,7 @@ mod tests {
     #[test]
     fn correct_entry_with_offset() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut wal = ConsensusOpWal::new(dir.path().to_str().unwrap());
+        let mut wal = ConsensusOpWal::new(dir.path());
         wal.append_entries(vec![Entry {
             index: 4,
             ..Default::default()
@@ -1199,7 +1302,7 @@ mod tests {
     #[test]
     fn at_least_1_entry() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut wal = ConsensusOpWal::new(dir.path().to_str().unwrap());
+        let mut wal = ConsensusOpWal::new(dir.path());
         wal.append_entries(vec![
             Entry {
                 index: 4,
@@ -1252,14 +1355,15 @@ mod tests {
         entries: Vec<Entry>,
         path: &std::path::Path,
     ) -> (ConsensusManager<NoCollections>, MemStorage) {
-        let persistent = Persistent::load_or_init(path, true, false).unwrap();
+        let persistent = Persistent::load_or_init(path, true, false, None).unwrap();
         let (sender, _) = mpsc::channel();
         let consensus_state = ConsensusManager::new(
             persistent,
             Arc::new(NoCollections),
             OperationSender::new(sender),
-            path.to_str().unwrap(),
-        );
+            path,
+        )
+        .expect("initialize consensus manager");
         let mem_storage = MemStorage::new();
         mem_storage.wl().append(entries.as_ref()).unwrap();
         consensus_state.append_entries(entries).unwrap();
@@ -1272,7 +1376,15 @@ mod tests {
         }
     }
 
+    // Each proptest case creates a persistent WAL on disk, which is very slow on Windows.
+    #[cfg(target_os = "windows")]
+    const PROPTEST_CASES: u32 = 10;
+    #[cfg(not(target_os = "windows"))]
+    const PROPTEST_CASES: u32 = 256;
+
     proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(PROPTEST_CASES))]
+
         #[test]
         fn check_first_and_last_indexes(entries in gen_entries(0, 100)) {
             let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
@@ -1361,9 +1473,162 @@ mod tests {
         (dir, wal)
     }
 
+    /// Regression test for the flaky `test_peer_snapshot_bootstrap`.
+    ///
+    /// Scenario: a peer proposes `AddPeer` and registers an awaiter, but the proposal is
+    /// committed remotely and delivered back to us as part of a raft snapshot rather than as a
+    /// log entry. Before the fix, the awaiter was never notified — `apply_snapshot` only
+    /// updated persistent state and did not touch `on_consensus_op_apply`. The awaiter would
+    /// then time out after 10 seconds and `add_peer_to_known` would fail, killing the joining
+    /// peer's bootstrap.
+    #[test]
+    fn apply_snapshot_notifies_pending_add_peer() {
+        use std::collections::HashMap;
+
+        use raft::eraftpb::{ConfState, Snapshot, SnapshotMetadata};
+
+        use super::{ConsensusOperations, SnapshotData};
+        use crate::types::{PeerAddressById, PeerMetadataById};
+
+        let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
+        let persistent = Persistent::load_or_init(dir.path(), true, false, None).unwrap();
+        let (sender, _) = mpsc::channel();
+        let consensus = ConsensusManager::new(
+            persistent,
+            Arc::new(NoCollections),
+            OperationSender::new(sender),
+            dir.path(),
+        )
+        .unwrap();
+
+        let new_peer_id: PeerId = 7372867103273069;
+        let new_peer_uri = "http://127.0.0.1:20924/".to_string();
+
+        // Register an awaiter directly, mimicking what `propose_consensus_op_with_await` does
+        // before the proposal is forwarded to the leader.
+        let operation = ConsensusOperations::AddPeer {
+            peer_id: new_peer_id,
+            uri: new_peer_uri.clone(),
+        };
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        consensus
+            .on_consensus_op_apply
+            .lock()
+            .insert(operation.clone(), tx);
+
+        // Build a snapshot whose state contains the new peer (this is what arrives over the
+        // wire when the leader truncates past our pending entry).
+        let mut address_by_id: PeerAddressById = HashMap::new();
+        address_by_id.insert(new_peer_id, new_peer_uri.parse().unwrap());
+
+        let snapshot_data = SnapshotData {
+            collections_data: super::CollectionsSnapshot::default(),
+            address_by_id,
+            metadata_by_id: PeerMetadataById::new(),
+            cluster_metadata: HashMap::new(),
+        };
+
+        let mut conf_state = ConfState::default();
+        conf_state.learners.push(new_peer_id);
+
+        let snapshot = Snapshot {
+            data: serde_cbor::to_vec(&snapshot_data).unwrap(),
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(conf_state),
+                index: 15,
+                term: 2,
+            }),
+        };
+
+        consensus.apply_snapshot(&snapshot).unwrap().unwrap();
+
+        // The awaiter should have been notified successfully, and the entry should have been
+        // removed from the pending map.
+        let result = rx.try_recv().expect("awaiter must be notified by snapshot");
+        assert!(result.is_ok(), "expected Ok notification, got {result:?}");
+        assert!(
+            !consensus
+                .on_consensus_op_apply
+                .lock()
+                .contains_key(&operation),
+            "satisfied operation should be removed from pending map",
+        );
+    }
+
+    /// Companion to the above: a snapshot that does NOT contain the awaited peer must leave
+    /// the awaiter untouched, so the caller can still time out / retry rather than being
+    /// falsely told the operation succeeded.
+    #[test]
+    fn apply_snapshot_does_not_notify_unrelated_add_peer() {
+        use std::collections::HashMap;
+
+        use raft::eraftpb::{ConfState, Snapshot, SnapshotMetadata};
+
+        use super::{ConsensusOperations, SnapshotData};
+        use crate::types::{PeerAddressById, PeerMetadataById};
+
+        let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
+        let persistent = Persistent::load_or_init(dir.path(), true, false, None).unwrap();
+        let (sender, _) = mpsc::channel();
+        let consensus = ConsensusManager::new(
+            persistent,
+            Arc::new(NoCollections),
+            OperationSender::new(sender),
+            dir.path(),
+        )
+        .unwrap();
+
+        let operation = ConsensusOperations::AddPeer {
+            peer_id: 12345,
+            uri: "http://127.0.0.1:11111/".to_string(),
+        };
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        consensus
+            .on_consensus_op_apply
+            .lock()
+            .insert(operation.clone(), tx);
+
+        // Snapshot mentions a *different* peer — our awaited operation is not yet satisfied.
+        let mut address_by_id: PeerAddressById = HashMap::new();
+        address_by_id.insert(99999, "http://127.0.0.1:22222/".parse().unwrap());
+
+        let snapshot_data = SnapshotData {
+            collections_data: super::CollectionsSnapshot::default(),
+            address_by_id,
+            metadata_by_id: PeerMetadataById::new(),
+            cluster_metadata: HashMap::new(),
+        };
+
+        let snapshot = Snapshot {
+            data: serde_cbor::to_vec(&snapshot_data).unwrap(),
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(ConfState::default()),
+                index: 1,
+                term: 1,
+            }),
+        };
+
+        consensus.apply_snapshot(&snapshot).unwrap().unwrap();
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty),
+            ),
+            "awaiter must not be notified when snapshot does not satisfy the operation",
+        );
+        assert!(
+            consensus
+                .on_consensus_op_apply
+                .lock()
+                .contains_key(&operation),
+            "unsatisfied operation should remain pending",
+        );
+    }
+
     fn empty_wal() -> (tempfile::TempDir, ConsensusOpWal) {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let wal = ConsensusOpWal::new(dir.path().to_str().unwrap());
+        let wal = ConsensusOpWal::new(dir.path());
         (dir, wal)
     }
 

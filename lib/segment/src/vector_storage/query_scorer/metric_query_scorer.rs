@@ -1,15 +1,16 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::typelevel::True;
 use common::types::{PointOffsetType, ScoreType};
+use zerocopy::FromBytes;
 
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{TypedDenseVector, VectorElementType};
 use crate::spaces::metric::Metric;
 use crate::vector_storage::DenseVectorStorage;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::QueryScorer;
 
 pub struct MetricQueryScorer<
@@ -61,30 +62,28 @@ impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
     TVectorStorage: DenseVectorStorage<TElement>,
-> QueryScorer<[TElement]> for MetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
+> QueryScorer for MetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
 {
+    type TVector = [TElement];
+
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         self.hardware_counter.cpu_counter().incr();
         self.hardware_counter.vector_io_read().incr();
-        TMetric::similarity(&self.query, self.vector_storage.get_dense(idx))
+        TMetric::similarity(&self.query, &self.vector_storage.get_dense::<Random>(idx))
     }
 
+    #[inline]
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
         debug_assert_eq!(ids.len(), scores.len());
 
-        let mut vectors = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
-
-        let vectors = self
-            .vector_storage
-            .get_dense_batch(ids, &mut vectors[..ids.len()]);
         self.hardware_counter.cpu_counter().incr_delta(ids.len());
         self.hardware_counter.vector_io_read().incr_delta(ids.len());
 
-        for idx in 0..ids.len() {
-            scores[idx] = TMetric::similarity(&self.query, vectors[idx]);
-        }
+        self.vector_storage
+            .for_each_in_dense_batch(ids, |idx, vector| {
+                scores[idx] = TMetric::similarity(&self.query, vector);
+            });
     }
 
     #[inline]
@@ -95,8 +94,13 @@ impl<
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
         self.hardware_counter.cpu_counter().incr();
-        let v1 = self.vector_storage.get_dense(point_a);
-        let v2 = self.vector_storage.get_dense(point_b);
-        TMetric::similarity(v1, v2)
+        let v1 = self.vector_storage.get_dense::<Random>(point_a);
+        let v2 = self.vector_storage.get_dense::<Random>(point_b);
+        TMetric::similarity(&v1, &v2)
+    }
+
+    type SupportsBytes = True;
+    fn score_bytes(&self, _enabled: Self::SupportsBytes, bytes: &[u8]) -> ScoreType {
+        self.score(<[TElement]>::ref_from_bytes(bytes).unwrap())
     }
 }

@@ -6,7 +6,7 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::prelude::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use tempfile::Builder;
 
@@ -68,7 +68,13 @@ async fn distance_matrix_anonymous_vector() {
 
     let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(upsert_points, true, WriteOrdering::default(), hw_counter)
+        .update_from_client_simple(
+            upsert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 

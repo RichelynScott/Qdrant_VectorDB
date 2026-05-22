@@ -1,30 +1,32 @@
 mod entry;
-mod facet;
-mod formula_rescore;
-mod order_by;
-mod sampling;
-mod scroll;
+pub mod memory;
 mod search;
 mod segment_ops;
+pub mod vector_data_read;
+mod vector_name_ops;
+mod version_tracker;
 
 pub mod snapshot;
 
+mod as_view;
+mod read_view;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use atomic_refcell::AtomicRefCell;
-use io::storage_version::StorageVersion;
-use parking_lot::{Mutex, RwLock};
-use rocksdb::DB;
+use common::is_alive_lock::IsAliveLock;
+use common::storage_version::StorageVersion;
+use parking_lot::Mutex;
+use uuid::Uuid;
 
-use crate::common::operation_error::{OperationError, OperationResult, SegmentFailedState};
-use crate::id_tracker::IdTrackerSS;
+use self::version_tracker::VersionTracker;
+use crate::common::operation_error::SegmentFailedState;
+use crate::id_tracker::IdTrackerEnum;
 use crate::index::VectorIndexEnum;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
@@ -37,8 +39,8 @@ pub const SEGMENT_STATE_FILE: &str = "segment.json";
 const SNAPSHOT_PATH: &str = "snapshot";
 
 // Sub-directories of `SNAPSHOT_PATH`:
-const DB_BACKUP_PATH: &str = "db_backup";
-const PAYLOAD_DB_BACKUP_PATH: &str = "payload_index_db_backup";
+const DEPRECATED_ROCKSDB_BACKUP_PATH: &str = "db_backup";
+const DEPRECATED_PAYLOAD_ROCKSDB_BACKUP_PATH: &str = "payload_index_db_backup";
 const SNAPSHOT_FILES_PATH: &str = "files";
 
 pub struct SegmentVersion;
@@ -57,15 +59,22 @@ impl StorageVersion for SegmentVersion {
 /// - Keeps track of occurred errors
 #[derive(Debug)]
 pub struct Segment {
+    pub uuid: Uuid,
+    /// Initial version this segment was created at
+    pub initial_version: Option<SeqNumberType>,
     /// Latest update operation number, applied to this segment
     /// If None, there were no updates and segment is empty
     pub version: Option<SeqNumberType>,
     /// Latest persisted version
+    /// Locked structure on which we hold the lock during flush to prevent concurrent flushes
     pub persisted_version: Arc<Mutex<Option<SeqNumberType>>>,
-    /// Path of the storage root
-    pub current_path: PathBuf,
+    /// Lock to prevent concurrent flushes and used for waiting for ongoing flushes to finish.
+    pub is_alive_flush_lock: IsAliveLock,
+    /// Path to the segment directory
+    pub segment_path: PathBuf,
+    pub version_tracker: VersionTracker,
     /// Component for mapping external ids to internal and also keeping track of point versions
-    pub id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    pub id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
     pub vector_data: HashMap<VectorNameBuf, VectorData>,
     pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
     pub payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
@@ -77,8 +86,6 @@ pub struct Segment {
     /// Last unhandled error
     /// If not None, all update operations will be aborted until original operation is performed properly
     pub error_status: Option<SegmentFailedState>,
-    pub database: Arc<RwLock<DB>>,
-    pub flush_thread: Mutex<Option<JoinHandle<OperationResult<SeqNumberType>>>>,
 }
 
 pub struct VectorData {
@@ -95,9 +102,8 @@ impl fmt::Debug for VectorData {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        if let Err(flushing_err) = self.lock_flushing() {
-            log::error!("Failed to flush segment during drop: {flushing_err}");
-        }
+        // Wait for all background flush operations to finish
+        self.is_alive_flush_lock.blocking_mark_dead();
 
         // Try to remove everything from the disk cache, as it might pollute the cache
         if let Err(e) = self.payload_storage.borrow().clear_cache() {
@@ -123,22 +129,11 @@ impl Drop for Segment {
                 log::error!("Failed to clear cache of vector storage {name}: {e}");
             }
 
-            if let Some(quantized_vectors) = quantized_vectors.borrow().as_ref() {
-                if let Err(e) = quantized_vectors.clear_cache() {
-                    log::error!("Failed to clear cache of quantized vectors {name}: {e}");
-                }
+            if let Some(quantized_vectors) = quantized_vectors.borrow().as_ref()
+                && let Err(e) = quantized_vectors.clear_cache()
+            {
+                log::error!("Failed to clear cache of quantized vectors {name}: {e}");
             }
         }
     }
-}
-
-pub fn destroy_rocksdb(path: &Path) -> OperationResult<()> {
-    rocksdb::DB::destroy(&Default::default(), path).map_err(|err| {
-        OperationError::service_error(format!(
-            "failed to destroy RocksDB at {}: {err}",
-            path.display()
-        ))
-    })?;
-
-    Ok(())
 }

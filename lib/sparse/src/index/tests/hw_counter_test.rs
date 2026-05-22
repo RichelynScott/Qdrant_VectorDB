@@ -21,11 +21,13 @@ fn do_search<I: InvertedIndex>(index: &I, query: RemappedSparseVector) -> HwMeas
         get_pooled_scores(),
         &is_stopped,
         &hardware_counter,
-    );
+    )
+    .unwrap();
 
     let result = search_context.search(&match_all);
-
-    assert_eq!(result.len(), top);
+    // there might be less than `top` result
+    // happens if index contains less than `top` sparse vectors with indices overlapping the query indices
+    assert!(result.len() <= top);
 
     accumulator
 }
@@ -46,11 +48,14 @@ fn do_plain_search<I: InvertedIndex>(
         get_pooled_scores(),
         &is_stopped,
         &hardware_counter,
-    );
+    )
+    .unwrap();
 
     let result = search_context.plain_search(docs);
 
-    assert_eq!(result.len(), top);
+    // there might be less than `top` result
+    // happens if index contains less than `top` sparse vectors with indices overlapping the query indices
+    assert!(result.len() <= top);
 
     accumulator
 }

@@ -1,15 +1,19 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::types::DeferredBehavior;
 use parking_lot::Mutex;
+use shard::count::CountRequestInternal;
 
+use super::TransferStage;
 use super::transfer_tasks_pool::TransferTaskProgress;
 use crate::hash_ring::HashRingRouter;
-use crate::operations::types::{CollectionError, CollectionResult, CountRequestInternal};
+use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::CollectionId;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::shard::ShardId;
-use crate::shards::shard_holder::LockedShardHolder;
+use crate::shards::shard_holder::SharedShardHolder;
 use crate::shards::transfer::stream_records::TRANSFER_BATCH_SIZE;
 
 /// Orchestrate shard transfer by streaming records, but only the points that fall into the new
@@ -25,7 +29,7 @@ use crate::shards::transfer::stream_records::TRANSFER_BATCH_SIZE;
 ///
 /// This function is cancel safe.
 pub(crate) async fn transfer_resharding_stream_records(
-    shard_holder: Arc<LockedShardHolder>,
+    shard_holder: SharedShardHolder,
     progress: Arc<Mutex<TransferTaskProgress>>,
     shard_id: ShardId,
     remote_shard: RemoteShard,
@@ -40,6 +44,7 @@ pub(crate) async fn transfer_resharding_stream_records(
     );
 
     // Proxify local shard and create payload indexes on remote shard
+    progress.lock().set_stage(TransferStage::Proxifying);
     {
         let shard_holder = shard_holder.read().await;
 
@@ -62,8 +67,19 @@ pub(crate) async fn transfer_resharding_stream_records(
         })?;
 
         replica_set
-            .proxify_local(remote_shard.clone(), Some(hashring.clone()))
+            .proxify_local(remote_shard.clone(), Some(hashring.clone()), None)
             .await?;
+
+        // Plunge all pending operations in update queue
+        // Required to ensure all operations that were in flight before the transfer are included
+        // in the transfer
+        progress.lock().set_stage(TransferStage::Plunging);
+        let Some(plunger) = replica_set.plunge_local_async().await? else {
+            return Err(CollectionError::service_error(format!(
+                "Shard {shard_id} cannot be proxied because it does not exist"
+            )));
+        };
+        plunger.await?;
 
         let hw_acc = HwMeasurementAcc::disposable();
         let Some(count_result) = replica_set
@@ -74,6 +90,7 @@ pub(crate) async fn transfer_resharding_stream_records(
                 }),
                 None,
                 hw_acc,
+                DeferredBehavior::IncludeAll,
             )
             .await?
         else {
@@ -135,27 +152,45 @@ pub(crate) async fn transfer_resharding_stream_records(
     }
 
     // Transfer contents batch by batch
+    progress.lock().set_stage(TransferStage::Transferring);
     log::trace!("Transferring points to shard {shard_id} by reshard streaming records");
 
     let mut offset = None;
+    let mut total_read = Duration::ZERO;
+    let mut total_send = Duration::ZERO;
 
     loop {
-        let shard_holder = shard_holder.read().await;
+        // Read batch under shard holder lock
+        let prepared_batch = {
+            let shard_holder = shard_holder.read().await;
 
-        let Some(replica_set) = shard_holder.get_shard(shard_id) else {
-            // Forward proxy gone?!
-            // That would be a programming error.
-            return Err(CollectionError::service_error(format!(
-                "Shard {shard_id} is not found"
-            )));
+            let Some(replica_set) = shard_holder.get_shard(shard_id) else {
+                // Forward proxy gone?!
+                // That would be a programming error.
+                return Err(CollectionError::service_error(format!(
+                    "Shard {shard_id} is not found"
+                )));
+            };
+
+            replica_set
+                .read_transfer_batch(offset, TRANSFER_BATCH_SIZE, Some(&hashring), true)
+                .await?
+
+            // Shard holder lock is dropped here, but the forward proxy update lock is still
+            // held inside the prepared batch.
         };
 
-        let (new_offset, count) = replica_set
-            .transfer_batch(offset, TRANSFER_BATCH_SIZE, Some(&hashring), true)
-            .await?;
+        // Send batch to remote shard without holding the shard holder lock.
+        let result = prepared_batch.send(&remote_shard).await?;
 
-        offset = new_offset;
-        progress.lock().add(count);
+        offset = result.next_page_offset;
+        total_read += result.read_duration;
+        total_send += result.send_duration;
+        {
+            let mut p = progress.lock();
+            p.add(result.count);
+            p.set_batch_durations(total_read, total_send);
+        }
 
         // If this is the last batch, finalize
         if offset.is_none() {

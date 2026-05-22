@@ -3,9 +3,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use quantization::encoded_storage::TestEncodedStorageBuilder;
     use quantization::encoded_vectors::{DistanceType, VectorParameters};
-    use quantization::encoded_vectors_u8::EncodedVectorsU8;
-    use quantization::{EncodedVectorsPQ, EncodingError};
+    use quantization::encoded_vectors_u8::{self, EncodedVectorsU8, ScalarQuantizationMethod};
+    use quantization::{EncodedVectorsPQ, EncodingError, encoded_vectors_pq};
 
     #[test]
     fn stop_condition_u8() {
@@ -22,17 +23,22 @@ mod tests {
         let vector_dim = 8;
         let vector_parameters = VectorParameters {
             dim: vector_dim,
-            count: vectors_count,
+            deprecated_count: None,
             distance_type: DistanceType::Dot,
             invert: false,
         };
         let zero_vector = vec![0.0; vector_dim];
 
+        let quantized_vector_size =
+            encoded_vectors_u8::get_quantized_vector_size(&vector_parameters);
         assert_eq!(
             EncodedVectorsU8::encode(
-                (0..vector_parameters.count).map(|_| &zero_vector),
-                Vec::<u8>::new(),
+                (0..vectors_count).map(|_| &zero_vector),
+                TestEncodedStorageBuilder::new(None, quantized_vector_size),
                 &vector_parameters,
+                vectors_count,
+                None,
+                ScalarQuantizationMethod::Int8,
                 None,
                 stopped_ref,
             )
@@ -58,19 +64,23 @@ mod tests {
         let vector_dim = 8;
         let vector_parameters = VectorParameters {
             dim: vector_dim,
-            count: vectors_count,
+            deprecated_count: None,
             distance_type: DistanceType::Dot,
             invert: false,
         };
         let zero_vector = vec![0.0; vector_dim];
 
+        let quantized_vector_size =
+            encoded_vectors_pq::get_quantized_vector_size(&vector_parameters, 2);
         assert_eq!(
             EncodedVectorsPQ::encode(
-                (0..vector_parameters.count).map(|_| &zero_vector),
-                Vec::<u8>::new(),
+                (0..vectors_count).map(|_| &zero_vector),
+                TestEncodedStorageBuilder::new(None, quantized_vector_size),
                 &vector_parameters,
+                vectors_count,
                 2,
                 1,
+                None,
                 stopped_ref,
             )
             .err(),

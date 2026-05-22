@@ -3,18 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::types::ScoreType;
 use futures::{TryFutureExt, future};
 use itertools::{Either, Itertools};
-use rand::Rng;
+use rand::RngExt;
 use segment::common::reciprocal_rank_fusion::rrf_scoring;
 use segment::common::score_fusion::{ScoreFusion, score_fusion};
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{Order, ScoredPoint, WithPayloadInterface, WithVector};
 use segment::utils::scored_point_ties::ScoredPointTies;
-use tokio::sync::RwLockReadGuard;
 use tokio::time::Instant;
 
 use super::Collection;
+use crate::collection::mmr::mmr_from_points_with_vector;
 use crate::collection_manager::probabilistic_search_sampling::find_search_sampling_over_point_distribution;
 use crate::common::batching::batch_requests;
 use crate::common::fetch_vectors::{
@@ -27,7 +27,7 @@ use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::universal_query::collection_query::CollectionQueryRequest;
 use crate::operations::universal_query::shard_query::{
-    FusionInternal, ScoringQuery, ShardQueryRequest, ShardQueryResponse,
+    self, FusionInternal, MmrInternal, ScoringQuery, ShardQueryRequest, ShardQueryResponse,
 };
 
 /// A factor which determines if we need to use the 2-step search or not.
@@ -118,7 +118,7 @@ impl Collection {
             let mut new_request = request.clone();
             let request_limit = new_request.limit + new_request.offset;
 
-            let is_exact = request.params.map(|p| p.exact).unwrap_or(false);
+            let is_exact = request.params.as_ref().is_some_and(|p| p.exact);
 
             if is_exact || request_limit < Self::SHARD_QUERY_SUBSAMPLING_LIMIT {
                 new_requests.push(new_request);
@@ -173,9 +173,10 @@ impl Collection {
 
         let all_searches = target_shards.iter().map(|(shard, shard_key)| {
             let shard_key = shard_key.cloned();
+            let request_clone = Arc::clone(&batch_request);
             shard
                 .query_batch(
-                    Arc::clone(&batch_request),
+                    request_clone,
                     read_consistency,
                     shard_selection.is_shard_id(),
                     timeout,
@@ -218,11 +219,20 @@ impl Collection {
 
         let metadata_required = is_payload_required || with_vectors;
 
-        let sum_limits: usize = requests_batch.iter().map(|s| s.limit).sum();
-        let sum_offsets: usize = requests_batch.iter().map(|s| s.offset).sum();
+        let sum_limits: usize = requests_batch
+            .iter()
+            .fold(0usize, |acc, s| acc.saturating_add(s.limit));
+        let sum_offsets: usize = requests_batch
+            .iter()
+            .fold(0usize, |acc, s| acc.saturating_add(s.offset));
 
         // Number of records we need to retrieve to fill the search result.
-        let require_transfers = self.shards_holder.read().await.len() * (sum_limits + sum_offsets);
+        let require_transfers = self
+            .shards_holder
+            .read()
+            .await
+            .len()
+            .saturating_mul(sum_limits.saturating_add(sum_offsets));
         // Actually used number of records.
         let used_transfers = sum_limits;
 
@@ -253,10 +263,8 @@ impl Collection {
                 .await?;
             // update timeout
             let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
-            let filled_results = without_payload_results
-                .into_iter()
-                .zip(requests_batch.into_iter())
-                .map(|(without_payload_result, req)| {
+            let filled_results = without_payload_results.into_iter().zip(requests_batch).map(
+                |(without_payload_result, req)| {
                     self.fill_search_result_with_payload(
                         without_payload_result,
                         Some(req.with_payload),
@@ -266,7 +274,8 @@ impl Collection {
                         timeout,
                         hw_measurement_acc.clone(),
                     )
-                });
+                },
+            );
             future::try_join_all(filled_results).await
         } else {
             self.do_query_batch_impl(
@@ -299,7 +308,7 @@ impl Collection {
                 read_consistency,
                 shard_selection,
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -307,17 +316,19 @@ impl Collection {
             .zip(requests_batch.iter())
             .map(|(shards_results, request)| async {
                 // shards_results shape: [num_shards, num_intermediate_results, num_points]
+                // merged_intermediates shape: [num_intermediate_results, num_points]
                 let merged_intermediates = self
                     .merge_intermediate_results_from_shards(request, shards_results)
                     .await?;
 
-                let result = Self::intermediates_to_final_list(
-                    merged_intermediates,
-                    request.query.as_ref(),
-                    request.limit,
-                    request.offset,
-                    request.score_threshold,
-                )?;
+                let result = self
+                    .intermediates_to_final_list(
+                        merged_intermediates,
+                        request,
+                        timeout.map(|timeout| timeout.saturating_sub(instant.elapsed())),
+                        hw_measurement_acc.clone(),
+                    )
+                    .await?;
 
                 let filter_refs = request.filter_refs();
                 self.post_process_if_slow_request(instant.elapsed(), filter_refs);
@@ -329,29 +340,90 @@ impl Collection {
         Ok(results)
     }
 
-    fn intermediates_to_final_list(
+    /// Resolves the final list of scored points from the intermediate results.
+    ///
+    /// Finalizes queries like fusion and mmr after collecting from all shards.
+    /// For other kind of queries it just passes the results through.
+    ///
+    /// Handles offset and limit.
+    async fn intermediates_to_final_list(
+        &self,
         mut intermediates: Vec<Vec<ScoredPoint>>,
-        query: Option<&ScoringQuery>,
-        limit: usize,
-        offset: usize,
-        score_threshold: Option<ScoreType>,
+        request: &ShardQueryRequest,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
-        let result = match query {
+        let ShardQueryRequest {
+            prefetches: _,
+            query,
+            filter: _,
+            score_threshold,
+            limit,
+            offset,
+            params: _,
+            with_vector,
+            with_payload: _,
+        } = request;
+
+        let result = match query.as_ref() {
             Some(ScoringQuery::Fusion(fusion)) => {
                 // If the root query is a Fusion, the returned results correspond to each the prefetches.
                 let mut fused = match fusion {
-                    FusionInternal::Rrf => rrf_scoring(intermediates),
+                    FusionInternal::Rrf { k, weights } => {
+                        let weights_slice = weights
+                            .as_ref()
+                            .map(|w| w.iter().map(|f| f.into_inner()).collect::<Vec<_>>());
+                        rrf_scoring(intermediates, *k, weights_slice.as_deref())?
+                    }
                     FusionInternal::Dbsf => score_fusion(intermediates, ScoreFusion::dbsf()),
                 };
-                if let Some(score_threshold) = score_threshold {
+                if let Some(&score_threshold) = score_threshold.as_ref() {
                     fused = fused
                         .into_iter()
-                        .take_while(|point| point.score >= score_threshold)
+                        .take_while(|point| point.score >= score_threshold.0)
                         .collect();
                 }
                 fused
             }
-            _ => {
+            Some(ScoringQuery::Mmr(mmr)) => {
+                let points_with_vector = intermediates.into_iter().flatten();
+
+                let collection_params = self.collection_config.read().await.params.clone();
+                let search_runtime_handle = &self.search_runtime;
+                let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
+
+                let mut mmr_result = mmr_from_points_with_vector(
+                    &collection_params,
+                    points_with_vector,
+                    mmr.clone(),
+                    *limit,
+                    search_runtime_handle,
+                    timeout,
+                    hw_measurement_acc,
+                )
+                .await?;
+
+                // strip mmr vector if necessary
+                match with_vector {
+                    WithVector::Bool(false) => mmr_result.iter_mut().for_each(|p| {
+                        p.vector.take();
+                    }),
+                    WithVector::Bool(true) => {}
+                    WithVector::Selector(items) => {
+                        if !items.contains(&mmr.using) {
+                            mmr_result.iter_mut().for_each(|p| {
+                                VectorStructInternal::take_opt(&mut p.vector, &mmr.using);
+                            })
+                        }
+                    }
+                };
+                mmr_result
+            }
+            None
+            | Some(ScoringQuery::Vector(_))
+            | Some(ScoringQuery::OrderBy(_))
+            | Some(ScoringQuery::Formula(_))
+            | Some(ScoringQuery::Sample(_)) => {
                 // Otherwise, it will be a list with a single list of scored points.
                 debug_assert_eq!(intermediates.len(), 1);
                 intermediates.pop().ok_or_else(|| {
@@ -362,7 +434,7 @@ impl Collection {
             }
         };
 
-        let result: Vec<ScoredPoint> = result.into_iter().skip(offset).take(limit).collect();
+        let result: Vec<ScoredPoint> = result.into_iter().skip(*offset).take(*limit).collect();
 
         Ok(result)
     }
@@ -370,7 +442,7 @@ impl Collection {
     /// To be called on the user-responding instance. Resolves ids into vectors, and merges the results from local and remote shards.
     ///
     /// This function is used to query the collection. It will return a list of scored points.
-    pub async fn query_batch<'a, F, Fut>(
+    pub async fn query_batch<F, Fut>(
         &self,
         requests_batch: Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
         collection_by_name: F,
@@ -380,7 +452,7 @@ impl Collection {
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
     where
         F: Fn(String) -> Fut,
-        Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+        Fut: Future<Output = Option<Arc<Collection>>>,
     {
         let start = Instant::now();
 
@@ -563,7 +635,8 @@ impl Collection {
             query_infos.into_iter().zip(all_shards_result_by_transposed)
         {
             // `shards_results` shape: [num_shards, num_scored_points]
-            let order = ScoringQuery::order(query_info.scoring_query, &collection_params)?;
+            let order =
+                shard_query::query_result_order(query_info.scoring_query, &collection_params)?;
             let number_of_shards = shards_results.len();
 
             // Equivalent to:
@@ -600,9 +673,11 @@ impl Collection {
                 // Prevents undersampling warning in case there are not enough data to merge.
                 let is_enough = merged.len() == query_info.take;
 
-                if number_of_shards > 1 && is_enough && best_last_result.is_some() {
+                if let Some(best_last_result) = best_last_result
+                    && number_of_shards > 1
+                    && is_enough
+                {
                     let worst_merged_point = merged.last();
-                    let best_last_result = best_last_result.unwrap();
                     if let Some(worst_merged_point) = worst_merged_point {
                         self.check_undersampling(worst_merged_point, &best_last_result, order);
                     }
@@ -631,27 +706,42 @@ impl Collection {
 ///
 /// Example: `[info1, info2, info3]` corresponds to `[result1, result2, result3]` of each shard
 fn intermediate_query_infos(request: &ShardQueryRequest) -> Vec<IntermediateQueryInfo<'_>> {
-    let needs_intermediate_results = request
-        .query
-        .as_ref()
-        .map(|sq| sq.needs_intermediate_results())
-        .unwrap_or(false);
+    let scoring_query = request.query.as_ref();
 
-    if needs_intermediate_results {
-        // In case of Fusion, expect the propagated intermediate results
-        request
-            .prefetches
-            .iter()
-            .map(|prefetch| IntermediateQueryInfo {
-                scoring_query: prefetch.query.as_ref(),
-                take: prefetch.limit,
-            })
-            .collect_vec()
-    } else {
-        // Otherwise, we expect the root result
-        vec![IntermediateQueryInfo {
-            scoring_query: request.query.as_ref(),
-            take: request.offset + request.limit,
-        }]
+    match scoring_query {
+        Some(ScoringQuery::Fusion(_)) => {
+            // In case of Fusion, expect the propagated intermediate results
+            request
+                .prefetches
+                .iter()
+                .map(|prefetch| IntermediateQueryInfo {
+                    scoring_query: prefetch.query.as_ref(),
+                    take: prefetch.limit,
+                })
+                .collect_vec()
+        }
+        Some(ScoringQuery::Mmr(MmrInternal {
+            vector: _,
+            using: _,
+            lambda: _,
+            candidates_limit,
+        })) => {
+            // In case of MMR, expect a single list with the amount of candidates
+            vec![IntermediateQueryInfo {
+                scoring_query: request.query.as_ref(),
+                take: *candidates_limit,
+            }]
+        }
+        None
+        | Some(ScoringQuery::Vector(_))
+        | Some(ScoringQuery::OrderBy(_))
+        | Some(ScoringQuery::Formula(_))
+        | Some(ScoringQuery::Sample(_)) => {
+            // Otherwise, we expect the root result
+            vec![IntermediateQueryInfo {
+                scoring_query: request.query.as_ref(),
+                take: request.offset + request.limit,
+            }]
+        }
     }
 }

@@ -9,6 +9,8 @@ pub mod test_avx2;
 #[cfg(test)]
 pub mod test_binary;
 #[cfg(test)]
+pub mod test_binary_encodings;
+#[cfg(test)]
 pub mod test_neon;
 #[cfg(test)]
 pub mod test_pq;
@@ -16,3 +18,5 @@ pub mod test_pq;
 pub mod test_simple;
 #[cfg(test)]
 pub mod test_sse;
+#[cfg(test)]
+pub mod test_tq;

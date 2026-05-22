@@ -7,12 +7,12 @@ use rand::prelude::StdRng;
 use rstest::rstest;
 
 use crate::fixtures::index_fixtures::random_vector;
-use crate::index::hnsw_index::graph_layers::GraphLayersBase;
+use crate::index::hnsw_index::graph_layers::{GraphLayersBase, SearchAlgorithm};
 use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use crate::index::hnsw_index::graph_links::GraphLinksFormat;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::hnsw_index::tests::create_graph_layer_builder_fixture;
-use crate::spaces::simple::CosineMetric;
+use crate::types::Distance;
 use crate::vector_storage::DEFAULT_STOPPED;
 
 fn search_in_builder(
@@ -21,12 +21,11 @@ fn search_in_builder(
     ef: usize,
     mut points_scorer: FilteredScorer,
 ) -> Vec<ScoredPointOffset> {
-    let entry_point = match builder
+    let Some(entry_point) = builder
         .get_entry_points()
-        .get_entry_point(|point_id| points_scorer.check_vector(point_id))
-    {
-        None => return vec![],
-        Some(ep) => ep,
+        .get_entry_point(|point_id| points_scorer.filters().check_vector(point_id))
+    else {
+        return vec![];
     };
 
     let zero_level_entry = builder
@@ -55,6 +54,7 @@ fn search_in_builder(
 #[rstest]
 #[case::uncompressed(GraphLinksFormat::Plain)]
 #[case::compressed(GraphLinksFormat::Compressed)]
+#[case::compressed_with_vectors(GraphLinksFormat::CompressedWithVectors)]
 fn test_compact_graph_layers(#[case] format: GraphLinksFormat) {
     let num_vectors = 1000;
     let num_queries = 100;
@@ -65,8 +65,15 @@ fn test_compact_graph_layers(#[case] format: GraphLinksFormat) {
 
     let mut rng = StdRng::seed_from_u64(42);
 
-    let (vector_holder, graph_layers_builder) =
-        create_graph_layer_builder_fixture::<CosineMetric, _>(num_vectors, m, dim, false, &mut rng);
+    let (vector_holder, graph_layers_builder) = create_graph_layer_builder_fixture(
+        num_vectors,
+        m,
+        dim,
+        false,
+        format.is_with_vectors(),
+        Distance::Cosine,
+        &mut rng,
+    );
 
     let queries = (0..num_queries)
         .map(|_| random_vector(&mut rng, dim))
@@ -75,21 +82,28 @@ fn test_compact_graph_layers(#[case] format: GraphLinksFormat) {
     let reference_results = queries
         .iter()
         .map(|query| {
-            let raw_scorer = vector_holder.get_raw_scorer(query.clone()).unwrap();
-            let scorer = FilteredScorer::new(raw_scorer.as_ref(), None);
+            let scorer = vector_holder.scorer(query.clone());
             search_in_builder(&graph_layers_builder, top, ef, scorer)
         })
         .collect_vec();
 
-    let graph_layers = graph_layers_builder.into_graph_layers_ram(format);
+    let graph_layers = graph_layers_builder.into_graph_layers_ram(
+        format.with_param_for_tests(vector_holder.graph_links_vectors().as_ref()),
+    );
 
     let results = queries
         .iter()
         .map(|query| {
-            let raw_scorer = vector_holder.get_raw_scorer(query.clone()).unwrap();
-            let scorer = FilteredScorer::new(raw_scorer.as_ref(), None);
+            let scorer = vector_holder.scorer(query.clone());
             graph_layers
-                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .search(
+                    top,
+                    ef,
+                    SearchAlgorithm::Hnsw,
+                    scorer,
+                    None,
+                    &DEFAULT_STOPPED,
+                )
                 .unwrap()
         })
         .collect_vec();

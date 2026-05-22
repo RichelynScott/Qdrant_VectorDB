@@ -4,6 +4,7 @@ use std::hash::Hash;
 use common::types::ScoreType;
 use gridstore::Blob;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -20,6 +21,16 @@ pub struct SparseVector {
     pub values: Vec<DimWeight>,
 }
 
+impl Hash for SparseVector {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self { indices, values } = self;
+        indices.hash(state);
+        for &value in values {
+            OrderedFloat(value).hash(state);
+        }
+    }
+}
+
 /// Same as `SparseVector` but with `DimOffset` indices.
 /// Meaning that is uses internal segment-specific indices.
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
@@ -33,7 +44,7 @@ pub struct RemappedSparseVector {
 /// Sort two arrays by the first array.
 pub fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) {
     // Check if the indices are already sorted
-    if indices.windows(2).all(|w| w[0] < w[1]) {
+    if indices.array_windows().all(|[a, b]| a < b) {
         return;
     }
 
@@ -75,7 +86,7 @@ pub fn score_vectors<T: Ord + Eq>(
             }
         }
     }
-    if overlap { Some(score) } else { None }
+    overlap.then_some(score)
 }
 
 impl RemappedSparseVector {
@@ -91,7 +102,7 @@ impl RemappedSparseVector {
 
     /// Check if this vector is sorted by indices.
     pub fn is_sorted(&self) -> bool {
-        self.indices.windows(2).all(|w| w[0] < w[1])
+        self.indices.array_windows().all(|[a, b]| a < b)
     }
 
     /// Score this vector against another vector using dot product.
@@ -136,6 +147,11 @@ impl SparseVector {
     /// Check if this vector is empty.
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty() && self.values.is_empty()
+    }
+
+    /// Returns the number of elements in the vector.
+    pub fn len(&self) -> usize {
+        self.indices.len()
     }
 
     /// Score this vector against another vector using dot product.

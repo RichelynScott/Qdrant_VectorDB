@@ -1,11 +1,12 @@
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Global feature flags, normally initialized when starting Qdrant.
 static FEATURE_FLAGS: OnceLock<FeatureFlags> = OnceLock::new();
 
-#[derive(Debug, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq, JsonSchema)]
 #[serde(default)]
 pub struct FeatureFlags {
     /// Magic feature flag that enables all features.
@@ -13,23 +14,29 @@ pub struct FeatureFlags {
     /// Note that this will only be applied to all flags when passed into [`init_feature_flags`].
     all: bool,
 
-    /// Whether to skip usage of RocksDB in immutable payload indices.
+    /// Use incremental HNSW building.
     ///
-    /// First implemented in Qdrant 1.13.5
-    // TODO(1.14): remove for release
-    // ToDo(mmap-payload-index): remove for release
-    pub payload_index_skip_rocksdb: bool,
-
-    /// Whether to use incremental HNSW building.
+    /// Enabled by default in Qdrant 1.14.1.
     pub incremental_hnsw_building: bool,
+
+    /// Use appendable quantization in appendable plain segments.
+    ///
+    /// Enabled by default in Qdrant 1.16.0.
+    pub appendable_quantization: bool,
+
+    /// Use single-file mmap in-ram vector storage (InRamMmap)
+    ///
+    /// Enabled by default in Qdrant 1.17.1+
+    pub single_file_mmap_vector_storage: bool,
 }
 
 impl Default for FeatureFlags {
     fn default() -> FeatureFlags {
         FeatureFlags {
             all: false,
-            payload_index_skip_rocksdb: false,
             incremental_hnsw_building: true,
+            appendable_quantization: true,
+            single_file_mmap_vector_storage: false,
         }
     }
 }
@@ -46,14 +53,16 @@ impl FeatureFlags {
 pub fn init_feature_flags(mut flags: FeatureFlags) {
     let FeatureFlags {
         all,
-        payload_index_skip_rocksdb,
         incremental_hnsw_building,
+        appendable_quantization,
+        single_file_mmap_vector_storage,
     } = &mut flags;
 
     // If all is set, explicitly set all feature flags
     if *all {
-        *payload_index_skip_rocksdb = true;
         *incremental_hnsw_building = true;
+        *appendable_quantization = true;
+        *single_file_mmap_vector_storage = true;
     }
 
     let res = FEATURE_FLAGS.set(flags);

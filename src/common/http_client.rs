@@ -1,6 +1,8 @@
 use std::path::Path;
-use std::{fs, io, result};
+use std::{io, result};
 
+use common::defaults::APP_USER_AGENT;
+use fs_err as fs;
 use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use storage::content_manager::errors::StorageError;
 
@@ -61,7 +63,7 @@ fn https_client(
     tls_config: Option<&TlsConfig>,
     verify_https_client_certificate: bool,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().user_agent(APP_USER_AGENT.as_str());
 
     // Configure TLS root certificate and validation
     if let Some(tls_config) = tls_config {
@@ -85,6 +87,14 @@ fn https_client(
                     );
                 }
             }
+        } else if !verify_https_client_certificate {
+            // If ca_cert is not provided, and we are not verifying client certificate,
+            // there is no way to verify https connection.
+            //
+            // So we have to disable certificate verification in order to be able to connect to the server.
+            builder = builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
         }
 
         if verify_https_client_certificate {
@@ -171,6 +181,6 @@ impl From<Error> for StorageError {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, err)
+        io::Error::other(err)
     }
 }

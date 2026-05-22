@@ -21,7 +21,7 @@ pub struct SegmentConfigV5 {
     pub storage_type: StorageTypeV5,
     /// Defines payload storage type
     #[serde(default)]
-    pub payload_storage_type: PayloadStorageType,
+    pub payload_storage_type: Option<PayloadStorageType>,
     /// Quantization parameters. If none - quantization is disabled.
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
@@ -29,29 +29,43 @@ pub struct SegmentConfigV5 {
 
 impl From<SegmentConfigV5> for SegmentConfig {
     fn from(old_segment: SegmentConfigV5) -> Self {
-        let vector_data = old_segment
-            .vector_data
+        let SegmentConfigV5 {
+            vector_data,
+            index,
+            storage_type,
+            payload_storage_type,
+            quantization_config,
+        } = old_segment;
+
+        let vector_data = vector_data
             .into_iter()
             .map(|(vector_name, old_data)| {
+                let VectorDataConfigV5 {
+                    size,
+                    distance,
+                    hnsw_config,
+                    quantization_config: vec_quantization_config,
+                    on_disk,
+                } = old_data;
+
                 let new_data = VectorDataConfig {
-                    size: old_data.size,
-                    distance: old_data.distance,
+                    size,
+                    distance,
                     // Use HNSW index if vector specific one is set, or fall back to segment index
-                    index: match old_data.hnsw_config {
+                    index: match hnsw_config {
                         Some(hnsw_config) => Indexes::Hnsw(hnsw_config),
-                        None => old_segment.index.clone(),
+                        None => index.clone(),
                     },
                     // Remove vector specific quantization config if no segment one is set
                     // This is required because in some cases this was incorrectly set on the vector
                     // level
-                    quantization_config: old_segment
-                        .quantization_config
-                        .as_ref()
-                        .and(old_data.quantization_config),
+                    quantization_config: quantization_config.as_ref().and(vec_quantization_config),
                     // Mmap if explicitly on disk, otherwise convert old storage type
-                    storage_type: (old_data.on_disk == Some(true))
-                        .then_some(VectorStorageType::Mmap)
-                        .unwrap_or_else(|| old_segment.storage_type.into()),
+                    storage_type: if on_disk == Some(true) {
+                        VectorStorageType::Mmap
+                    } else {
+                        storage_type.into()
+                    },
                     multivector_config: None,
                     datatype: None,
                 };
@@ -60,10 +74,14 @@ impl From<SegmentConfigV5> for SegmentConfig {
             })
             .collect();
 
+        // ToDo: remove this whole thing once we drop rocksdb support
+
+        let default_storage_type = PayloadStorageType::Mmap;
+
         SegmentConfig {
             vector_data,
             sparse_vector_data: Default::default(),
-            payload_storage_type: old_segment.payload_storage_type,
+            payload_storage_type: payload_storage_type.unwrap_or(default_storage_type),
         }
     }
 }
@@ -126,6 +144,7 @@ impl From<SegmentStateV5> for SegmentState {
     fn from(old: SegmentStateV5) -> Self {
         let SegmentStateV5 { version, config } = old;
         Self {
+            initial_version: None,
             version,
             config: config.into(),
         }
@@ -153,6 +172,7 @@ mod tests {
                             max_indexing_threads: 0,
                             on_disk: None,
                             payload_m: Some(10),
+                            inline_storage: None,
                         }),
                         quantization_config: None,
                         on_disk: None,
@@ -184,9 +204,10 @@ mod tests {
                 max_indexing_threads: 0,
                 on_disk: None,
                 payload_m: None,
+                inline_storage: None,
             }),
             storage_type: StorageTypeV5::InMemory,
-            payload_storage_type: PayloadStorageType::default(),
+            payload_storage_type: None,
             quantization_config: None,
         };
 
@@ -259,9 +280,10 @@ mod tests {
                 max_indexing_threads: 0,
                 on_disk: None,
                 payload_m: None,
+                inline_storage: None,
             }),
             storage_type: StorageTypeV5::InMemory,
-            payload_storage_type: PayloadStorageType::default(),
+            payload_storage_type: None,
             quantization_config: Some(QuantizationConfig::Scalar(ScalarQuantization {
                 scalar: ScalarQuantizationConfig {
                     r#type: Default::default(),
@@ -299,6 +321,9 @@ mod tests {
                     panic!("expected scalar quantization")
                 }
                 QuantizationConfig::Binary(_) => {
+                    panic!("expected scalar quantization")
+                }
+                QuantizationConfig::Turbo(_) => {
                     panic!("expected scalar quantization")
                 }
             },

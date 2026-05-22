@@ -3,7 +3,7 @@ use std::io::Error as IoError;
 use std::time::Duration;
 
 use collection::operations::types::CollectionError;
-use io::file_operations::FileStorageError;
+use collection::shards::shard::ShardId;
 use tempfile::PersistError;
 use thiserror::Error;
 
@@ -42,56 +42,79 @@ pub enum StorageError {
         description: String,
         retry_after: Option<Duration>,
     },
+    #[error("Shard temporarily unavailable: {description}")]
+    ShardUnavailable { description: String },
+    #[error("Partial snapshot for shard {shard_id} contains no changes")]
+    EmptyPartialSnapshot { shard_id: ShardId },
 }
 
 impl StorageError {
-    pub fn inference_error(description: impl Into<String>) -> StorageError {
-        StorageError::InferenceError {
+    pub fn inference_error(description: impl Into<String>) -> Self {
+        Self::InferenceError {
             description: description.into(),
         }
     }
 
-    pub fn service_error(description: impl Into<String>) -> StorageError {
-        StorageError::ServiceError {
+    pub fn service_error(description: impl Into<String>) -> Self {
+        Self::ServiceError {
             description: description.into(),
             backtrace: Some(Backtrace::force_capture().to_string()),
         }
     }
 
-    pub fn bad_request(description: impl Into<String>) -> StorageError {
-        StorageError::BadRequest {
+    pub fn bad_request(description: impl Into<String>) -> Self {
+        Self::BadRequest {
             description: description.into(),
         }
     }
 
-    pub fn bad_input(description: impl Into<String>) -> StorageError {
-        StorageError::BadInput {
+    pub fn bad_input(description: impl Into<String>) -> Self {
+        Self::BadInput {
             description: description.into(),
         }
     }
 
-    pub fn already_exists(description: impl Into<String>) -> StorageError {
-        StorageError::AlreadyExists {
+    pub fn already_exists(description: impl Into<String>) -> Self {
+        Self::AlreadyExists {
             description: description.into(),
         }
     }
 
-    pub fn not_found(description: impl Into<String>) -> StorageError {
-        StorageError::NotFound {
+    pub fn not_found(description: impl Into<String>) -> Self {
+        Self::NotFound {
             description: description.into(),
         }
     }
 
     pub fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
-        StorageError::ChecksumMismatch {
+        Self::ChecksumMismatch {
             expected: expected.into(),
             actual: actual.into(),
         }
     }
 
-    pub fn forbidden(description: impl Into<String>) -> StorageError {
-        StorageError::Forbidden {
+    pub fn forbidden(description: impl Into<String>) -> Self {
+        Self::Forbidden {
             description: description.into(),
+        }
+    }
+
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
+        Self::Timeout {
+            description: format!(
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
+            ),
+        }
+    }
+
+    pub fn rate_limit_exceeded(
+        description: impl Into<String>,
+        retry_after: Option<Duration>,
+    ) -> StorageError {
+        StorageError::RateLimitExceeded {
+            description: description.into(),
+            retry_after,
         }
     }
 
@@ -122,14 +145,8 @@ impl StorageError {
                 backtrace: None,
             },
             CollectionError::InconsistentShardFailure { ref first_err, .. } => {
-                StorageError::from_inconsistent_shard_failure(
-                    *first_err.clone(),
-                    overriding_description,
-                )
+                Self::from_inconsistent_shard_failure(*first_err.clone(), overriding_description)
             }
-            CollectionError::BadShardSelection { .. } => StorageError::BadRequest {
-                description: overriding_description,
-            },
             CollectionError::ForwardProxyError { error, .. } => {
                 Self::from_inconsistent_shard_failure(*error, overriding_description)
             }
@@ -147,7 +164,7 @@ impl StorageError {
                 description: overriding_description,
                 backtrace: None,
             },
-            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::StrictMode { description } => StorageError::BadRequest { description },
             CollectionError::InferenceError { description } => {
                 StorageError::InferenceError { description }
             }
@@ -158,6 +175,9 @@ impl StorageError {
                 description,
                 retry_after,
             },
+            CollectionError::ShardUnavailable { .. } => StorageError::ShardUnavailable {
+                description: overriding_description,
+            },
         }
     }
 }
@@ -167,10 +187,10 @@ impl From<CollectionError> for StorageError {
         match err {
             CollectionError::BadInput { description } => StorageError::BadInput { description },
             CollectionError::NotFound { .. } => StorageError::NotFound {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             CollectionError::PointNotFound { .. } => StorageError::NotFound {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             CollectionError::ServiceError { error, backtrace } => StorageError::ServiceError {
                 description: error,
@@ -182,31 +202,28 @@ impl From<CollectionError> for StorageError {
                 backtrace: None,
             },
             CollectionError::InconsistentShardFailure { ref first_err, .. } => {
-                let full_description = format!("{}", &err);
-                StorageError::from_inconsistent_shard_failure(*first_err.clone(), full_description)
-            }
-            CollectionError::BadShardSelection { description } => {
-                StorageError::BadRequest { description }
+                let full_description = err.to_string();
+                Self::from_inconsistent_shard_failure(*first_err.clone(), full_description)
             }
             CollectionError::ForwardProxyError { error, .. } => {
-                let full_description = format!("{error}");
-                StorageError::from_inconsistent_shard_failure(*error, full_description)
+                let full_description = error.to_string();
+                Self::from_inconsistent_shard_failure(*error, full_description)
             }
             CollectionError::OutOfMemory { .. } => StorageError::ServiceError {
-                description: format!("{err}"),
+                description: err.to_string(),
                 backtrace: None,
             },
             CollectionError::Timeout { .. } => StorageError::Timeout {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             CollectionError::PreConditionFailed { .. } => StorageError::PreconditionFailed {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             CollectionError::ObjectStoreError { .. } => StorageError::ServiceError {
-                description: format!("{err}"),
+                description: err.to_string(),
                 backtrace: None,
             },
-            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::StrictMode { description } => StorageError::BadRequest { description },
             CollectionError::InferenceError { description } => {
                 StorageError::InferenceError { description }
             }
@@ -217,18 +234,15 @@ impl From<CollectionError> for StorageError {
                 description,
                 retry_after,
             },
+            CollectionError::ShardUnavailable { description } => {
+                StorageError::ShardUnavailable { description }
+            }
         }
     }
 }
 
 impl From<IoError> for StorageError {
     fn from(err: IoError) -> Self {
-        StorageError::service_error(format!("{err}"))
-    }
-}
-
-impl From<FileStorageError> for StorageError {
-    fn from(err: FileStorageError) -> Self {
         Self::service_error(err.to_string())
     }
 }
@@ -245,127 +259,85 @@ impl From<tempfile::PathPersistError> for StorageError {
 
 impl<Guard> From<std::sync::PoisonError<Guard>> for StorageError {
     fn from(err: std::sync::PoisonError<Guard>) -> Self {
-        StorageError::ServiceError {
-            description: format!("Mutex lock poisoned: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Mutex lock poisoned: {err}"))
     }
 }
 
 impl<T> From<std::sync::mpsc::SendError<T>> for StorageError {
     fn from(err: std::sync::mpsc::SendError<T>) -> Self {
-        StorageError::ServiceError {
-            description: format!("Channel closed: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Channel closed: {err}"))
     }
 }
 
 impl From<tokio::sync::oneshot::error::RecvError> for StorageError {
     fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
-        StorageError::ServiceError {
-            description: format!("Oneshot channel sender dropped: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Oneshot channel sender dropped: {err}"))
     }
 }
 
 impl From<tokio::sync::broadcast::error::RecvError> for StorageError {
     fn from(err: tokio::sync::broadcast::error::RecvError) -> Self {
-        StorageError::ServiceError {
-            description: format!("Broadcast channel sender dropped: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Broadcast channel sender dropped: {err}"))
     }
 }
 
 impl From<serde_cbor::Error> for StorageError {
     fn from(err: serde_cbor::Error) -> Self {
-        StorageError::ServiceError {
-            description: format!("cbor (de)serialization error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("cbor (de)serialization error: {err}"))
     }
 }
 
 impl From<serde_json::Error> for StorageError {
     fn from(err: serde_json::Error) -> Self {
-        StorageError::ServiceError {
-            description: format!("json (de)serialization error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("json (de)serialization error: {err}"))
     }
 }
 
 impl From<prost_for_raft::EncodeError> for StorageError {
     fn from(err: prost_for_raft::EncodeError) -> Self {
-        StorageError::ServiceError {
-            description: format!("prost encode error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("prost encode error: {err}"))
     }
 }
 
 impl From<prost_for_raft::DecodeError> for StorageError {
     fn from(err: prost_for_raft::DecodeError) -> Self {
-        StorageError::ServiceError {
-            description: format!("prost decode error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("prost decode error: {err}"))
     }
 }
 
 impl From<raft::Error> for StorageError {
     fn from(err: raft::Error) -> Self {
-        StorageError::ServiceError {
-            description: format!("Error in Raft consensus: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Error in Raft consensus: {err}"))
     }
 }
 
 impl<E: std::fmt::Display> From<atomicwrites::Error<E>> for StorageError {
     fn from(err: atomicwrites::Error<E>) -> Self {
-        StorageError::ServiceError {
-            description: format!("Failed to write file: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Failed to write file: {err}"))
     }
 }
 
 impl From<tonic::transport::Error> for StorageError {
     fn from(err: tonic::transport::Error) -> Self {
-        StorageError::ServiceError {
-            description: format!("Tonic transport error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Tonic transport error: {err}"))
     }
 }
 
 impl From<reqwest::Error> for StorageError {
     fn from(err: reqwest::Error) -> Self {
-        StorageError::ServiceError {
-            description: format!("Http request error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Http request error: {err}"))
     }
 }
 
 impl From<tokio::task::JoinError> for StorageError {
     fn from(err: tokio::task::JoinError) -> Self {
-        StorageError::ServiceError {
-            description: format!("Tokio task join error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Tokio task join error: {err}"))
     }
 }
 
 impl From<PersistError> for StorageError {
     fn from(err: PersistError) -> Self {
-        StorageError::ServiceError {
-            description: format!("Persist error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Persist error: {err}"))
     }
 }
 

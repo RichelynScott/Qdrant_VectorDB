@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
@@ -8,7 +9,7 @@ use futures::Future;
 use futures::future::try_join_all;
 use segment::data_types::vectors::{VectorInternal, VectorRef};
 use segment::types::{PointIdType, VectorName, VectorNameBuf, WithPayloadInterface, WithVector};
-use tokio::sync::RwLockReadGuard;
+use shard::retrieve::record_internal::RecordInternal;
 
 use crate::collection::Collection;
 use crate::common::batching::batch_requests;
@@ -16,11 +17,10 @@ use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
-    CollectionError, CollectionResult, PointRequestInternal, RecommendExample, RecordInternal,
+    CollectionError, CollectionResult, PointRequestInternal, RecommendExample,
 };
-use crate::operations::universal_query::collection_query;
 use crate::operations::universal_query::collection_query::{
-    CollectionQueryRequest, CollectionQueryResolveRequest, VectorInputInternal,
+    CollectionQueryRequest, CollectionQueryResolveRequest, Query, VectorInputInternal,
 };
 
 pub async fn retrieve_points(
@@ -49,7 +49,7 @@ pub async fn retrieve_points(
 
 pub enum CollectionRefHolder<'a> {
     Ref(&'a Collection),
-    Guard(RwLockReadGuard<'a, Collection>),
+    Arc(Arc<Collection>),
 }
 
 pub async fn retrieve_points_with_locked_collection(
@@ -74,7 +74,7 @@ pub async fn retrieve_points_with_locked_collection(
             )
             .await
         }
-        CollectionRefHolder::Guard(guard) => {
+        CollectionRefHolder::Arc(guard) => {
             retrieve_points(
                 &guard,
                 ids,
@@ -206,7 +206,7 @@ impl<'coll_name> ReferencedPoints<'coll_name> {
         });
     }
 
-    pub async fn fetch_vectors<'a, F, Fut>(
+    pub async fn fetch_vectors<F, Fut>(
         mut self,
         collection: &Collection,
         read_consistency: Option<ReadConsistency>,
@@ -217,7 +217,7 @@ impl<'coll_name> ReferencedPoints<'coll_name> {
     ) -> CollectionResult<ReferencedVectors>
     where
         F: Fn(String) -> Fut,
-        Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+        Fut: Future<Output = Option<Arc<Collection>>>,
     {
         debug_assert!(self.ids_per_collection.len() == self.vector_names_per_collection.len());
 
@@ -247,11 +247,11 @@ impl<'coll_name> ReferencedPoints<'coll_name> {
                     hw_measurement_acc.clone(),
                 )),
                 Some(name) => {
-                    let other_collection = collection_by_name(name.to_string()).await;
+                    let other_collection = collection_by_name(name.clone()).await;
                     match other_collection {
                         Some(other_collection) => {
                             vector_retrieves.push(retrieve_points_with_locked_collection(
-                                CollectionRefHolder::Guard(other_collection),
+                                CollectionRefHolder::Arc(other_collection),
                                 points,
                                 vector_names,
                                 read_consistency,
@@ -261,9 +261,7 @@ impl<'coll_name> ReferencedPoints<'coll_name> {
                             ))
                         }
                         None => {
-                            return Err(CollectionError::NotFound {
-                                what: format!("Collection {name}"),
-                            });
+                            return Err(CollectionError::not_found(format!("Collection {name}")));
                         }
                     }
                 }
@@ -323,8 +321,8 @@ pub fn convert_to_vectors<'a>(
     })
 }
 
-pub async fn resolve_referenced_vectors_batch<'a, 'b, F, Fut, Req: RetrieveRequest>(
-    requests: &'b [(Req, ShardSelectorInternal)],
+pub async fn resolve_referenced_vectors_batch<F, Fut, Req: RetrieveRequest>(
+    requests: &[(Req, ShardSelectorInternal)],
     collection: &Collection,
     collection_by_name: F,
     read_consistency: Option<ReadConsistency>,
@@ -333,7 +331,7 @@ pub async fn resolve_referenced_vectors_batch<'a, 'b, F, Fut, Req: RetrieveReque
 ) -> CollectionResult<ReferencedVectors>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     let fetch_requests = batch_requests::<
         &(Req, ShardSelectorInternal),
@@ -409,15 +407,21 @@ pub fn build_vector_resolver_queries(
     resolve_prefetches
 }
 
-pub fn build_vector_resolver_query<'a>(
-    request: &'a CollectionQueryRequest,
-    shard_selector: &'a ShardSelectorInternal,
-) -> Vec<(CollectionQueryResolveRequest<'a>, ShardSelectorInternal)> {
+pub fn build_vector_resolver_query(
+    request: &CollectionQueryRequest,
+    shard_selector: &ShardSelectorInternal,
+) -> Vec<(CollectionQueryResolveRequest, ShardSelectorInternal)> {
     let mut resolve_prefetches = vec![];
-    // resolve query for root query
-    if let Some(collection_query::Query::Vector(vector_query)) = &request.query {
+    // resolve ids for root query
+    let referenced_ids = request
+        .query
+        .as_ref()
+        .map(Query::get_referenced_ids)
+        .unwrap_or_default();
+
+    if !referenced_ids.is_empty() {
         let resolve_root = CollectionQueryResolveRequest {
-            vector_query,
+            referenced_ids,
             lookup_from: request.lookup_from.clone(),
             using: request.using.clone(),
         };

@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::iter;
 
-use bitvec::prelude::{BitSlice, BitVec};
 use byteorder::LittleEndian;
 #[cfg(test)]
 use common::bitpacking::make_bitmask;
+use common::bitvec::{BitSlice, BitVec};
 use common::types::PointOffsetType;
 use itertools::Itertools;
 #[cfg(test)]
-use rand::Rng as _;
+use rand::RngExt;
 use rand::distr::Distribution;
 #[cfg(test)]
 use rand::rngs::StdRng;
@@ -255,5 +255,18 @@ impl CompressedPointMappings {
             internal_to_external: compressed_internal_to_external,
             external_to_internal,
         }
+    }
+
+    /// Approximate RAM usage in bytes.
+    pub fn ram_usage_bytes(&self) -> usize {
+        let Self {
+            deleted,
+            internal_to_external,
+            external_to_internal,
+        } = self;
+
+        deleted.capacity().div_ceil(u8::BITS as usize)
+            + internal_to_external.ram_usage_bytes()
+            + external_to_internal.ram_usage_bytes()
     }
 }

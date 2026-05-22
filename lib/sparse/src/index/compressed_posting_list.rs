@@ -452,7 +452,7 @@ impl<'a, W: Weight> CompressedPostingListIterator<'a, W> {
     fn next_from(&mut self, peek: PostingElementEx) -> PostingElement {
         if self.pos.0 / CHUNK_SIZE < self.list.chunks.len() {
             self.pos = (self.pos.0 + 1, None);
-            if self.pos.0 % CHUNK_SIZE == 0 {
+            if self.pos.0.is_multiple_of(CHUNK_SIZE) {
                 self.unpacked = false;
             }
         } else {
@@ -511,11 +511,11 @@ impl<W: Weight> PostingListIter for CompressedPostingListIterator<'_, W> {
         // 2. If current, change the position to the element and do peek
 
         // Shortcut peeking into memory
-        if let Some(current_record_id) = self.pos.1.as_ref() {
-            if record_id < *current_record_id {
-                // We are already ahead
-                return None;
-            }
+        if let Some(current_record_id) = self.pos.1.as_ref()
+            && record_id < *current_record_id
+        {
+            // We are already ahead
+            return None;
         }
 
         // If None, we are already reading remainder

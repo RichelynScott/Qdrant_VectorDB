@@ -2,25 +2,28 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
-use std::hash::Hash;
+use std::hash::{self, Hash, Hasher};
+use std::mem;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use ahash::AHashSet;
-use common::types::ScoreType;
+use bytemuck::{Pod, Zeroable};
+use common::stable_hash::StableHash;
+use common::types::{PointOffsetType, ScoreType};
+use ecow::EcoString;
 use fnv::FnvBuildHasher;
 use geo::{Contains, Coord, Distance as GeoDistance, Haversine, LineString, Point, Polygon};
 use indexmap::IndexSet;
 use itertools::Itertools;
-use merge::Merge;
+use num_derive::FromPrimitive;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use smol_str::SmolStr;
-use strum::EnumIter;
+use strum::{EnumIter, EnumString};
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
 use zerocopy::native_endian::U64;
@@ -32,13 +35,18 @@ use crate::data_types::index::{
     BoolIndexParams, DatetimeIndexParams, FloatIndexParams, GeoIndexParams, IntegerIndexParams,
     KeywordIndexParams, TextIndexParams, UuidIndexParams,
 };
+use crate::data_types::modifier::Modifier;
 use crate::data_types::order_by::OrderValue;
-use crate::data_types::vectors::VectorStructInternal;
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::tiny_map::TinyMap;
+use crate::data_types::vectors::{DenseVector, VectorStructInternal};
 use crate::index::field_index::CardinalityEstimation;
 use crate::index::sparse_index::sparse_index_config::SparseIndexConfig;
 use crate::json_path::JsonPath;
-use crate::spaces::metric::MetricPostProcessing;
+use crate::spaces::metric::{Metric, MetricPostProcessing};
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+use crate::types::utils::unordered_hash_unique;
+use crate::utils::maybe_arc::MaybeArc;
 
 pub type PayloadKeyType = JsonPath;
 pub type PayloadKeyTypeRef<'a> = &'a JsonPath;
@@ -60,7 +68,7 @@ pub type VectorName = str;
 pub type VectorNameBuf = String;
 
 /// Wraps `DateTime<Utc>` to allow more flexible deserialization
-#[derive(Clone, Copy, Serialize, JsonSchema, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Serialize, JsonSchema, Debug, PartialEq, Eq, PartialOrd, Hash)]
 #[serde(transparent)]
 pub struct DateTimeWrapper(pub chrono::DateTime<chrono::Utc>);
 
@@ -76,16 +84,22 @@ impl DateTimeWrapper {
 }
 
 impl<'de> Deserialize<'de> for DateTimePayloadType {
+    /// Parses RFC3339 datetime strings used in REST/JSON `datetime_range` filters.
+    /// Returns a clear user-facing error when the format is invalid.
+    /// Example accepted value: `2014-01-01T00:00:00Z`.
+    ///
+    /// Binary formats (CBOR/MessagePack/WAL) also serialize as RFC3339 strings, so we reuse
+    /// the same parsing path everywhere.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let str_datetime = <&str>::deserialize(deserializer)?;
-        let parse_result = DateTimePayloadType::from_str(str_datetime).ok();
-        match parse_result {
-            Some(datetime) => Ok(datetime),
-            None => Err(serde::de::Error::custom(format!(
-                "'{str_datetime}' is not in a supported date/time format, please use RFC 3339"
+        let str_datetime: Cow<'de, str> = Cow::deserialize(deserializer)?;
+
+        match DateTimePayloadType::from_str(str_datetime.as_ref()) {
+            Ok(datetime) => Ok(datetime),
+            Err(_) => Err(serde::de::Error::custom(format!(
+                "'{str_datetime}' does not match accepted datetime format (RFC3339). Example: 2014-01-01T00:00:00Z"
             ))),
         }
     }
@@ -97,6 +111,8 @@ impl FromStr for DateTimePayloadType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Attempt to parse the input string in RFC 3339 format
         if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(s)
+            // Attempt to parse default to-string format
+            .or_else(|_| chrono::DateTime::from_str(s))
             // Attempt to parse the input string in the specified formats:
             // - YYYY-MM-DD'T'HH:MM:SS-HHMM (timezone without colon)
             // - YYYY-MM-DD HH:MM:SS-HHMM (timezone without colon)
@@ -110,11 +126,14 @@ impl FromStr for DateTimePayloadType {
         // Attempt to parse the input string in the specified formats:
         // - YYYY-MM-DD'T'HH:MM:SS (without timezone or Z)
         // - YYYY-MM-DD HH:MM:SS (without timezone or Z)
-        // - YYYY-MM-DD HH:MM
+        // - YYYY-MM-DD'T'HH:MM (without timezone and seconds)
+        // - YYYY-MM-DD HH:MM (without timezone and seconds)
         // - YYYY-MM-DD
         // See: <https://github.com/qdrant/qdrant/issues/3529>
+        // See: <https://github.com/qdrant/qdrant/issues/8718>
         let datetime = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M"))
             .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map(Into::into))?;
 
@@ -154,9 +173,30 @@ pub enum ExtendedPointId {
     Uuid(Uuid),
 }
 
+impl StableHash for ExtendedPointId {
+    fn stable_hash<W: FnMut(&[u8])>(&self, write: &mut W) {
+        match self {
+            ExtendedPointId::NumId(num) => {
+                0u64.stable_hash(write); // discriminant for NumId
+                num.stable_hash(write);
+            }
+            ExtendedPointId::Uuid(uuid) => {
+                1u64.stable_hash(write); // discriminant for Uuid
+
+                uuid.as_bytes().len().stable_hash(write); // compatibility with uuid <= v1.16.0
+                write(uuid.as_bytes());
+            }
+        }
+    }
+}
+
 impl ExtendedPointId {
-    pub fn is_num_id(&self) -> bool {
-        matches!(self, ExtendedPointId::NumId(..))
+    #[cfg(any(test, feature = "testing"))]
+    pub fn as_u64(&self) -> u64 {
+        match self {
+            ExtendedPointId::NumId(num) => *num,
+            ExtendedPointId::Uuid(_) => panic!("Cannot convert UUID to u64"),
+        }
     }
 
     pub fn is_uuid(&self) -> bool {
@@ -210,10 +250,11 @@ impl<'de> serde::Deserialize<'de> for ExtendedPointId {
             return Ok(ExtendedPointId::Uuid(uuid));
         }
 
+        let value = crate::utils::fmt::SerdeValue(&value);
+
         Err(serde::de::Error::custom(format!(
-            "value {} is not a valid point ID, \
+            "value {value} is not a valid point ID, \
                  valid values are either an unsigned integer or a UUID",
-            crate::utils::fmt::SerdeValue(&value),
         )))
     }
 }
@@ -260,6 +301,8 @@ impl From<CompactExtendedPointId> for ExtendedPointId {
     PartialEq,
     Eq,
     Hash,
+    EnumString,
+    EnumIter,
 )]
 /// Distance function types used to compare vectors
 pub enum Distance {
@@ -283,10 +326,32 @@ impl Distance {
         }
     }
 
+    pub fn preprocess_vector<T: PrimitiveVectorElement>(&self, vector: DenseVector) -> DenseVector
+    where
+        CosineMetric: Metric<T>,
+        EuclidMetric: Metric<T>,
+        DotProductMetric: Metric<T>,
+        ManhattanMetric: Metric<T>,
+    {
+        match self {
+            Distance::Cosine => CosineMetric::preprocess(vector),
+            Distance::Euclid => EuclidMetric::preprocess(vector),
+            Distance::Dot => DotProductMetric::preprocess(vector),
+            Distance::Manhattan => ManhattanMetric::preprocess(vector),
+        }
+    }
+
     pub fn distance_order(&self) -> Order {
         match self {
             Distance::Cosine | Distance::Dot => Order::LargeBetter,
             Distance::Euclid | Distance::Manhattan => Order::SmallBetter,
+        }
+    }
+
+    pub fn is_ordered(&self, left: ScoreType, right: ScoreType) -> bool {
+        match self.distance_order() {
+            Order::LargeBetter => left >= right,
+            Order::SmallBetter => left <= right,
         }
     }
 
@@ -402,9 +467,12 @@ pub struct VectorDataInfo {
 #[derive(Debug, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct SegmentInfo {
+    pub uuid: Uuid,
     pub segment_type: SegmentType,
     pub num_vectors: usize,
     pub num_points: usize,
+    pub num_deferred_points: Option<usize>,
+    pub num_deleted_deferred_points: Option<usize>,
     pub num_indexed_vectors: usize,
     pub num_deleted_vectors: usize,
     /// An ESTIMATION of effective amount of bytes used for vectors
@@ -417,11 +485,17 @@ pub struct SegmentInfo {
     pub is_appendable: bool,
     pub index_schema: HashMap<PayloadKeyType, PayloadIndexInfo>,
     pub vector_data: HashMap<String, VectorDataInfo>,
+    /// Internal ID from which points are deferred (hidden from reads).
+    /// Only set for appendable segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub deferred_internal_id: Option<PointOffsetType>,
 }
 
 #[derive(Debug, Default)]
 pub struct SizeStats {
     pub num_vectors: usize,
+    pub num_vectors_by_name: TinyMap<VectorNameBuf, usize>,
     pub vectors_size_bytes: usize,
     pub payloads_size_bytes: usize,
     pub num_points: usize,
@@ -439,18 +513,33 @@ pub struct QuantizationSearchParams {
     /// Might require more time in case if original vectors are stored on disk.
     /// If not set, qdrant decides automatically apply rescoring or not.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rescore: Option<bool>,
 
     /// Oversampling factor for quantization. Default is 1.0.
     ///
-    /// Defines how many extra vectors should be pre-selected using quantized index,
+    /// Defines how many extra vectors should be preselected using quantized index,
     /// and then re-scored using original vectors.
     ///
-    /// For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will be pre-selected using quantized index,
+    /// For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will be preselected using quantized index,
     /// and then top-100 will be returned after re-scoring.
     #[serde(default = "default_quantization_oversampling_value")]
     #[validate(range(min = 1.0))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub oversampling: Option<f64>,
+}
+
+impl Hash for QuantizationSearchParams {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            ignore,
+            rescore,
+            oversampling,
+        } = self;
+        ignore.hash(state);
+        rescore.hash(state);
+        oversampling.map(OrderedFloat).hash(state);
+    }
 }
 
 pub const fn default_quantization_ignore_value() -> bool {
@@ -461,12 +550,47 @@ pub const fn default_quantization_oversampling_value() -> Option<f64> {
     None
 }
 
+/// Default value for [`AcornSearchParams::max_selectivity`].
+///
+/// After change, update docs for GRPC and REST API.
+pub const ACORN_MAX_SELECTIVITY_DEFAULT: f64 = 0.4;
+
+/// ACORN-related search parameters
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, Copy, PartialEq, Default, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct AcornSearchParams {
+    /// If true, then ACORN may be used for the HNSW search based on filters
+    /// selectivity.
+
+    /// Improves search recall for searches with multiple low-selectivity
+    /// payload filters, at cost of performance.
+    #[serde(default)]
+    pub enable: bool,
+
+    /// Maximum selectivity of filters to enable ACORN.
+    ///
+    /// If estimated filters selectivity is higher than this value,
+    /// ACORN will not be used. Selectivity is estimated as:
+    /// `estimated number of points satisfying the filters / total number of points`.
+    ///
+    /// 0.0 for never, 1.0 for always. Default is 0.4.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub max_selectivity: Option<OrderedFloat<f64>>,
+}
+
 /// Additional parameters of the search
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, Copy, PartialEq, Default)]
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Copy, Clone, PartialEq, Default, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchParams {
     /// Params relevant to HNSW index
     /// Size of the beam in a beam-search. Larger the value - more accurate the result, more time required for search.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hnsw_ef: Option<usize>,
 
     /// Search without approximation. If set to true, search may run long but with exact results.
@@ -476,6 +600,7 @@ pub struct SearchParams {
     /// Quantization params
     #[serde(default)]
     #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quantization: Option<QuantizationSearchParams>,
 
     /// If enabled, the engine will only perform search among indexed or small segments.
@@ -483,35 +608,12 @@ pub struct SearchParams {
     /// guarantee that all uploaded vectors will be included in search results
     #[serde(default)]
     pub indexed_only: bool,
-}
 
-/// Collection default values
-#[derive(Debug, Deserialize, Validate, Clone, PartialEq, Eq)]
-pub struct CollectionConfigDefaults {
+    /// ACORN search params
     #[serde(default)]
-    pub vectors: Option<VectorsConfigDefaults>,
-
     #[validate(nested)]
-    pub quantization: Option<QuantizationConfig>,
-
-    #[validate(range(min = 1))]
-    #[serde(default = "default_shard_number_const")]
-    pub shard_number: u32,
-
-    #[validate(range(min = 1))]
-    #[serde(default = "default_shard_number_per_node_const")]
-    pub shard_number_per_node: u32,
-
-    #[validate(range(min = 1))]
-    #[serde(default = "default_replication_factor_const")]
-    pub replication_factor: u32,
-
-    #[serde(default = "default_write_consistency_factor_const")]
-    #[validate(range(min = 1))]
-    pub write_consistency_factor: u32,
-
-    #[validate(nested)]
-    pub strict_mode: Option<StrictModeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acorn: Option<AcornSearchParams>,
 }
 
 /// Configuration for vectors.
@@ -519,22 +621,6 @@ pub struct CollectionConfigDefaults {
 pub struct VectorsConfigDefaults {
     #[serde(default)]
     pub on_disk: Option<bool>,
-}
-
-pub const fn default_shard_number_per_node_const() -> u32 {
-    1
-}
-
-pub const fn default_shard_number_const() -> u32 {
-    1
-}
-
-pub const fn default_replication_factor_const() -> u32 {
-    1
-}
-
-pub const fn default_write_consistency_factor_const() -> u32 {
-    1
 }
 
 /// Vector index configuration
@@ -567,7 +653,9 @@ impl Indexes {
 }
 
 /// Config of HNSW index
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq, Eq)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Anonymize,
+)]
 #[serde(rename_all = "snake_case")]
 #[anonymize(false)]
 pub struct HnswConfig {
@@ -576,9 +664,11 @@ pub struct HnswConfig {
     /// Number of neighbours to consider during the index building. Larger the value - more accurate the search, more time required to build index.
     #[validate(range(min = 4))]
     pub ef_construct: usize,
-    /// Minimal size (in KiloBytes) of vectors for additional payload-based indexing.
-    /// If payload chunk is smaller than `full_scan_threshold_kb` additional indexing won't be used -
-    /// in this case full-scan search should be preferred by query planner and additional indexing is not required.
+    /// Minimal size threshold (in KiloBytes) below which full-scan is preferred over HNSW search.
+    /// This measures the total size of vectors being queried against.
+    /// When the maximum estimated amount of points that a condition satisfies is smaller than
+    /// `full_scan_threshold_kb`, the query planner will use full-scan search instead of HNSW index
+    /// traversal for better performance.
     /// Note: 1Kb = 1 vector of size 256
     #[serde(alias = "full_scan_threshold_kb")]
     pub full_scan_threshold: usize,
@@ -594,6 +684,12 @@ pub struct HnswConfig {
     /// Custom M param for hnsw graph built for payload index. If not set, default M will be used.
     #[serde(default, skip_serializing_if = "Option::is_none")] // Better backward compatibility
     pub payload_m: Option<usize>,
+    /// Store copies of original and quantized vectors within the HNSW index file. Default: false.
+    /// Enabling this option will trade the search speed for disk usage by reducing amount of
+    /// random seeks during the search.
+    /// Requires quantized vectors to be enabled. Multi-vectors are not supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_storage: Option<bool>,
 }
 
 impl HnswConfig {
@@ -606,14 +702,43 @@ impl HnswConfig {
     /// For example, a change in `max_indexing_threads` will not require rebuilding because it
     /// doesn't affect the final index, and thus this would return false.
     pub fn mismatch_requires_rebuild(&self, other: &Self) -> bool {
-        self.m != other.m
-            || self.ef_construct != other.ef_construct
-            || self.full_scan_threshold != other.full_scan_threshold
-            || self.payload_m != other.payload_m
+        let HnswConfig {
+            m,
+            ef_construct,
+            full_scan_threshold,
+            max_indexing_threads: _,
+            payload_m,
+            on_disk,
+            inline_storage,
+        } = *self;
+
+        m != other.m
+            || ef_construct != other.ef_construct
+            || full_scan_threshold != other.full_scan_threshold
+            || payload_m != other.payload_m
             // Data on disk is the same, we have a unit test for that. We can eventually optimize
             // this to just reload the collection rather than optimizing it again as a whole just
             // to flip this flag
-            || self.on_disk != other.on_disk
+            || on_disk != other.on_disk
+            || inline_storage != other.inline_storage
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone)]
+#[serde(rename_all = "snake_case", default)]
+#[anonymize(false)]
+pub struct HnswGlobalConfig {
+    /// Enable HNSW healing if the ratio of missing points is no more than this value.
+    /// To disable healing completely, set this value to `0.0`.
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub healing_threshold: f64,
+}
+
+impl Default for HnswGlobalConfig {
+    fn default() -> Self {
+        Self {
+            healing_threshold: 0.3,
+        }
     }
 }
 
@@ -631,14 +756,14 @@ pub enum CompressionRatio {
     X64,
 }
 
-#[derive(Default, Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ScalarType {
     #[default]
     Int8,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct ScalarQuantizationConfig {
     /// Type of quantization to use
@@ -664,13 +789,13 @@ impl ScalarQuantizationConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct ScalarQuantization {
     #[validate(nested)]
     pub scalar: ScalarQuantizationConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct ProductQuantizationConfig {
     pub compression: CompressionRatio,
@@ -690,7 +815,7 @@ impl ProductQuantizationConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct ProductQuantization {
     #[validate(nested)]
     pub product: ProductQuantizationConfig,
@@ -705,29 +830,83 @@ impl Hash for ScalarQuantizationConfig {
 
 impl Eq for ScalarQuantizationConfig {}
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryQuantizationEncoding {
+    #[default]
+    OneBit,
+    TwoBits,
+    OneAndHalfBits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct BinaryQuantizationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub always_ram: Option<bool>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<BinaryQuantizationEncoding>,
+
+    /// Asymmetric quantization configuration allows a query to have different quantization than stored vectors.
+    /// It can increase the accuracy of search at the cost of performance.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_encoding: Option<BinaryQuantizationQueryEncoding>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct BinaryQuantization {
     #[validate(nested)]
     pub binary: BinaryQuantizationConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurboQuantBitSize {
+    Bits1,
+    Bits1_5,
+    Bits2,
+    #[default]
+    Bits4,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct TurboQuantQuantizationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub always_ram: Option<bool>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bits: Option<TurboQuantBitSize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate)]
+pub struct TurboQuantization {
+    #[validate(nested)]
+    pub turbo: TurboQuantQuantizationConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Anonymize)]
 #[serde(untagged, rename_all = "snake_case")]
 #[anonymize(false)]
 pub enum QuantizationConfig {
     Scalar(ScalarQuantization),
     Product(ProductQuantization),
     Binary(BinaryQuantization),
+    Turbo(TurboQuantization),
 }
 
 impl QuantizationConfig {
+    /// If appendable_quantization feature is enabled and config supports appendable segments,
+    /// returns the config for use in appendable segment; otherwise `None`.
+    pub fn for_appendable_segment(opt: Option<&Self>) -> Option<Self> {
+        let appendable = common::flags::feature_flags().appendable_quantization;
+        opt.filter(|q| appendable && q.supports_appendable())
+            .cloned()
+    }
+
     /// Detect configuration mismatch against `other` that requires rebuilding
     ///
     /// Returns true only if both conditions are met:
@@ -735,6 +914,22 @@ impl QuantizationConfig {
     /// - to effectively change the configuration, a quantization rebuild is required
     pub fn mismatch_requires_rebuild(&self, other: &Self) -> bool {
         self != other
+    }
+
+    pub fn supports_appendable(&self) -> bool {
+        matches!(
+            self,
+            QuantizationConfig::Binary(_) | QuantizationConfig::Turbo(_)
+        )
+    }
+
+    pub fn always_ram(&self) -> bool {
+        match self {
+            QuantizationConfig::Scalar(s) => s.scalar.always_ram == Some(true),
+            QuantizationConfig::Product(p) => p.product.always_ram == Some(true),
+            QuantizationConfig::Binary(b) => b.binary.always_ram == Some(true),
+            QuantizationConfig::Turbo(t) => t.turbo.always_ram == Some(true),
+        }
     }
 }
 
@@ -744,8 +939,22 @@ impl Validate for QuantizationConfig {
             QuantizationConfig::Scalar(scalar) => scalar.validate(),
             QuantizationConfig::Product(product) => product.validate(),
             QuantizationConfig::Binary(binary) => binary.validate(),
+            QuantizationConfig::Turbo(turbo) => turbo.validate(),
         }
     }
+}
+
+#[derive(
+    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[serde(rename_all = "lowercase")]
+#[anonymize(false)]
+pub enum BinaryQuantizationQueryEncoding {
+    #[default]
+    Default,
+    Binary,
+    Scalar4Bits,
+    Scalar8Bits,
 }
 
 impl From<ScalarQuantizationConfig> for QuantizationConfig {
@@ -766,9 +975,7 @@ impl From<BinaryQuantizationConfig> for QuantizationConfig {
     }
 }
 
-#[derive(
-    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge, Hash,
-)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Hash)]
 pub struct StrictModeSparse {
     /// Max length of sparse vector
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -782,14 +989,6 @@ pub struct StrictModeSparseConfig {
     #[validate(nested)]
     #[serde(flatten)]
     pub config: BTreeMap<VectorNameBuf, StrictModeSparse>,
-}
-
-impl Merge for StrictModeSparseConfig {
-    fn merge(&mut self, other: Self) {
-        for (key, value) in other.config {
-            self.config.entry(key).or_default().merge(value);
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Default)]
@@ -827,9 +1026,7 @@ impl From<StrictModeSparse> for StrictModeSparseOutput {
     }
 }
 
-#[derive(
-    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge, Hash,
-)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Hash)]
 pub struct StrictModeMultivector {
     /// Max number of vectors in a multivector
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -843,15 +1040,6 @@ pub struct StrictModeMultivectorConfig {
     #[validate(nested)]
     #[serde(flatten)]
     pub config: BTreeMap<VectorNameBuf, StrictModeMultivector>,
-}
-
-impl Merge for StrictModeMultivectorConfig {
-    fn merge(&mut self, other: Self) {
-        for (key, value) in other.config {
-            // overwrite value if key exists
-            self.config.entry(key).or_default().merge(value);
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Default)]
@@ -889,7 +1077,7 @@ impl From<StrictModeMultivector> for StrictModeMultivectorOutput {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default)]
 pub struct StrictModeConfig {
     // Global
     /// Whether strict mode is enabled for a collection or not.
@@ -915,11 +1103,11 @@ pub struct StrictModeConfig {
     pub unindexed_filtering_update: Option<bool>,
 
     // Search
-    /// Max HNSW value allowed in search parameters.
+    /// Max HNSW ef value allowed in search parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_max_hnsw_ef: Option<usize>,
 
-    /// Whether exact search is allowed or not.
+    /// Whether exact search is allowed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_allow_exact: Option<bool>,
 
@@ -930,6 +1118,10 @@ pub struct StrictModeConfig {
     /// Max batchsize when upserting
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upsert_max_batchsize: Option<usize>,
+
+    /// Max batchsize when searching
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_batchsize: Option<usize>,
 
     /// Max size of a collections vector storage in bytes, ignoring replicas.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -962,15 +1154,30 @@ pub struct StrictModeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_max_size: Option<usize>,
 
-    /// Multivector configuration
+    /// Multivector strict mode configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub multivector_config: Option<StrictModeMultivectorConfig>,
 
-    /// Sparse vector configuration
+    /// Sparse vector strict mode configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub sparse_config: Option<StrictModeSparseConfig>,
+
+    /// Max number of payload indexes in a collection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0))]
+    pub max_payload_index_count: Option<usize>,
+
+    /// Reject memory-consuming update operations (e.g. upsert, set payload)
+    /// when the process resident memory exceeds this percentage of total system
+    /// memory (or cgroup limit). Value in [1, 100]. Applied uniformly to external
+    /// and internal (replication) traffic — rejection is deterministic so it does
+    /// not cause replica divergence. Delete operations are not affected, so
+    /// callers can still free memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1, max = 100))]
+    pub max_resident_memory_percent: Option<u8>,
 }
 
 impl Eq for StrictModeConfig {}
@@ -988,6 +1195,7 @@ impl Hash for StrictModeConfig {
             // We skip hashing this field because we cannot reliably hash a float
             search_max_oversampling: _,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -997,6 +1205,8 @@ impl Hash for StrictModeConfig {
             condition_max_size,
             multivector_config,
             sparse_config,
+            max_payload_index_count,
+            max_resident_memory_percent,
         } = self;
         enabled.hash(state);
         max_query_limit.hash(state);
@@ -1006,6 +1216,7 @@ impl Hash for StrictModeConfig {
         search_max_hnsw_ef.hash(state);
         search_allow_exact.hash(state);
         upsert_max_batchsize.hash(state);
+        search_max_batchsize.hash(state);
         max_collection_vector_size_bytes.hash(state);
         read_rate_limit.hash(state);
         write_rate_limit.hash(state);
@@ -1015,6 +1226,8 @@ impl Hash for StrictModeConfig {
         condition_max_size.hash(state);
         multivector_config.hash(state);
         sparse_config.hash(state);
+        max_payload_index_count.hash(state);
+        max_resident_memory_percent.hash(state);
     }
 }
 
@@ -1028,13 +1241,11 @@ pub struct StrictModeConfigOutput {
 
     /// Max allowed `limit` parameter for all APIs that don't have their own max limit.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(range(min = 1))]
     #[anonymize(false)]
     pub max_query_limit: Option<usize>,
 
     /// Max allowed `timeout` parameter.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(range(min = 1))]
     #[anonymize(false)]
     pub max_timeout: Option<usize>,
 
@@ -1065,6 +1276,10 @@ pub struct StrictModeConfigOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[anonymize(false)]
     pub upsert_max_batchsize: Option<usize>,
+    /// Max batchsize when searching
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub search_max_batchsize: Option<usize>,
 
     /// Max size of a collections vector storage in bytes, ignoring replicas.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1108,6 +1323,15 @@ pub struct StrictModeConfigOutput {
     /// Sparse vector configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_config: Option<StrictModeSparseConfigOutput>,
+
+    /// Max number of payload indexes in a collection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_payload_index_count: Option<usize>,
+
+    /// Reject memory-consuming update operations when resident memory exceeds this percentage of total RAM (1-100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub max_resident_memory_percent: Option<u8>,
 }
 
 impl From<StrictModeConfig> for StrictModeConfigOutput {
@@ -1122,6 +1346,7 @@ impl From<StrictModeConfig> for StrictModeConfigOutput {
             search_allow_exact,
             search_max_oversampling,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -1131,6 +1356,8 @@ impl From<StrictModeConfig> for StrictModeConfigOutput {
             condition_max_size,
             multivector_config,
             sparse_config,
+            max_payload_index_count,
+            max_resident_memory_percent,
         } = config;
 
         Self {
@@ -1143,6 +1370,7 @@ impl From<StrictModeConfig> for StrictModeConfigOutput {
             search_allow_exact,
             search_max_oversampling,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -1152,6 +1380,8 @@ impl From<StrictModeConfig> for StrictModeConfigOutput {
             condition_max_size,
             multivector_config: multivector_config.map(StrictModeMultivectorConfigOutput::from),
             sparse_config: sparse_config.map(StrictModeSparseConfigOutput::from),
+            max_payload_index_count,
+            max_resident_memory_percent,
         }
     }
 }
@@ -1167,6 +1397,7 @@ impl Default for HnswConfig {
             max_indexing_threads: 0,
             on_disk: Some(false),
             payload_m: None,
+            inline_storage: None,
         }
     }
 }
@@ -1178,27 +1409,39 @@ impl Default for Indexes {
 }
 
 /// Type of payload storage
-#[derive(
-    Anonymize, Default, Debug, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq,
-)]
+#[derive(Anonymize, Debug, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq)]
 #[serde(tag = "type", content = "options", rename_all = "snake_case")]
 pub enum PayloadStorageType {
-    // Store payload in memory and use persistence storage only if vectors are changed
-    InMemory,
-    // Store payload on disk only, read each time it is requested
-    #[default]
-    OnDisk,
     // Store payload on disk and in memory, read from memory if possible
     Mmap,
+    // Store payload on disk and in memory, populate on load
+    InRamMmap,
 }
 
-impl PayloadStorageType {
-    pub fn is_on_disk(&self) -> bool {
-        matches!(self, PayloadStorageType::OnDisk | PayloadStorageType::Mmap)
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::derivable_impls)]
+impl Default for PayloadStorageType {
+    fn default() -> Self {
+        PayloadStorageType::Mmap
     }
 }
 
-#[derive(Anonymize, Default, Debug, Deserialize, Serialize, JsonSchema, Clone)]
+impl PayloadStorageType {
+    /// Convert user-facing `on_disk_payload` (true = store on disk) to storage type.
+    /// Returns `Mmap` or `InRamMmap`; for RocksDB-backed variants use collection config.
+    pub fn from_on_disk_payload(on_disk: bool) -> Self {
+        if on_disk { Self::Mmap } else { Self::InRamMmap }
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            PayloadStorageType::Mmap => true,
+            PayloadStorageType::InRamMmap => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Anonymize)]
 #[serde(rename_all = "snake_case")]
 pub struct SegmentConfig {
     #[serde(default)]
@@ -1233,17 +1476,6 @@ impl SegmentConfig {
                 .any(|config| config.is_indexed())
     }
 
-    /// Check if all vector storages are indexed
-    pub fn are_all_vectors_indexed(&self) -> bool {
-        self.vector_data
-            .values()
-            .all(|config| config.index.is_indexed())
-            && self
-                .sparse_vector_data
-                .values()
-                .all(|config| config.is_indexed())
-    }
-
     /// Check if any vector storage is on-disk
     pub fn is_any_on_disk(&self) -> bool {
         self.vector_data
@@ -1268,17 +1500,72 @@ impl SegmentConfig {
             )
             .all(|v| v)
     }
+
+    pub fn check_compatible(&self, other: &Self) -> Result<(), String> {
+        // Vector data have to be compatible between two segments.
+        // Sparse vector data can be different, but a placeholder check is implemented to catch
+        // and enforce compatibility check for future changes.
+        // Payload storage type can be different.
+
+        // Assert segment config fields
+        let Self {
+            vector_data: _,
+            sparse_vector_data: _,
+            payload_storage_type: _,
+        } = self;
+
+        check_vectors_map_compatible(
+            &self.vector_data,
+            &other.vector_data,
+            VectorDataConfig::check_compatible,
+        )?;
+
+        check_vectors_map_compatible(
+            &self.sparse_vector_data,
+            &other.sparse_vector_data,
+            SparseVectorDataConfig::check_compatible,
+        )?;
+
+        Ok(())
+    }
+}
+
+fn check_vectors_map_compatible<C, F>(
+    this: &HashMap<String, C>,
+    other: &HashMap<String, C>,
+    check: F,
+) -> Result<(), String>
+where
+    F: Fn(&C, &C) -> Result<(), String>,
+{
+    if this.len() != other.len() {
+        let expected_keys: Vec<String> = this.keys().map(|k| format!("{k:?}")).collect();
+        let actual_keys: Vec<String> = other.keys().map(|k| format!("{k:?}")).collect();
+        return Err(format!(
+            "Incompatible configs: expected vector storages with keys {expected_keys:?}, but got {actual_keys:?}"
+        ));
+    }
+
+    for (vector_name, config) in this {
+        let Some(other_config) = other.get(vector_name) else {
+            return Err(format!(
+                "Incompatible configs: expected vector storage with key {vector_name:?} not found in other config"
+            ));
+        };
+
+        check(config, other_config)
+            .map_err(|err| format!("Incompatible config for vector {vector_name:?}: {err}"))?;
+    }
+
+    Ok(())
 }
 
 /// Storage types for vectors
-#[derive(
-    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone,
-)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone)]
 pub enum VectorStorageType {
     /// Storage in memory (RAM)
     ///
     /// Will be very fast at the cost of consuming a lot of memory.
-    #[default]
     Memory,
     /// Storage in mmap file, not appendable
     ///
@@ -1293,11 +1580,26 @@ pub enum VectorStorageType {
     ///
     /// Designed as a replacement for `Memory`, which doesn't depend on RocksDB
     InRamChunkedMmap,
+    /// Storage in a single mmap file, not appendable
+    /// Pre-fetched into RAM on load
+    InRamMmap,
+    /// Placeholder storage: contains no data, all vectors reported as deleted.
+    /// Used for newly created named vectors on immutable segments.
+    /// No files on disk, reconstructed from config on load.
+    Empty,
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::derivable_impls)]
+impl Default for VectorStorageType {
+    fn default() -> Self {
+        VectorStorageType::InRamChunkedMmap
+    }
 }
 
 /// Storage types for vectors
 #[derive(
-    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone,
+    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum VectorStorageDatatype {
@@ -1319,6 +1621,22 @@ pub struct MultiVectorConfig {
     pub comparator: MultiVectorComparator,
 }
 
+impl MultiVectorConfig {
+    fn check_compatible(&self, other: &Self) -> Result<(), String> {
+        // Assert multi-vector config fields
+        let Self { comparator } = self;
+
+        if *comparator != other.comparator {
+            return Err(format!(
+                "Incompatible configs: expected multi-vector comparator {comparator:?}, but got {other_comparator:?}",
+                other_comparator = other.comparator
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(
     Debug, Default, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
 )]
@@ -1329,17 +1647,37 @@ pub enum MultiVectorComparator {
 }
 
 impl VectorStorageType {
+    /// Convert user-facing `on_disk` (true = store on disk) to appendable vector storage type.
+    /// Returns `ChunkedMmap` or `InRamChunkedMmap`.
+    pub fn from_on_disk(on_disk: bool) -> Self {
+        if on_disk {
+            Self::ChunkedMmap
+        } else {
+            Self::InRamChunkedMmap
+        }
+    }
+
     /// Whether this storage type is a mmap on disk
     pub fn is_on_disk(&self) -> bool {
         match self {
-            Self::Memory | Self::InRamChunkedMmap => false,
+            Self::Memory | Self::InRamChunkedMmap | Self::InRamMmap => false,
             Self::Mmap | Self::ChunkedMmap => true,
+            // Empty storage has no actual data; report based on what the
+            // runtime EmptyDenseVectorStorage was configured with.
+            // This fallback returns true to be safe, but callers that need
+            // the real on-disk status should check the storage instance.
+            Self::Empty => true,
         }
+    }
+
+    /// Whether this is a placeholder empty storage type
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
     }
 }
 
 /// Config of single vector data storage
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Anonymize)]
 #[serde(rename_all = "snake_case")]
 pub struct VectorDataConfig {
     /// Size/dimensionality of the vectors used
@@ -1374,21 +1712,77 @@ impl VectorDataConfig {
             VectorStorageType::Mmap => false,
             VectorStorageType::ChunkedMmap => true,
             VectorStorageType::InRamChunkedMmap => true,
+            VectorStorageType::InRamMmap => false,
+            VectorStorageType::Empty => false,
         };
         is_index_appendable && is_storage_appendable
     }
+
+    pub fn check_compatible(&self, other: &Self) -> Result<(), String> {
+        // Size and distance have to be the same for both segments.
+        // Storage type, index and quantization config can be different.
+        //
+        // Assert vector data config fields
+        let Self {
+            size,
+            distance,
+            storage_type: _,
+            index: _,
+            quantization_config: _,
+            multivector_config,
+            datatype,
+        } = self;
+
+        if *size != other.size {
+            return Err(format!(
+                "Incompatible configs: expected vector size {size}, but got {other_size}",
+                other_size = other.size
+            ));
+        }
+
+        if *distance != other.distance {
+            return Err(format!(
+                "Incompatible configs: expected distance {distance:?}, but got {other_distance:?}",
+                other_distance = other.distance
+            ));
+        }
+
+        let left_datatype = datatype.unwrap_or(VectorStorageDatatype::Float32);
+        let right_datatype = other.datatype.unwrap_or(VectorStorageDatatype::Float32);
+        if left_datatype != right_datatype {
+            return Err(format!(
+                "Incompatible configs: expected vector storage datatype {left_datatype:?}, but got {right_datatype:?}",
+            ));
+        }
+
+        match (multivector_config, &other.multivector_config) {
+            (None, None) => {}
+            (Some(this), Some(other)) => {
+                MultiVectorConfig::check_compatible(this, other)?;
+            }
+            _ => {
+                return Err(format!(
+                    "Incompatible configs: expected multivector config {this_multivector_config:?}, but got {other_multivector_config:?}",
+                    this_multivector_config = multivector_config,
+                    other_multivector_config = other.multivector_config
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, Copy, Default)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Anonymize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SparseVectorStorageType {
-    /// Storage on disk
-    // (rocksdb storage)
-    OnDisk,
-    /// Storage in memory maps
-    // (gridstore storage)
+    /// Storage in memory maps (gridstore storage)
     #[default]
     Mmap,
+    /// Placeholder storage: contains no data, all vectors reported as deleted.
+    /// Used for newly created sparse named vectors on immutable segments.
+    Empty,
 }
 
 impl SparseVectorStorageType {
@@ -1397,14 +1791,15 @@ impl SparseVectorStorageType {
         match self {
             // Both options are on disk, but we keep it explicit for the case if someone adds a new
             // storage type in the future
-            Self::OnDisk => true,
-            Self::Mmap => true,
+            Self::Mmap | Self::Empty => true,
         }
     }
 }
 
 /// Config of single sparse vector data storage
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, Validate)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Anonymize,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct SparseVectorDataConfig {
     /// Sparse inverted index config
@@ -1413,21 +1808,46 @@ pub struct SparseVectorDataConfig {
     /// Type of storage this sparse vector uses
     #[serde(default = "default_sparse_vector_storage_type_when_not_in_config")]
     pub storage_type: SparseVectorStorageType,
+
+    /// Configures addition value modifications for sparse vectors.
+    /// Default: none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Modifier>,
 }
 
 /// If the storage type is not in config, it means it is the OnDisk variant
-const fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
-    SparseVectorStorageType::OnDisk
+fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
+    SparseVectorStorageType::default()
 }
 
 impl SparseVectorDataConfig {
     pub fn is_indexed(&self) -> bool {
         true
     }
+
+    pub fn check_compatible(&self, other: &Self) -> Result<(), String> {
+        // Both index and storage type can be different for two segments to be compatible
+
+        // Assert sparse vector config fields
+        let Self {
+            index: _,
+            storage_type: _,
+            modifier,
+        } = self;
+
+        if modifier != &other.modifier {
+            return Err(format!(
+                "Incompatible configs: expected sparse vector modifier {modifier:?}, but got {other_modifier:?}",
+                other_modifier = other.modifier
+            ));
+        }
+
+        Ok(())
+    }
 }
 
-/// Default value based on <https://github.com/google-research/google-research/blob/master/scann/docs/algorithms.md>
-pub const DEFAULT_FULL_SCAN_THRESHOLD: usize = 20_000;
+/// Default value based on experiments and observations
+pub const DEFAULT_FULL_SCAN_THRESHOLD: usize = 10_000;
 
 pub const DEFAULT_SPARSE_FULL_SCAN_THRESHOLD: usize = 5_000;
 
@@ -1435,20 +1855,40 @@ pub const DEFAULT_SPARSE_FULL_SCAN_THRESHOLD: usize = 5_000;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct SegmentState {
+    #[serde(default)]
+    pub initial_version: Option<SeqNumberType>,
     pub version: Option<SeqNumberType>,
     pub config: SegmentConfig,
 }
 
+pub type RawGeoPoint = (f64, f64);
+
 /// Geo point payload schema
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Default)]
+#[derive(
+    Debug,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    PartialOrd,
+    Ord,
+    Pod,
+    Zeroable,
+)]
 #[serde(try_from = "GeoPointShadow")]
+#[repr(C)]
 pub struct GeoPoint {
-    pub lon: f64,
-    pub lat: f64,
+    pub lon: OrderedFloat<f64>,
+    pub lat: OrderedFloat<f64>,
 }
 
 /// Ordered sequence of GeoPoints representing the line
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 pub struct GeoLineString {
     pub points: Vec<GeoPoint>,
 }
@@ -1459,6 +1899,7 @@ struct GeoPointShadow {
     pub lat: f64,
 }
 
+#[derive(Debug)]
 pub struct GeoPointValidationError {
     pub lon: f64,
     pub lat: f64,
@@ -1490,7 +1931,14 @@ impl GeoPoint {
 
     pub fn new(lon: f64, lat: f64) -> Result<Self, GeoPointValidationError> {
         Self::validate(lon, lat)?;
-        Ok(GeoPoint { lon, lat })
+        Ok(Self::new_unchecked(lon, lat))
+    }
+
+    pub const fn new_unchecked(lon: f64, lat: f64) -> Self {
+        GeoPoint {
+            lon: OrderedFloat(lon),
+            lat: OrderedFloat(lat),
+        }
     }
 }
 
@@ -1501,13 +1949,30 @@ impl TryFrom<GeoPointShadow> for GeoPoint {
         let GeoPointShadow { lon, lat } = value;
         GeoPoint::validate(lon, lat)?;
 
-        Ok(Self { lon, lat })
+        Ok(Self::new_unchecked(lon, lat))
     }
 }
 
 impl From<GeoPoint> for geo::Point {
-    fn from(GeoPoint { lon, lat }: GeoPoint) -> Self {
+    fn from(
+        GeoPoint {
+            lon: OrderedFloat(lon),
+            lat: OrderedFloat(lat),
+        }: GeoPoint,
+    ) -> Self {
         Self::new(lon, lat)
+    }
+}
+
+impl From<RawGeoPoint> for GeoPoint {
+    fn from((lon, lat): RawGeoPoint) -> Self {
+        GeoPoint::new(lon, lat).expect("invalid GeoPoint coordinates")
+    }
+}
+
+impl From<GeoPoint> for RawGeoPoint {
+    fn from(geo_point: GeoPoint) -> Self {
+        (geo_point.lon.0, geo_point.lat.0)
     }
 }
 
@@ -1542,7 +2007,7 @@ fn payload_example() -> Option<Payload> {
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Hash)]
 #[schemars(example = "payload_example")]
 pub struct Payload(pub Map<String, Value>);
 
@@ -1569,6 +2034,10 @@ impl Payload {
 
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
     }
 }
 
@@ -1773,20 +2242,102 @@ impl PayloadSchemaParams {
             PayloadSchemaParams::Bool(i) => i.on_disk.unwrap_or_default(),
         }
     }
+
+    pub fn enable_hnsw(&self) -> bool {
+        match self {
+            PayloadSchemaParams::Keyword(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Integer(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Float(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Datetime(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Uuid(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Text(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Geo(params) => params.enable_hnsw.unwrap_or(true),
+            PayloadSchemaParams::Bool(params) => params.enable_hnsw.unwrap_or(true),
+        }
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash, Eq)]
+impl Validate for PayloadSchemaParams {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            PayloadSchemaParams::Keyword(_) => Ok(()),
+            PayloadSchemaParams::Integer(integer_index_params) => integer_index_params.validate(),
+            PayloadSchemaParams::Float(_) => Ok(()),
+            PayloadSchemaParams::Geo(_) => Ok(()),
+            PayloadSchemaParams::Text(_) => Ok(()),
+            PayloadSchemaParams::Bool(_) => Ok(()),
+            PayloadSchemaParams::Datetime(_) => Ok(()),
+            PayloadSchemaParams::Uuid(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum PayloadFieldSchema {
     FieldType(PayloadSchemaType),
     FieldParams(PayloadSchemaParams),
 }
 
+impl PartialEq for PayloadFieldSchema {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::FieldType(this), Self::FieldType(other)) => this == other,
+            (Self::FieldParams(this), Self::FieldParams(other)) => this == other,
+            (Self::FieldType(this), Self::FieldParams(other)) => &this.expand() == other,
+            (Self::FieldParams(this), Self::FieldType(other)) => this == &other.expand(),
+        }
+    }
+}
+
+impl hash::Hash for PayloadFieldSchema {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        match self {
+            PayloadFieldSchema::FieldType(default) => default.expand().hash(state),
+            PayloadFieldSchema::FieldParams(params) => params.hash(state),
+        }
+    }
+}
+
+impl Validate for PayloadFieldSchema {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            PayloadFieldSchema::FieldType(_) => Ok(()), // nothing to validate
+            PayloadFieldSchema::FieldParams(payload_schema_params) => {
+                payload_schema_params.validate()
+            }
+        }
+    }
+}
+
 impl Display for PayloadFieldSchema {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             PayloadFieldSchema::FieldType(t) => write!(f, "{}", t.name()),
-            PayloadFieldSchema::FieldParams(p) => write!(f, "{}", p.name()),
+            PayloadFieldSchema::FieldParams(params) => match params {
+                PayloadSchemaParams::Keyword(_)
+                | PayloadSchemaParams::Float(_)
+                | PayloadSchemaParams::Geo(_)
+                | PayloadSchemaParams::Bool(_)
+                | PayloadSchemaParams::Datetime(_)
+                | PayloadSchemaParams::Uuid(_) => write!(f, "{}", params.name()),
+                PayloadSchemaParams::Integer(integer_params) => {
+                    let range = integer_params.range.unwrap_or(true);
+                    let lookup = integer_params.lookup.unwrap_or(true);
+                    if range && lookup {
+                        write!(f, "integer")
+                    } else {
+                        write!(f, "integer (with range: {range}, lookup: {lookup})")
+                    }
+                }
+                PayloadSchemaParams::Text(text_params) => {
+                    if text_params.phrase_matching.unwrap_or_default() {
+                        write!(f, "text (with phrase_matching: true)")
+                    } else {
+                        write!(f, "text")
+                    }
+                }
+            },
         }
     }
 }
@@ -1827,6 +2378,41 @@ impl PayloadFieldSchema {
             PayloadFieldSchema::FieldParams(p) => p.kind(),
         }
     }
+
+    /// Check if this type supports a `match` condition
+    pub fn supports_match(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(payload_schema_type) => match payload_schema_type {
+                PayloadSchemaType::Keyword => true,
+                PayloadSchemaType::Integer => true,
+                PayloadSchemaType::Uuid => true,
+                PayloadSchemaType::Bool => true,
+                PayloadSchemaType::Float => false,
+                PayloadSchemaType::Geo => false,
+                PayloadSchemaType::Text => false,
+                PayloadSchemaType::Datetime => false,
+            },
+            PayloadFieldSchema::FieldParams(payload_schema_params) => match payload_schema_params {
+                PayloadSchemaParams::Keyword(_) => true,
+                PayloadSchemaParams::Integer(integer_index_params) => {
+                    integer_index_params.lookup == Some(true)
+                }
+                PayloadSchemaParams::Uuid(_) => true,
+                PayloadSchemaParams::Bool(_) => true,
+                PayloadSchemaParams::Float(_) => false,
+                PayloadSchemaParams::Geo(_) => false,
+                PayloadSchemaParams::Text(_) => false,
+                PayloadSchemaParams::Datetime(_) => false,
+            },
+        }
+    }
+
+    pub fn enable_hnsw(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(_) => true,
+            PayloadFieldSchema::FieldParams(p) => p.enable_hnsw(),
+        }
+    }
 }
 
 impl From<PayloadSchemaType> for PayloadFieldSchema {
@@ -1844,65 +2430,23 @@ impl TryFrom<PayloadIndexInfo> for PayloadFieldSchema {
             params,
             points: _,
         } = index_info;
+
         match params {
-            Some(params) if params.kind() == data_type => {
+            None => Ok(PayloadFieldSchema::FieldType(data_type)),
+
+            Some(params) if data_type == params.kind() => {
                 Ok(PayloadFieldSchema::FieldParams(params))
             }
-            Some(_) => Err(format!(
-                "Payload field with type {data_type:?} has unexpected params"
+
+            Some(params) => Err(format!(
+                "payload field with type {data_type:?} has parameters of type {:?}",
+                params.kind(),
             )),
-            None => Ok(PayloadFieldSchema::FieldType(data_type)),
         }
     }
 }
 
-pub fn value_type(value: &Value) -> Option<PayloadSchemaType> {
-    match value {
-        Value::Null => None,
-        Value::Bool(_) => None,
-        Value::Number(num) => {
-            if num.is_i64() {
-                Some(PayloadSchemaType::Integer)
-            } else if num.is_f64() {
-                Some(PayloadSchemaType::Float)
-            } else {
-                None
-            }
-        }
-        Value::String(_) => Some(PayloadSchemaType::Keyword),
-        Value::Array(_) => None,
-        Value::Object(obj) => {
-            let lon_op = obj.get("lon").and_then(|x| x.as_f64());
-            let lat_op = obj.get("lat").and_then(|x| x.as_f64());
-
-            if let (Some(_), Some(_)) = (lon_op, lat_op) {
-                return Some(PayloadSchemaType::Geo);
-            }
-            None
-        }
-    }
-}
-
-pub fn infer_value_type(value: &Value) -> Option<PayloadSchemaType> {
-    match value {
-        Value::Array(array) => infer_collection_value_type(array),
-        _ => value_type(value),
-    }
-}
-
-pub fn infer_collection_value_type<'a, I>(values: I) -> Option<PayloadSchemaType>
-where
-    I: IntoIterator<Item = &'a Value>,
-{
-    let possible_types = values.into_iter().map(value_type).unique().collect_vec();
-    if possible_types.len() != 1 {
-        None // There is an ambiguity or empty array
-    } else {
-        possible_types.into_iter().next().unwrap()
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum ValueVariants {
     String(String),
@@ -1927,6 +2471,24 @@ pub enum AnyVariants {
     Integers(IndexSet<IntPayloadType, FnvBuildHasher>),
 }
 
+impl Hash for AnyVariants {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        mem::discriminant(self).hash(state);
+        match self {
+            AnyVariants::Strings(index_set) => {
+                for item in index_set {
+                    item.hash(state);
+                }
+            }
+            AnyVariants::Integers(index_set) => {
+                for item in index_set {
+                    item.hash(state);
+                }
+            }
+        }
+    }
+}
+
 impl AnyVariants {
     pub fn len(&self) -> usize {
         match self {
@@ -1944,34 +2506,56 @@ impl AnyVariants {
 }
 
 /// Exact match of the given value
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct MatchValue {
     pub value: ValueVariants,
 }
 
 /// Full-text match of the strings.
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct MatchText {
     pub text: String,
 }
 
-impl From<String> for MatchText {
-    fn from(text: String) -> Self {
-        MatchText { text }
+/// Full-text match of at least one token of the string.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub struct MatchTextAny {
+    pub text_any: String,
+}
+
+impl<S: Into<String>> From<S> for MatchText {
+    fn from(text: S) -> Self {
+        MatchText { text: text.into() }
+    }
+}
+
+/// Full-text phrase match of the string.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub struct MatchPhrase {
+    pub phrase: String,
+}
+
+impl<S: Into<String>> From<S> for MatchPhrase {
+    fn from(text: S) -> Self {
+        MatchPhrase {
+            phrase: text.into(),
+        }
     }
 }
 
 /// Exact match on any of the given values
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct MatchAny {
     pub any: AnyVariants,
 }
 
 /// Should have at least one value not matching the any given values
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct MatchExcept {
     pub except: AnyVariants,
@@ -1983,16 +2567,20 @@ pub struct MatchExcept {
 pub enum MatchInterface {
     Value(MatchValue),
     Text(MatchText),
+    TextAny(MatchTextAny),
+    Phrase(MatchPhrase),
     Any(MatchAny),
     Except(MatchExcept),
 }
 
 /// Match filter request
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged, from = "MatchInterface")]
 pub enum Match {
     Value(MatchValue),
     Text(MatchText),
+    TextAny(MatchTextAny),
+    Phrase(MatchPhrase),
     Any(MatchAny),
     Except(MatchExcept),
 }
@@ -2026,10 +2614,14 @@ impl From<MatchInterface> for Match {
         match value {
             MatchInterface::Value(value) => Self::Value(MatchValue { value: value.value }),
             MatchInterface::Text(text) => Self::Text(MatchText { text: text.text }),
+            MatchInterface::TextAny(text_any) => Self::TextAny(MatchTextAny {
+                text_any: text_any.text_any,
+            }),
             MatchInterface::Any(any) => Self::Any(MatchAny { any: any.any }),
             MatchInterface::Except(except) => Self::Except(MatchExcept {
                 except: except.except,
             }),
+            MatchInterface::Phrase(MatchPhrase { phrase }) => Self::Phrase(MatchPhrase { phrase }),
         }
     }
 }
@@ -2050,8 +2642,8 @@ impl From<String> for Match {
     }
 }
 
-impl From<SmolStr> for Match {
-    fn from(keyword: SmolStr) -> Self {
+impl From<EcoString> for Match {
+    fn from(keyword: EcoString) -> Self {
         Self::Value(MatchValue {
             value: ValueVariants::String(keyword.into()),
         })
@@ -2108,17 +2700,89 @@ impl From<Vec<IntPayloadType>> for MatchExcept {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum RangeInterface {
-    Float(Range<FloatPayloadType>),
+    Float(Range<OrderedFloat<FloatPayloadType>>),
     DateTime(Range<DateTimePayloadType>),
 }
 
+impl Hash for RangeInterface {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        match self {
+            RangeInterface::Float(range) => {
+                let Range { lt, gt, gte, lte } = range;
+                lt.hash(state);
+                gt.hash(state);
+                gte.hash(state);
+                lte.hash(state);
+            }
+            RangeInterface::DateTime(range) => {
+                let Range { lt, gt, gte, lte } = range;
+                lt.hash(state);
+                gt.hash(state);
+                gte.hash(state);
+                lte.hash(state);
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RangeInterfaceUntagged {
+    Float(Range<OrderedFloatPayloadType>),
+    DateTime(Range<DateTimePayloadType>),
+}
+
+impl<'de> serde::Deserialize<'de> for RangeInterface {
+    /// Parses range bounds, treating string bounds as RFC3339 datetimes for REST/JSON `datetime_range` filters.
+    /// Preserves clear user-facing errors when datetime formats are invalid.
+    /// Example accepted datetime bound: `2014-01-01T00:00:00Z`.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !deserializer.is_human_readable() {
+            return RangeInterfaceUntagged::deserialize(deserializer).map(|parsed| match parsed {
+                RangeInterfaceUntagged::Float(r) => RangeInterface::Float(r),
+                RangeInterfaceUntagged::DateTime(r) => RangeInterface::DateTime(r),
+            });
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // If any range bound is a string -> treat as datetime range
+        if let Some(obj) = value.as_object() {
+            let keys = ["lt", "gt", "lte", "gte"];
+            let has_string_bound = keys
+                .iter()
+                .any(|k| obj.get(*k).is_some_and(|v| v.is_string()));
+
+            if has_string_bound {
+                return serde_json::from_value::<Range<DateTimePayloadType>>(value)
+                    .map(RangeInterface::DateTime)
+                    .map_err(serde::de::Error::custom);
+            }
+        }
+
+        // Fallback to existing untagged behavior
+        let parsed = serde_json::from_value::<RangeInterfaceUntagged>(value)
+            .map_err(serde::de::Error::custom)?;
+
+        Ok(match parsed {
+            RangeInterfaceUntagged::Float(r) => RangeInterface::Float(r),
+            RangeInterfaceUntagged::DateTime(r) => RangeInterface::DateTime(r),
+        })
+    }
+}
+
+type OrderedFloatPayloadType = OrderedFloat<FloatPayloadType>;
+
 /// Range filter request
 #[macro_rules_attribute::macro_rules_derive(crate::common::macros::schemars_rename_generics)]
-#[derive_args(< FloatPayloadType > => "Range", < DateTimePayloadType > => "DatetimeRange")]
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq)]
+#[derive_args(< OrderedFloatPayloadType > => "Range", < DateTimePayloadType > => "DatetimeRange")]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Range<T> {
     /// point.key < range.lt
@@ -2155,7 +2819,7 @@ impl<T: Copy + PartialOrd> Range<T> {
 }
 
 /// Values count filter request
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct ValuesCount {
     /// point.key.length() < values_count.lt
@@ -2181,17 +2845,29 @@ impl ValuesCount {
         let count = match value {
             Value::Null => 0,
             Value::Array(array) => array.len(),
-            _ => 1,
+            Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => 1,
         };
 
         self.check_count(count)
     }
 }
 
+#[cfg(test)]
+impl From<std::ops::Range<usize>> for ValuesCount {
+    fn from(range: std::ops::Range<usize>) -> Self {
+        Self {
+            gte: Some(range.start),
+            lt: Some(range.end),
+            gt: None,
+            lte: None,
+        }
+    }
+}
+
 /// Geo filter request
 ///
 /// Matches coordinates inside the rectangle, described by coordinates of lop-left and bottom-right edges
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct GeoBoundingBox {
     /// Coordinates of the top left point of the area rectangle
@@ -2218,19 +2894,28 @@ impl GeoBoundingBox {
 /// Geo filter request
 ///
 /// Matches coordinates inside the circle of `radius` and center with coordinates `center`
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct GeoRadius {
     /// Coordinates of the top left point of the area rectangle
     pub center: GeoPoint,
     /// Radius of the area in meters
-    pub radius: f64,
+    pub radius: OrderedFloat<f64>,
+}
+
+impl Hash for GeoRadius {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        let GeoRadius { center, radius } = self;
+        center.hash(state);
+        // Hash f64 by converting to bits
+        OrderedFloat(*radius).hash(state);
+    }
 }
 
 impl GeoRadius {
     pub fn check_point(&self, point: &GeoPoint) -> bool {
         let query_center = Point::from(self.center);
-        Haversine.distance(query_center, Point::from(*point)) < self.radius
+        Haversine.distance(query_center, Point::from(*point)) < self.radius.0
     }
 }
 
@@ -2246,7 +2931,7 @@ pub struct PolygonWrapper {
 
 impl PolygonWrapper {
     pub fn check_point(&self, point: &GeoPoint) -> bool {
-        let point_new = Point::new(point.lon, point.lat);
+        let point_new = Point::new(point.lon.0, point.lat.0);
         self.polygon.contains(&point_new)
     }
 }
@@ -2254,7 +2939,7 @@ impl PolygonWrapper {
 /// Geo filter request
 ///
 /// Matches coordinates inside the polygon, defined by `exterior` and `interiors`
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(try_from = "GeoPolygonShadow", rename_all = "snake_case")]
 pub struct GeoPolygon {
     /// The exterior line bounds the surface
@@ -2270,24 +2955,19 @@ pub struct GeoPolygon {
 impl GeoPolygon {
     pub fn validate_line_string(line: &GeoLineString) -> OperationResult<()> {
         if line.points.len() <= 3 {
-            return Err(OperationError::ValidationError {
-                description: format!(
-                    "polygon invalid, the size must be at least 4, got {}",
-                    line.points.len()
-                ),
-            });
+            return Err(OperationError::validation_error(format!(
+                "polygon invalid, the size must be at least 4, got {}",
+                line.points.len()
+            )));
         }
 
-        if let (Some(first), Some(last)) = (line.points.first(), line.points.last()) {
-            if (first.lat - last.lat).abs() > f64::EPSILON
-                || (first.lon - last.lon).abs() > f64::EPSILON
-            {
-                return Err(OperationError::ValidationError {
-                    description: String::from(
-                        "polygon invalid, the first and the last points should be the same to form a closed line",
-                    ),
-                });
-            }
+        if let (Some(first), Some(last)) = (line.points.first(), line.points.last())
+            && ((first.lat - last.lat).abs() > f64::EPSILON
+                || (first.lon - last.lon).abs() > f64::EPSILON)
+        {
+            return Err(OperationError::validation_error(
+                "polygon invalid, the first and the last points should be the same to form a closed line",
+            ));
         }
 
         Ok(())
@@ -2299,7 +2979,10 @@ impl GeoPolygon {
             self.exterior
                 .points
                 .iter()
-                .map(|p| Coord { x: p.lon, y: p.lat })
+                .map(|p| Coord {
+                    x: p.lon.0,
+                    y: p.lat.0,
+                })
                 .collect(),
         );
 
@@ -2312,7 +2995,10 @@ impl GeoPolygon {
                     interior_points
                         .points
                         .iter()
-                        .map(|p| Coord { x: p.lon, y: p.lat })
+                        .map(|p| Coord {
+                            x: p.lon.0,
+                            y: p.lat.0,
+                        })
                         .collect()
                 })
                 .map(LineString)
@@ -2348,27 +3034,35 @@ impl TryFrom<GeoPolygonShadow> for GeoPolygon {
 }
 
 /// All possible payload filtering conditions
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
 #[validate(schema(function = "validate_field_condition"))]
 #[serde(rename_all = "snake_case")]
 pub struct FieldCondition {
     /// Payload key
     pub key: PayloadKeyType,
     /// Check if point has field with a given value
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub r#match: Option<Match>,
     /// Check if points value lies in a given range
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<RangeInterface>,
     /// Check if points geolocation lies in a given area
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_bounding_box: Option<GeoBoundingBox>,
     /// Check if geo point is within a given radius
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_radius: Option<GeoRadius>,
     /// Check if geo point is within a given polygon
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_polygon: Option<GeoPolygon>,
     /// Check number of values of the field
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub values_count: Option<ValuesCount>,
     /// Check that the field is empty, alternative syntax for `is_empty: "field_name"`
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_empty: Option<bool>,
     /// Check that the field is null, alternative syntax for `is_null: "field_name"`
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_null: Option<bool>,
 }
 
@@ -2387,7 +3081,7 @@ impl FieldCondition {
         }
     }
 
-    pub fn new_range(key: PayloadKeyType, range: Range<FloatPayloadType>) -> Self {
+    pub fn new_range(key: PayloadKeyType, range: Range<OrderedFloat<FloatPayloadType>>) -> Self {
         Self {
             key,
             r#match: None,
@@ -2474,7 +3168,7 @@ impl FieldCondition {
         }
     }
 
-    pub fn new_is_empty(key: PayloadKeyType) -> Self {
+    pub fn new_is_empty(key: PayloadKeyType, is_empty: bool) -> Self {
         Self {
             key,
             r#match: None,
@@ -2483,12 +3177,12 @@ impl FieldCondition {
             geo_radius: None,
             geo_polygon: None,
             values_count: None,
-            is_empty: Some(true),
+            is_empty: Some(is_empty),
             is_null: None,
         }
     }
 
-    pub fn new_is_null(key: PayloadKeyType) -> Self {
+    pub fn new_is_null(key: PayloadKeyType, is_null: bool) -> Self {
         Self {
             key,
             r#match: None,
@@ -2498,7 +3192,7 @@ impl FieldCondition {
             geo_polygon: None,
             values_count: None,
             is_empty: None,
-            is_null: Some(true),
+            is_null: Some(is_null),
         }
     }
 
@@ -2529,6 +3223,8 @@ impl FieldCondition {
             Match::Except(match_except) => match_except.except.len(),
             Match::Value(_) => 0,
             Match::Text(_) => 0,
+            Match::Phrase(_) => 0,
+            Match::TextAny(_) => 0,
         }
     }
 }
@@ -2544,20 +3240,20 @@ pub fn validate_field_condition(field_condition: &FieldCondition) -> Result<(), 
 }
 
 /// Payload field
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 pub struct PayloadField {
     /// Payload field name
     pub key: PayloadKeyType,
 }
 
 /// Select points with empty payload for a specified field
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 pub struct IsEmptyCondition {
     pub is_empty: PayloadField,
 }
 
 /// Select points with null payload for a specified field
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 pub struct IsNullCondition {
     pub is_null: PayloadField,
 }
@@ -2582,11 +3278,17 @@ impl From<JsonPath> for IsEmptyCondition {
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 pub struct HasIdCondition {
     #[schemars(schema_with = "HashSet::<PointIdType>::json_schema")]
-    pub has_id: AHashSet<PointIdType>,
+    pub has_id: MaybeArc<AHashSet<PointIdType>>,
+}
+
+impl Hash for HasIdCondition {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        unordered_hash_unique(state, self.has_id.iter());
+    }
 }
 
 /// Filter points which have specific vector assigned
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 pub struct HasVectorCondition {
     pub has_vector: VectorNameBuf,
 }
@@ -2597,29 +3299,42 @@ impl From<VectorNameBuf> for HasVectorCondition {
     }
 }
 
+/// Threshold determining when to use an `Arc` in `HasIdCondition` if the condition includes many points.
+/// Since we're cloning filters quite a lot, using an Arc for larger conditions reduces risk of memory leaks
+/// and potentially improves performance in some places.
+const HAS_ID_CONDITION_ARC_THRESHOLD: usize = 1_000;
+
 impl From<AHashSet<PointIdType>> for HasIdCondition {
     fn from(has_id: AHashSet<PointIdType>) -> Self {
-        HasIdCondition { has_id }
+        if has_id.len() > HAS_ID_CONDITION_ARC_THRESHOLD {
+            HasIdCondition {
+                has_id: MaybeArc::arc(has_id),
+            }
+        } else {
+            HasIdCondition {
+                has_id: MaybeArc::no_arc(has_id),
+            }
+        }
     }
 }
 
 impl FromIterator<PointIdType> for HasIdCondition {
     fn from_iter<T: IntoIterator<Item = PointIdType>>(iter: T) -> Self {
-        HasIdCondition {
-            has_id: iter.into_iter().collect(),
-        }
+        let items: AHashSet<_> = iter.into_iter().collect();
+        // Arc-Threshold applies here, since we're reusing the From implementation from AHashSet.
+        Self::from(items)
     }
 }
 
 /// Select points with payload for a specified nested field
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Validate)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Validate, Hash)]
 pub struct Nested {
     pub key: PayloadKeyType,
     #[validate(nested)]
     pub filter: Filter,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Validate)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Validate, Hash)]
 pub struct NestedCondition {
     #[validate(nested)]
     pub nested: Nested,
@@ -2646,7 +3361,7 @@ impl NestedCondition {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 #[serde(
     expecting = "Expected some form of condition, which can be a field condition (like {\"key\": ..., \"match\": ... }), or some other mentioned in the documentation: https://qdrant.tech/documentation/concepts/filtering/#filtering-conditions"
@@ -2669,24 +3384,108 @@ pub enum Condition {
     Filter(Filter),
 
     #[serde(skip)]
-    CustomIdChecker(Arc<dyn CustomIdCheckerCondition + Send + Sync + 'static>),
+    CustomIdChecker(CustomIdChecker),
 }
 
-impl PartialEq for Condition {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Field(this), Self::Field(other)) => this == other,
-            (Self::IsEmpty(this), Self::IsEmpty(other)) => this == other,
-            (Self::IsNull(this), Self::IsNull(other)) => this == other,
-            (Self::HasId(this), Self::HasId(other)) => this == other,
-            (Self::HasVector(this), Self::HasVector(other)) => this == other,
-            (Self::Nested(this), Self::Nested(other)) => this == other,
-            (Self::Filter(this), Self::Filter(other)) => this == other,
-            (Self::CustomIdChecker(_), Self::CustomIdChecker(_)) => false,
-            _ => false,
+#[derive(Deserialize)]
+#[serde(untagged)]
+#[serde(
+    expecting = "Expected some form of condition, which can be a field condition (like {\"key\": ..., \"match\": ... }), or some other mentioned in the documentation: https://qdrant.tech/documentation/concepts/filtering/#filtering-conditions"
+)]
+#[allow(clippy::large_enum_variant, dead_code)]
+enum ConditionUntagged {
+    Field(FieldCondition),
+    IsEmpty(IsEmptyCondition),
+    IsNull(IsNullCondition),
+    HasId(HasIdCondition),
+    HasVector(HasVectorCondition),
+    Nested(NestedCondition),
+    Filter(Filter),
+
+    #[serde(skip)]
+    CustomIdChecker(CustomIdChecker),
+}
+
+impl From<ConditionUntagged> for Condition {
+    fn from(condition: ConditionUntagged) -> Self {
+        match condition {
+            ConditionUntagged::Field(condition) => Condition::Field(condition),
+            ConditionUntagged::IsEmpty(condition) => Condition::IsEmpty(condition),
+            ConditionUntagged::IsNull(condition) => Condition::IsNull(condition),
+            ConditionUntagged::HasId(condition) => Condition::HasId(condition),
+            ConditionUntagged::HasVector(condition) => Condition::HasVector(condition),
+            ConditionUntagged::Nested(condition) => Condition::Nested(condition),
+            ConditionUntagged::Filter(condition) => Condition::Filter(condition),
+            ConditionUntagged::CustomIdChecker(condition) => Condition::CustomIdChecker(condition),
         }
     }
 }
+
+impl<'de> serde::Deserialize<'de> for Condition {
+    /// Deserializes Condition with special handling for FieldCondition to preserve
+    /// readable RFC3339 datetime parse errors. Other variants use ConditionUntagged
+    /// for compiler-level safety when new variants are added.
+    /// Example accepted datetime value: `2014-01-01T00:00:00Z`.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Buffer into serde_value::Value which, unlike serde_json::Value,
+        // can represent byte arrays from non-human-readable formats (e.g. CBOR).
+        // Note: we cannot rely on `deserializer.is_human_readable()` here because
+        // serde's internal ContentDeserializer (used by flatten + untagged) always
+        // reports `true` regardless of the original format.
+        let value = serde_value::Value::deserialize(deserializer)?;
+
+        // Special case: FieldCondition first to surface datetime parse errors.
+        // Untagged enum would swallow these errors with generic message.
+        if let serde_value::Value::Map(obj) = &value
+            && obj.contains_key(&serde_value::Value::String("key".into()))
+        {
+            return value
+                .deserialize_into()
+                .map(Condition::Field)
+                .map_err(serde::de::Error::custom);
+        }
+
+        // All other variants handled by ConditionUntagged (compiler-safe)
+        value
+            .deserialize_into::<ConditionUntagged>()
+            .map(Condition::from)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Condition {
+    pub fn new_custom(checker: Arc<dyn CustomIdCheckerCondition + Send + Sync + 'static>) -> Self {
+        Condition::CustomIdChecker(CustomIdChecker(checker))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomIdChecker(pub Arc<dyn CustomIdCheckerCondition + Send + Sync + 'static>);
+
+impl Hash for CustomIdChecker {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        // We cannot hash the inner function
+        // This means that two different CustomIdChecker conditions will have the same hash,
+        // but that's acceptable since we cannot do better, and only expected to be used
+        // for logging and profiling purposes.
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+impl PartialEq for CustomIdChecker {
+    fn eq(&self, other: &Self) -> bool {
+        // We cannot compare the inner function
+        // This means that two different CustomIdChecker conditions will never be equal,
+        // but that's acceptable since we cannot do better, and only expected to be used
+        // for logging and profiling purposes.
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CustomIdChecker {}
 
 impl Condition {
     pub fn new_nested(key: JsonPath, filter: Filter) -> Self {
@@ -2719,7 +3518,18 @@ impl Condition {
             | Condition::IsNull(_)
             | Condition::CustomIdChecker(_)
             | Condition::HasId(_)
-            | Condition::HasVector(_) => 0,
+            | Condition::HasVector(_) => 1,
+        }
+    }
+
+    pub fn targeted_key(&self) -> Option<PayloadKeyType> {
+        match self {
+            Condition::Field(field_condition) => Some(field_condition.key.clone()),
+            Condition::IsEmpty(is_empty_condition) => Some(is_empty_condition.is_empty.key.clone()),
+            Condition::IsNull(is_null_condition) => Some(is_null_condition.is_null.key.clone()),
+            Condition::Nested(nested_condition) => Some(nested_condition.array_key()),
+            Condition::Filter(filter) => filter.iter_conditions().find_map(|c| c.targeted_key()),
+            Condition::HasId(_) | Condition::HasVector(_) | Condition::CustomIdChecker(_) => None,
         }
     }
 }
@@ -2746,7 +3556,7 @@ pub trait CustomIdCheckerCondition: fmt::Debug {
 }
 
 /// Options for specifying which payload to include or not
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash)]
 #[serde(untagged, rename_all = "snake_case")]
 #[serde(
     expecting = "Expected a boolean, an array of strings, or an object with an include/exclude field"
@@ -2774,7 +3584,7 @@ impl Default for WithPayloadInterface {
 }
 
 /// Options for specifying which vector to include
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged, rename_all = "snake_case")]
 #[serde(expecting = "Expected a boolean, or an array of strings")]
 pub enum WithVector {
@@ -2792,11 +3602,38 @@ impl WithVector {
             WithVector::Selector(_) => true,
         }
     }
+
+    /// Merges two `WithVector` options, additively.
+    pub fn merge(&self, other: &WithVector) -> WithVector {
+        match (self, other) {
+            // if any is true, then true
+            (WithVector::Bool(true), _) => WithVector::Bool(true),
+            (_, WithVector::Bool(true)) => WithVector::Bool(true),
+
+            // if both are false, then false
+            (WithVector::Bool(false), WithVector::Bool(false)) => WithVector::Bool(false),
+
+            // merge selectors
+            (WithVector::Selector(s1), WithVector::Selector(s2)) => {
+                WithVector::Selector(s1.iter().chain(s2).unique().cloned().collect())
+            }
+
+            // use selector from the other option
+            (WithVector::Bool(false), WithVector::Selector(s)) => WithVector::Selector(s.clone()),
+            (WithVector::Selector(s), WithVector::Bool(false)) => WithVector::Selector(s.clone()),
+        }
+    }
 }
 
 impl From<bool> for WithVector {
     fn from(b: bool) -> Self {
         WithVector::Bool(b)
+    }
+}
+
+impl From<VectorNameBuf> for WithVector {
+    fn from(name: VectorNameBuf) -> Self {
+        WithVector::Selector(vec![name])
     }
 }
 
@@ -2810,7 +3647,7 @@ impl WithPayloadInterface {
     pub fn is_required(&self) -> bool {
         match self {
             WithPayloadInterface::Bool(b) => *b,
-            _ => true,
+            WithPayloadInterface::Fields(_) | WithPayloadInterface::Selector(_) => true,
         }
     }
 }
@@ -2824,26 +3661,32 @@ impl From<bool> for WithPayload {
     }
 }
 
-impl From<&WithPayloadInterface> for WithPayload {
-    fn from(interface: &WithPayloadInterface) -> Self {
+impl From<WithPayloadInterface> for WithPayload {
+    fn from(interface: WithPayloadInterface) -> Self {
         match interface {
-            WithPayloadInterface::Bool(x) => WithPayload {
-                enable: *x,
+            WithPayloadInterface::Bool(enable) => WithPayload {
+                enable,
                 payload_selector: None,
             },
-            WithPayloadInterface::Fields(x) => WithPayload {
+            WithPayloadInterface::Fields(fields) => WithPayload {
                 enable: true,
-                payload_selector: Some(PayloadSelector::new_include(x.clone())),
+                payload_selector: Some(PayloadSelector::new_include(fields)),
             },
-            WithPayloadInterface::Selector(x) => WithPayload {
+            WithPayloadInterface::Selector(selector) => WithPayload {
                 enable: true,
-                payload_selector: Some(x.clone()),
+                payload_selector: Some(selector),
             },
         }
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+impl From<&WithPayloadInterface> for WithPayload {
+    fn from(interface: &WithPayloadInterface) -> Self {
+        WithPayload::from(interface.clone())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct PayloadSelectorInclude {
     /// Only include this payload keys
@@ -2856,7 +3699,7 @@ impl PayloadSelectorInclude {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct PayloadSelectorExclude {
     /// Exclude this fields from returning payload
@@ -2870,7 +3713,7 @@ impl PayloadSelectorExclude {
 }
 
 /// Specifies how to treat payload selector
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum PayloadSelector {
     /// Include only this fields into response payload
@@ -2934,37 +3777,64 @@ pub struct WithPayload {
     pub payload_selector: Option<PayloadSelector>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default)]
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Default, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct MinShould {
+    #[validate(nested)]
     pub conditions: Vec<Condition>,
     pub min_count: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default)]
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Default, Hash,
+)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Filter {
     /// At least one of those conditions should match
     #[validate(nested)]
-    #[serde(default, with = "MaybeOneOrMany")]
+    #[serde(
+        default,
+        with = "MaybeOneOrMany",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub should: Option<Vec<Condition>>,
     /// At least minimum amount of given conditions should match
     #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_should: Option<MinShould>,
     /// All conditions must match
     #[validate(nested)]
-    #[serde(default, with = "MaybeOneOrMany")]
+    #[serde(
+        default,
+        with = "MaybeOneOrMany",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub must: Option<Vec<Condition>>,
     /// All conditions must NOT match
     #[validate(nested)]
-    #[serde(default, with = "MaybeOneOrMany")]
+    #[serde(
+        default,
+        with = "MaybeOneOrMany",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub must_not: Option<Vec<Condition>>,
 }
 
 impl Filter {
+    pub fn new() -> Self {
+        Filter {
+            should: None,
+            min_should: None,
+            must: None,
+            must_not: None,
+        }
+    }
+
     pub fn new_should(condition: Condition) -> Self {
         Filter {
             should: Some(vec![condition]),
@@ -2998,6 +3868,33 @@ impl Filter {
             min_should: None,
             must: None,
             must_not: Some(vec![condition]),
+        }
+    }
+
+    /// Create an extended filtering condition, which would also include filter by given list of IDs.
+    pub fn with_point_ids(self, ids: impl IntoIterator<Item = PointIdType>) -> Filter {
+        let has_id_condition: HasIdCondition = ids.into_iter().collect();
+
+        let Filter {
+            should,
+            min_should,
+            must,
+            must_not,
+        } = self;
+
+        let new_must = match must {
+            Some(mut must) => {
+                must.push(Condition::HasId(has_id_condition));
+                Some(must)
+            }
+            None => Some(vec![Condition::HasId(has_id_condition)]),
+        };
+
+        Filter {
+            should,
+            min_should,
+            must: new_must,
+            must_not,
         }
     }
 
@@ -3061,7 +3958,7 @@ impl Filter {
     pub fn total_conditions_count(&self) -> usize {
         fn count_all_conditions(field: Option<&Vec<Condition>>) -> usize {
             field
-                .map(|i| i.len() + i.iter().map(|j| j.sub_conditions_count()).sum::<usize>())
+                .map(|i| i.iter().map(|j| j.sub_conditions_count()).sum::<usize>())
                 .unwrap_or(0)
         }
 
@@ -3155,7 +4052,7 @@ pub(crate) mod test_utils {
         let exterior_line = GeoLineString {
             points: exterior_points
                 .into_iter()
-                .map(|(lon, lat)| GeoPoint { lon, lat })
+                .map(|(lon, lat)| GeoPoint::new_unchecked(lon, lat))
                 .collect(),
         };
 
@@ -3172,7 +4069,7 @@ pub(crate) mod test_utils {
         let exterior_line = GeoLineString {
             points: exterior_points
                 .into_iter()
-                .map(|(lon, lat)| GeoPoint { lon, lat })
+                .map(|(lon, lat)| GeoPoint::new_unchecked(lon, lat))
                 .collect(),
         };
 
@@ -3182,7 +4079,7 @@ pub(crate) mod test_utils {
                 .map(|points| GeoLineString {
                     points: points
                         .into_iter()
-                        .map(|(lon, lat)| GeoPoint { lon, lat })
+                        .map(|(lon, lat)| GeoPoint::new_unchecked(lon, lat))
                         .collect(),
                 })
                 .collect(),
@@ -3197,22 +4094,14 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
+    use itertools::Itertools;
     use rstest::rstest;
-    use serde::de::DeserializeOwned;
     use serde_json;
 
     use super::test_utils::build_polygon_with_interiors;
     use super::*;
-
-    #[allow(dead_code)]
-    fn check_rms_serialization<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
-        record: T,
-    ) {
-        let binary_entity = rmp_serde::to_vec(&record).expect("serialization ok");
-        let de_record: T = rmp_serde::from_slice(&binary_entity).expect("deserialization ok");
-
-        assert_eq!(record, de_record);
-    }
 
     #[test]
     #[ignore]
@@ -3235,6 +4124,9 @@ mod tests {
     #[case::without_z_and_decimals("2020-03-01T00:00:00.12")]
     #[case::space_sep_without_z("2020-03-01 00:00:00")]
     #[case::space_sep_without_z_and_decimals("2020-03-01 00:00:00.123456")]
+    #[case::t_sep_without_seconds("2020-03-01T00:00")]
+    #[case::space_sep_without_seconds("2020-03-01 00:00")]
+    #[case::date_only("2020-03-01")]
     fn test_datetime_deserialization(#[case] datetime: &str) {
         let datetime = DateTimePayloadType::from_str(datetime).unwrap();
         let serialized = serde_json::to_string(&datetime).unwrap();
@@ -3254,6 +4146,85 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_datetime_range_returns_clear_rfc3339_error() {
+        let json = r#"{
+            "key": "created_at",
+            "range": {
+                "gte": "2014-01-01T00:00:00BAD"
+            }
+        }"#;
+
+        let err = serde_json::from_str::<Condition>(json)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("RFC3339"), "err was: {err}");
+        assert!(err.contains("2014-01-01T00:00:00BAD"), "err was: {err}");
+        assert!(err.contains("Example"), "err was: {err}");
+    }
+
+    /// Regression test: DateTimePayloadType binary serialization roundtrip.
+    /// Ensures DateTimePayloadType parses binary-encoded RFC3339 strings.
+    #[test]
+    fn test_datetime_payload_type_binary_roundtrip() {
+        let original = DateTimePayloadType::from_str("2024-06-15T12:30:45Z").unwrap();
+
+        // rmp-serde uses non-human-readable format
+        let binary = rmp_serde::to_vec(&original).expect("serialize");
+        let restored: DateTimePayloadType = rmp_serde::from_slice(&binary).expect("deserialize");
+
+        assert_eq!(original, restored);
+    }
+
+    /// Regression test: RangeInterface with datetime binary roundtrip.
+    /// Ensures the RangeInterface datetime deserialization works in binary.
+    #[test]
+    fn test_range_interface_datetime_binary_roundtrip() {
+        let dt_gte = DateTimePayloadType::from_str("2024-01-01T00:00:00Z").unwrap();
+        let dt_lte = DateTimePayloadType::from_str("2024-12-31T23:59:59Z").unwrap();
+
+        let range = RangeInterface::DateTime(Range {
+            lt: None,
+            gt: None,
+            gte: Some(dt_gte),
+            lte: Some(dt_lte),
+        });
+
+        // rmp-serde uses non-human-readable format
+        let binary = rmp_serde::to_vec(&range).expect("serialize");
+        let restored: RangeInterface = rmp_serde::from_slice(&binary).expect("deserialize");
+
+        assert_eq!(range, restored);
+    }
+
+    /// Regression test: Non-FieldCondition JSON deserialization uses ConditionUntagged fallback.
+    /// Ensures compiler-safe handling of other Condition variants.
+    #[test]
+    fn test_condition_json_fallback_to_untagged() {
+        // IsEmptyCondition (no "key" field at top level, uses "is_empty" instead)
+        let is_empty_json = r#"{"is_empty": {"key": "optional_field"}}"#;
+        let condition: Condition = serde_json::from_str(is_empty_json).unwrap();
+        assert!(matches!(condition, Condition::IsEmpty(_)));
+
+        // HasIdCondition
+        let has_id_json = r#"{"has_id": [1, 2, 3]}"#;
+        let condition: Condition = serde_json::from_str(has_id_json).unwrap();
+        assert!(matches!(condition, Condition::HasId(_)));
+
+        // Nested Filter
+        let nested_json = r#"{"nested": {"key": "items", "filter": {"must": []}}}"#;
+        let condition: Condition = serde_json::from_str(nested_json).unwrap();
+        assert!(matches!(condition, Condition::Nested(_)));
+    }
+
+    #[test]
+    fn test_datetime_wrapper_transcoding() {
+        let expected = DateTimeWrapper(chrono::Utc::now());
+        let transcoded = DateTimeWrapper::from_str(&expected.to_string()).unwrap();
+        assert_eq!(expected, transcoded);
+    }
+
+    #[test]
     fn test_timezone_ordering() {
         let datetimes = [
             "2000-06-08 00:18:53+0900",
@@ -3270,58 +4241,49 @@ mod tests {
             .sorted_by_key(|(_, dt)| dt.timestamp())
             .collect();
 
-        sorted_datetimes.windows(2).for_each(|pair| {
-            let (i1, dt1) = pair[0];
-            let (i2, dt2) = pair[1];
-            assert!(
-                i1 < i2,
-                "i1: {}, dt1: {}, ts1: {}\ni2: {}, dt2: {}, ts2: {}",
-                i1,
-                dt1.0,
-                dt1.timestamp(),
-                i2,
-                dt2.0,
-                dt2.timestamp()
-            );
-        });
+        sorted_datetimes
+            .array_windows()
+            .for_each(|[(i1, dt1), (i2, dt2)]| {
+                assert!(
+                    i1 < i2,
+                    "i1: {}, dt1: {}, ts1: {}\ni2: {}, dt2: {}, ts2: {}",
+                    i1,
+                    dt1.0,
+                    dt1.timestamp(),
+                    i2,
+                    dt2.0,
+                    dt2.timestamp()
+                );
+            });
     }
 
     #[test]
     fn test_geo_radius_check_point() {
         let radius = GeoRadius {
-            center: GeoPoint { lon: 0.0, lat: 0.0 },
-            radius: 80000.0,
+            center: GeoPoint::new_unchecked(0.0, 0.0),
+            radius: OrderedFloat(80000.0),
         };
 
-        let inside_result = radius.check_point(&GeoPoint { lon: 0.5, lat: 0.5 });
+        let inside_result = radius.check_point(&GeoPoint::new_unchecked(0.5, 0.5));
         assert!(inside_result);
 
-        let outside_result = radius.check_point(&GeoPoint { lon: 1.5, lat: 1.5 });
+        let outside_result = radius.check_point(&GeoPoint::new_unchecked(1.5, 1.5));
         assert!(!outside_result);
     }
 
     #[test]
     fn test_geo_boundingbox_check_point() {
         let bounding_box = GeoBoundingBox {
-            top_left: GeoPoint {
-                lon: -1.0,
-                lat: 1.0,
-            },
-            bottom_right: GeoPoint {
-                lon: 1.0,
-                lat: -1.0,
-            },
+            top_left: GeoPoint::new_unchecked(-1.0, 1.0),
+            bottom_right: GeoPoint::new_unchecked(1.0, -1.0),
         };
 
         // haversine distance between (0, 0) and (0.5, 0.5) is 78626.29627999048
-        let inside_result = bounding_box.check_point(&GeoPoint {
-            lon: -0.5,
-            lat: 0.5,
-        });
+        let inside_result = bounding_box.check_point(&GeoPoint::new_unchecked(-0.5, 0.5));
         assert!(inside_result);
 
         // haversine distance between (0, 0) and (0.5, 0.5) is 235866.91169814655
-        let outside_result = bounding_box.check_point(&GeoPoint { lon: 1.5, lat: 1.5 });
+        let outside_result = bounding_box.check_point(&GeoPoint::new_unchecked(1.5, 1.5));
         assert!(!outside_result);
     }
 
@@ -3329,28 +4291,17 @@ mod tests {
     fn test_geo_boundingbox_antimeridian_check_point() {
         // Use the bounding box for USA: (74.071028, 167), (18.7763, -66.885417)
         let bounding_box = GeoBoundingBox {
-            top_left: GeoPoint {
-                lat: 74.071028,
-                lon: 167.0,
-            },
-            bottom_right: GeoPoint {
-                lat: 18.7763,
-                lon: -66.885417,
-            },
+            top_left: GeoPoint::new_unchecked(167.0, 74.071028),
+            bottom_right: GeoPoint::new_unchecked(-66.885417, 18.7763),
         };
 
         // Test NYC, which is inside the bounding box
-        let inside_result = bounding_box.check_point(&GeoPoint {
-            lat: 40.75798,
-            lon: -73.991516,
-        });
+        let inside_result =
+            bounding_box.check_point(&GeoPoint::new_unchecked(-73.991516, 40.75798));
         assert!(inside_result);
 
         // Test Berlin, which is outside the bounding box
-        let outside_result = bounding_box.check_point(&GeoPoint {
-            lat: 52.52437,
-            lon: 13.41053,
-        });
+        let outside_result = bounding_box.check_point(&GeoPoint::new_unchecked(13.41053, 52.52437));
         assert!(!outside_result);
     }
 
@@ -3414,7 +4365,9 @@ mod tests {
             let polygon = build_polygon_with_interiors(exterior, interiors);
 
             for ((lon, lat), expected_result) in points {
-                let inside_result = polygon.convert().check_point(&GeoPoint { lon, lat });
+                let inside_result = polygon
+                    .convert()
+                    .check_point(&GeoPoint::new_unchecked(lon, lat));
                 assert_eq!(inside_result, expected_result);
             }
         }
@@ -4324,6 +5277,37 @@ mod tests {
         };
         assert_eq!(payload, expected);
     }
+
+    #[test]
+    fn test_extended_point_id_cbor_roundtrip() {
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        for point_id in [ExtendedPointId::Uuid(uuid), ExtendedPointId::NumId(42)] {
+            let cbor_bytes = serde_cbor::to_vec(&point_id).unwrap();
+            let deserialized: ExtendedPointId = serde_cbor::from_slice(&cbor_bytes).unwrap();
+            assert_eq!(point_id, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_filter_with_match_and_has_id_uuid_cbor_roundtrip() {
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let filter = Filter {
+            should: None,
+            min_should: None,
+            must: Some(vec![Condition::Field(FieldCondition::new_match(
+                crate::json_path::JsonPath::new("org_id"),
+                Match::new_value(ValueVariants::String("test_org".to_string())),
+            ))]),
+            must_not: Some(vec![Condition::HasId(HasIdCondition {
+                has_id: [ExtendedPointId::Uuid(uuid)].into_iter().collect(),
+            })]),
+        };
+
+        let cbor_bytes = serde_cbor::to_vec(&filter).unwrap();
+        let deserialized: Filter = serde_cbor::from_slice(&cbor_bytes).unwrap();
+        assert_eq!(filter, deserialized);
+    }
 }
 
 fn shard_key_string_example() -> String {
@@ -4337,8 +5321,11 @@ fn shard_key_number_example() -> u64 {
 #[derive(Deserialize, Serialize, JsonSchema, Anonymize, Debug, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum ShardKey {
-    #[schemars(example = "shard_key_string_example")]
-    Keyword(String),
+    #[schemars(
+        schema_with = "String::json_schema",
+        example = "shard_key_string_example"
+    )]
+    Keyword(EcoString),
     #[schemars(example = "shard_key_number_example")]
     #[anonymize(false)]
     Number(u64),
@@ -4346,13 +5333,19 @@ pub enum ShardKey {
 
 impl From<String> for ShardKey {
     fn from(s: String) -> Self {
+        ShardKey::Keyword(EcoString::from(s))
+    }
+}
+
+impl From<EcoString> for ShardKey {
+    fn from(s: EcoString) -> Self {
         ShardKey::Keyword(s)
     }
 }
 
 impl From<&str> for ShardKey {
     fn from(s: &str) -> Self {
-        ShardKey::Keyword(s.to_owned())
+        ShardKey::Keyword(EcoString::from(s))
     }
 }
 

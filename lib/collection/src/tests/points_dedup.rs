@@ -1,16 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use api::rest::OrderByInterface;
+use ahash::AHashMap;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
+use segment::data_types::order_by::OrderByInterface;
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{
     Distance, ExtendedPointId, Payload, PayloadFieldSchema, PayloadSchemaType, SearchParams,
 };
 use serde_json::{Map, Value};
+use shard::query::query_enum::QueryEnum;
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
@@ -18,7 +20,6 @@ use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
 };
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
@@ -29,8 +30,10 @@ use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
-use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_trait::WaitUntil;
 
 const DIM: u64 = 4;
 const PEER_ID: u64 = 1;
@@ -42,6 +45,7 @@ async fn fixture() -> Collection {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -60,13 +64,14 @@ async fn fixture() -> Collection {
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
 
     let collection_name = "test".to_string();
-    let shards: HashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
+    let shards: AHashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
         .map(|i| (i, HashSet::from([PEER_ID])))
         .collect();
 
@@ -134,7 +139,7 @@ async fn fixture() -> Collection {
             ])),
         ));
         shard
-            .update_local(op, true, HwMeasurementAcc::new(), false)
+            .update_local(op, WaitUntil::Visible, None, HwMeasurementAcc::new(), false)
             .await
             .expect("failed to insert points");
     }

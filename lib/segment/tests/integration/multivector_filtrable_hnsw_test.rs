@@ -4,32 +4,33 @@ use std::sync::atomic::AtomicBool;
 
 use common::budget::ResourcePermit;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::TelemetryDetail;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_multi_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_multi_vector};
 use segment::fixtures::query_fixtures::{QueryVariant, random_multi_vec_query};
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::segment_constructor::build_segment;
 use segment::types::{
     Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, MultiVectorConfig,
     PayloadSchemaType, Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig,
     VectorStorageType,
 };
-use segment::vector_storage::VectorStorage;
+use segment::vector_storage::VectorStorageRead;
 use tempfile::Builder;
 
 /// Check all cases with single vector per multi and several vectors per multi
 #[rstest]
 #[case::nearest_eq(QueryVariant::Nearest, 1, 32, 5)]
 #[case::nearest_multi(QueryVariant::Nearest, 3, 64, 20)]
-#[case::discovery_eq(QueryVariant::Discovery, 1, 128, 5)]
-#[case::discovery_multi(QueryVariant::Discovery, 3, 128, 20)]
+#[case::discover_eq(QueryVariant::Discover, 1, 128, 5)]
+#[case::discover_multi(QueryVariant::Discover, 3, 128, 20)]
 #[case::recobestscore_eq(QueryVariant::RecoBestScore, 1, 64, 5)]
 #[case::recobestscore_multi(QueryVariant::RecoBestScore, 2, 64, 10)]
 #[case::recosumscores_eq(QueryVariant::RecoSumScores, 1, 64, 5)]
@@ -44,6 +45,7 @@ fn test_multi_filterable_hnsw(
     use segment::json_path::JsonPath;
     use segment::payload_json;
     use segment::segment_constructor::VectorIndexBuildArgs;
+    use segment::types::HnswGlobalConfig;
 
     let stopped = AtomicBool::new(false);
 
@@ -55,7 +57,7 @@ fn test_multi_filterable_hnsw(
     let full_scan_threshold = 8; // KB
     let num_payload_values = 2;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -66,7 +68,7 @@ fn test_multi_filterable_hnsw(
             VectorDataConfig {
                 size: vector_dim,
                 distance,
-                storage_type: VectorStorageType::Memory,
+                storage_type: VectorStorageType::default(),
                 index: Indexes::Plain {}, // uses plain index for comparison
                 quantization_config: None,
                 multivector_config: Some(MultiVectorConfig::default()), // uses multivec config
@@ -81,14 +83,14 @@ fn test_multi_filterable_hnsw(
 
     let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_segment(dir.path(), &config, None, true).unwrap();
     for n in 0..num_points {
         let idx = n.into();
         // Random number of vectors per multivec point
-        let num_vector_for_point = rnd.random_range(1..=max_num_vector_per_points);
-        let multi_vec = random_multi_vector(&mut rnd, vector_dim, num_vector_for_point);
+        let num_vector_for_point = rng.random_range(1..=max_num_vector_per_points);
+        let multi_vec = random_multi_vector(&mut rng, vector_dim, num_vector_for_point);
 
-        let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
+        let int_payload = random_int_payload(&mut rng, num_payload_values..=num_payload_values);
         let payload = payload_json! {int_key: int_payload};
 
         let named_vectors = only_default_multi_vector(&multi_vec);
@@ -124,9 +126,10 @@ fn test_multi_filterable_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = 1; // single-threaded for deterministic build
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
@@ -144,8 +147,11 @@ fn test_multi_filterable_hnsw(
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -155,12 +161,12 @@ fn test_multi_filterable_hnsw(
     let attempts = 100;
     for i in 0..attempts {
         // Random number of vectors per multivec query
-        let num_vector_for_query = rnd.random_range(1..=max_num_vector_per_points);
+        let num_vector_for_query = rng.random_range(1..=max_num_vector_per_points);
         let query =
-            random_multi_vec_query(&query_variant, &mut rnd, vector_dim, num_vector_for_query);
+            random_multi_vec_query(&query_variant, &mut rng, vector_dim, num_vector_for_query);
 
         let range_size = 40;
-        let left_range = rnd.random_range(0..400);
+        let left_range = rng.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
@@ -168,8 +174,8 @@ fn test_multi_filterable_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

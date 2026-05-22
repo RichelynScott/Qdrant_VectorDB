@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::typelevel::False;
 use common::types::{PointOffsetType, ScoreType};
 
 use super::score_multi;
@@ -12,7 +13,6 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::vector_storage::MultiVectorStorage;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::QueryScorer;
 
 pub struct MultiMetricQueryScorer<
@@ -87,17 +87,18 @@ impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
     TVectorStorage: MultiVectorStorage<TElement>,
-> QueryScorer<TypedMultiDenseVector<TElement>>
-    for MultiMetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
+> QueryScorer for MultiMetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
 {
+    type TVector = TypedMultiDenseVector<TElement>;
+
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        let stored = self.vector_storage.get_multi(idx);
+        let stored = self.vector_storage.get_multi::<Random>(idx);
         self.hardware_counter
             .vector_io_read()
-            .incr_delta(stored.vectors_count());
+            .incr_delta(stored.as_ref().vectors_count());
 
-        self.score_multi(TypedMultiDenseVectorRef::from(&self.query), stored)
+        self.score_multi(TypedMultiDenseVectorRef::from(&self.query), stored.as_ref())
     }
 
     #[inline]
@@ -109,32 +110,28 @@ impl<
     }
 
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
         debug_assert_eq!(ids.len(), scores.len());
 
-        let mut vectors = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
-        let vectors = self
-            .vector_storage
-            .get_batch_multi(ids, &mut vectors[..ids.len()]);
-
-        let total_read = vectors.iter().map(|v| v.vectors_count()).sum();
-
-        self.hardware_counter
-            .vector_io_read()
-            .incr_delta(total_read);
-
-        for idx in 0..ids.len() {
-            scores[idx] = self.score_ref(vectors[idx]);
-        }
+        let vectors_read = self.hardware_counter.vector_io_read();
+        self.vector_storage
+            .for_each_in_batch_multi(ids, |idx, vector| {
+                vectors_read.incr_delta(vector.vectors_count());
+                scores[idx] = self.score_ref(vector);
+            });
     }
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
-        let v1 = self.vector_storage.get_multi(point_a);
-        let v2 = self.vector_storage.get_multi(point_b);
+        let v1 = self.vector_storage.get_multi::<Random>(point_a);
+        let v2 = self.vector_storage.get_multi::<Random>(point_b);
         self.hardware_counter
             .vector_io_read()
-            .incr_delta(v1.vectors_count() + v2.vectors_count());
+            .incr_delta(v1.as_ref().vectors_count() + v2.as_ref().vectors_count());
 
-        self.score_multi(v1, v2)
+        self.score_multi(v1.as_ref(), v2.as_ref())
+    }
+
+    type SupportsBytes = False;
+    fn score_bytes(&self, enabled: Self::SupportsBytes, _: &[u8]) -> ScoreType {
+        match enabled {}
     }
 }

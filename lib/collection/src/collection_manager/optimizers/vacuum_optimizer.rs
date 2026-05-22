@@ -1,44 +1,73 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use ordered_float::OrderedFloat;
-use parking_lot::Mutex;
-use segment::common::operation_time_statistics::OperationDurationsAggregator;
-use segment::entry::entry_point::SegmentEntry;
-use segment::index::VectorIndex;
-use segment::types::{HnswConfig, QuantizationConfig, SegmentType};
-use segment::vector_storage::VectorStorage;
-
-use crate::collection_manager::holders::segment_holder::{
-    LockedSegment, LockedSegmentHolder, SegmentId,
-};
-use crate::collection_manager::optimizers::segment_optimizer::{
-    OptimizerThresholds, SegmentOptimizer,
-};
-use crate::config::CollectionParams;
-
 /// Optimizer which looks for segments with high amount of soft-deleted points or vectors
 ///
 /// Since the creation of a segment, a lot of points or vectors may have been soft-deleted. This
 /// results in the index slowly breaking apart, and unnecessary storage usage.
 ///
 /// This optimizer will look for the worst segment to rebuilt the index and minimize storage usage.
-pub struct VacuumOptimizer {
-    deleted_threshold: f64,
-    min_vectors_number: usize,
-    thresholds_config: OptimizerThresholds,
-    segments_path: PathBuf,
-    collection_temp_dir: PathBuf,
-    collection_params: CollectionParams,
-    hnsw_config: HnswConfig,
-    quantization_config: Option<QuantizationConfig>,
-    telemetry_durations_aggregator: Arc<Mutex<OperationDurationsAggregator>>,
-}
+pub use shard::optimizers::vacuum_optimizer::VacuumOptimizer;
 
-impl VacuumOptimizer {
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use itertools::Itertools;
+    use segment::entry::NonAppendableSegmentEntry as _;
+    use segment::id_tracker::IdTrackerRead;
+    use segment::index::VectorIndexRead;
+    use segment::payload_json;
+    use segment::types::{
+        Distance, HnswConfig, HnswGlobalConfig, PayloadContainer, PayloadSchemaType,
+        QuantizationConfig, VectorName,
+    };
+    use segment::vector_storage::{VectorStorage, VectorStorageRead};
+    use serde_json::Value;
+    use shard::locked_segment::LockedSegment;
+    use shard::operations::optimization::OptimizerThresholds;
+    use shard::optimizers::segment_optimizer::SegmentOptimizer;
+    use shard::segment_holder::locked::LockedSegmentHolder;
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::collection_manager::fixtures::{random_multi_vec_segment, random_segment};
+    use crate::collection_manager::holders::segment_holder::SegmentHolder;
+    use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
+    use crate::config::CollectionParams;
+    use crate::operations::types::VectorsConfig;
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+    use crate::optimizers_builder::build_segment_optimizer_config;
+
+    const VECTOR1_NAME: &VectorName = "vector1";
+    const VECTOR2_NAME: &VectorName = "vector2";
+
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new_indexing_optimizer(
+        default_segments_number: usize,
+        thresholds_config: OptimizerThresholds,
+        segments_path: PathBuf,
+        collection_temp_dir: PathBuf,
+        collection_params: CollectionParams,
+        hnsw_config: HnswConfig,
+        hnsw_global_config: HnswGlobalConfig,
+        quantization_config: Option<QuantizationConfig>,
+    ) -> IndexingOptimizer {
+        let segment_config =
+            build_segment_optimizer_config(&collection_params, &hnsw_config, &quantization_config);
+        shard::optimizers::indexing_optimizer::IndexingOptimizer::new(
+            default_segments_number,
+            thresholds_config,
+            segments_path,
+            collection_temp_dir,
+            segment_config,
+            hnsw_global_config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_vacuum_optimizer(
         deleted_threshold: f64,
         min_vectors_number: usize,
         thresholds_config: OptimizerThresholds,
@@ -46,192 +75,21 @@ impl VacuumOptimizer {
         collection_temp_dir: PathBuf,
         collection_params: CollectionParams,
         hnsw_config: HnswConfig,
+        hnsw_global_config: HnswGlobalConfig,
         quantization_config: Option<QuantizationConfig>,
-    ) -> Self {
-        VacuumOptimizer {
+    ) -> VacuumOptimizer {
+        let segment_config =
+            build_segment_optimizer_config(&collection_params, &hnsw_config, &quantization_config);
+        shard::optimizers::vacuum_optimizer::VacuumOptimizer::new(
             deleted_threshold,
             min_vectors_number,
             thresholds_config,
             segments_path,
             collection_temp_dir,
-            collection_params,
-            hnsw_config,
-            quantization_config,
-            telemetry_durations_aggregator: OperationDurationsAggregator::new(),
-        }
+            segment_config,
+            hnsw_global_config,
+        )
     }
-
-    fn worst_segment(
-        &self,
-        segments: LockedSegmentHolder,
-        excluded_ids: &HashSet<SegmentId>,
-    ) -> Option<SegmentId> {
-        let segments_read_guard = segments.read();
-        segments_read_guard
-            .iter()
-            // Excluded externally, might already be scheduled for optimization
-            .filter(|(idx, _segment)| !excluded_ids.contains(idx))
-            .flat_map(|(idx, segment)| {
-                // Calculate littered ratio for segment and named vectors
-                let littered_ratio_segment = self.littered_ratio_segment(segment);
-                let littered_ratio_vectors = self.littered_vectors_index_ratio(segment);
-                [littered_ratio_segment, littered_ratio_vectors]
-                    .into_iter()
-                    .flatten()
-                    .map(|ratio| (*idx, ratio))
-            })
-            .max_by_key(|(_, ratio)| OrderedFloat(*ratio))
-            .map(|(idx, _)| idx)
-    }
-
-    /// Calculate littered ratio for segment on point level
-    ///
-    /// Returns `None` if littered ratio did not reach vacuum thresholds.
-    fn littered_ratio_segment(&self, segment: &LockedSegment) -> Option<f64> {
-        let segment_entry = match segment {
-            LockedSegment::Original(segment) => segment,
-            LockedSegment::Proxy(_) => return None,
-        };
-        let read_segment = segment_entry.read();
-
-        let littered_ratio =
-            read_segment.deleted_point_count() as f64 / read_segment.total_point_count() as f64;
-        let is_big = read_segment.total_point_count() >= self.min_vectors_number;
-        let is_littered = littered_ratio > self.deleted_threshold;
-
-        (is_big && is_littered).then_some(littered_ratio)
-    }
-
-    /// Calculate littered ratio for segment on vector index level
-    ///
-    /// If a segment has multiple named vectors, it checks each one.
-    /// We are only interested in indexed vectors, as they are the ones affected by soft-deletes.
-    ///
-    /// This finds the maximum deletion ratio for a named vector. The ratio is based on the number
-    /// of deleted vectors versus the number of indexed vector.s
-    ///
-    /// Returns `None` if littered ratio did not reach vacuum thresholds for no named vectors.
-    fn littered_vectors_index_ratio(&self, segment: &LockedSegment) -> Option<f64> {
-        {
-            let segment_entry = segment.get();
-            let read_segment = segment_entry.read();
-
-            // Never optimize special segments
-            if read_segment.segment_type() == SegmentType::Special {
-                return None;
-            }
-
-            // Segment must have any index
-            let segment_config = read_segment.config();
-            if !segment_config.is_any_vector_indexed() {
-                return None;
-            }
-        }
-
-        // We can only work with original segments
-        let real_segment = match segment {
-            LockedSegment::Original(segment) => segment.read(),
-            LockedSegment::Proxy(_) => return None,
-        };
-
-        // In this segment, check the index of each named vector for a high deletion ratio.
-        // Return the worst ratio.
-        real_segment
-            .vector_data
-            .values()
-            .filter(|vector_data| vector_data.vector_index.borrow().is_index())
-            .filter_map(|vector_data| {
-                // We use the number of now available vectors against the number of indexed vectors
-                // to determine how many are soft-deleted from the index.
-                let vector_index = vector_data.vector_index.borrow();
-                let vector_storage = vector_data.vector_storage.borrow();
-                let indexed_vector_count = vector_index.indexed_vector_count();
-                let deleted_from_index =
-                    indexed_vector_count.saturating_sub(vector_storage.available_vector_count());
-                let deleted_ratio = if indexed_vector_count != 0 {
-                    deleted_from_index as f64 / indexed_vector_count as f64
-                } else {
-                    0.0
-                };
-
-                let reached_minimum = deleted_from_index >= self.min_vectors_number;
-                let reached_ratio = deleted_ratio > self.deleted_threshold;
-                (reached_minimum && reached_ratio).then_some(deleted_ratio)
-            })
-            .max_by_key(|ratio| OrderedFloat(*ratio))
-    }
-}
-
-impl SegmentOptimizer for VacuumOptimizer {
-    fn name(&self) -> &str {
-        "vacuum"
-    }
-
-    fn segments_path(&self) -> &Path {
-        self.segments_path.as_path()
-    }
-
-    fn temp_path(&self) -> &Path {
-        self.collection_temp_dir.as_path()
-    }
-
-    fn collection_params(&self) -> CollectionParams {
-        self.collection_params.clone()
-    }
-
-    fn hnsw_config(&self) -> &HnswConfig {
-        &self.hnsw_config
-    }
-
-    fn quantization_config(&self) -> Option<QuantizationConfig> {
-        self.quantization_config.clone()
-    }
-
-    fn threshold_config(&self) -> &OptimizerThresholds {
-        &self.thresholds_config
-    }
-
-    fn check_condition(
-        &self,
-        segments: LockedSegmentHolder,
-        excluded_ids: &HashSet<SegmentId>,
-    ) -> Vec<SegmentId> {
-        self.worst_segment(segments, excluded_ids)
-            .into_iter()
-            .collect()
-    }
-
-    fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
-        &self.telemetry_durations_aggregator
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    use common::budget::ResourceBudget;
-    use common::counter::hardware_counter::HardwareCounterCell;
-    use itertools::Itertools;
-    use parking_lot::RwLock;
-    use segment::entry::entry_point::SegmentEntry;
-    use segment::index::hnsw_index::num_rayon_threads;
-    use segment::payload_json;
-    use segment::types::{Distance, PayloadContainer, PayloadSchemaType, VectorName};
-    use serde_json::Value;
-    use tempfile::Builder;
-
-    use super::*;
-    use crate::collection_manager::fixtures::{random_multi_vec_segment, random_segment};
-    use crate::collection_manager::holders::segment_holder::SegmentHolder;
-    use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
-    use crate::operations::types::VectorsConfig;
-    use crate::operations::vector_params_builder::VectorParamsBuilder;
-
-    const VECTOR1_NAME: &VectorName = "vector1";
-    const VECTOR2_NAME: &VectorName = "vector2";
 
     #[test]
     fn test_vacuum_conditions() {
@@ -244,13 +102,13 @@ mod tests {
 
         let hw_counter = HardwareCounterCell::new();
 
-        let original_segment_path = match segment {
-            LockedSegment::Original(s) => s.read().current_path.clone(),
+        let original_segment = match segment {
+            LockedSegment::Original(s) => s,
             LockedSegment::Proxy(_) => panic!("Not expected"),
         };
+        let original_segment_path = original_segment.read().segment_path.clone();
 
-        let segment_points_to_delete = segment
-            .get()
+        let segment_points_to_delete = original_segment
             .read()
             .iter_points()
             .enumerate()
@@ -265,16 +123,14 @@ mod tests {
                 .unwrap();
         }
 
-        let segment_points_to_assign1 = segment
-            .get()
+        let segment_points_to_assign1 = original_segment
             .read()
             .iter_points()
             .enumerate()
             .filter_map(|(i, point_id)| (i % 20 == 0).then_some(point_id))
             .collect_vec();
 
-        let segment_points_to_assign2 = segment
-            .get()
+        let segment_points_to_assign2 = original_segment
             .read()
             .iter_points()
             .enumerate()
@@ -309,15 +165,16 @@ mod tests {
                 .unwrap();
         }
 
-        let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+        let locked_holder = LockedSegmentHolder::new(holder);
 
-        let vacuum_optimizer = VacuumOptimizer::new(
+        let vacuum_optimizer = new_vacuum_optimizer(
             0.2,
             50,
             OptimizerThresholds {
                 max_segment_size_kb: 1000000,
                 memmap_threshold_kb: 1000000,
                 indexing_threshold_kb: 1000000,
+                deferred_internal_id: None,
             },
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
@@ -326,31 +183,19 @@ mod tests {
                 ..CollectionParams::empty()
             },
             Default::default(),
+            HnswGlobalConfig::default(),
             Default::default(),
         );
 
-        let suggested_to_optimize =
-            vacuum_optimizer.check_condition(locked_holder.clone(), &Default::default());
+        let suggested_to_optimize = vacuum_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
 
         // Check that only one segment is selected for optimization
         assert_eq!(suggested_to_optimize.len(), 1);
 
-        let permit_cpu_count = num_rayon_threads(0);
-        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
-        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
+        vacuum_optimizer.optimize_for_test(locked_holder.clone(), suggested_to_optimize);
 
-        vacuum_optimizer
-            .optimize(
-                locked_holder.clone(),
-                suggested_to_optimize,
-                permit,
-                budget.clone(),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-
-        let after_optimization_segments =
-            locked_holder.read().iter().map(|(x, _)| *x).collect_vec();
+        let after_optimization_segments = locked_holder.read().iter().map(|(x, _)| x).collect_vec();
 
         // Check only one new segment
         assert_eq!(after_optimization_segments.len(), 1);
@@ -411,6 +256,7 @@ mod tests {
             max_segment_size_kb: usize::MAX,
             memmap_threshold_kb: usize::MAX,
             indexing_threshold_kb: 10,
+            deferred_internal_id: None,
         };
         let collection_params = CollectionParams {
             vectors: VectorsConfig::Multi(BTreeMap::from([
@@ -451,7 +297,7 @@ mod tests {
             .unwrap();
 
         let mut segment_id = holder.add_new(segment);
-        let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+        let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config = HnswConfig {
             m: 16,
@@ -460,23 +306,21 @@ mod tests {
             max_indexing_threads: 0,
             on_disk: None,
             payload_m: None,
+            inline_storage: None,
         };
 
-        let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
-        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
-
         // Optimizers used in test
-        let index_optimizer = IndexingOptimizer::new(
+        let index_optimizer = new_indexing_optimizer(
             2,
             thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
-            hnsw_config.clone(),
+            hnsw_config,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
-        let vacuum_optimizer = VacuumOptimizer::new(
+        let vacuum_optimizer = new_vacuum_optimizer(
             0.2,
             5,
             thresholds_config,
@@ -484,19 +328,12 @@ mod tests {
             temp_dir.path().to_owned(),
             collection_params,
             hnsw_config,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
 
         // Use indexing optimizer to build index for vacuum index test
-        let changed = index_optimizer
-            .optimize(
-                locked_holder.clone(),
-                vec![segment_id],
-                permit,
-                budget.clone(),
-                &false.into(),
-            )
-            .unwrap();
+        let changed = index_optimizer.optimize_for_test(locked_holder.clone(), vec![segment_id]);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
@@ -505,22 +342,15 @@ mod tests {
         assert_eq!(locked_holder.read().len(), 2, "index must be built");
 
         // Update working segment ID
-        segment_id = *locked_holder
+        segment_id = locked_holder
             .read()
-            .iter()
-            .find(|(_, segment)| {
-                let segment = match segment {
-                    LockedSegment::Original(s) => s.read(),
-                    LockedSegment::Proxy(_) => unreachable!(),
-                };
-                segment.total_point_count() > 0
-            })
+            .iter_original()
+            .find(|(_, segment)| segment.read().total_point_count() > 0)
             .unwrap()
             .0;
 
         // Vacuum optimizer should not optimize yet, no points/vectors have been deleted
-        let suggested_to_optimize =
-            vacuum_optimizer.check_condition(locked_holder.clone(), &Default::default());
+        let suggested_to_optimize = vacuum_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(suggested_to_optimize.len(), 0);
 
         // Delete some points and vectors
@@ -550,6 +380,7 @@ mod tests {
 
                 let vector1_vecs_to_delete = id_tracker
                     .borrow()
+                    .point_mappings()
                     .iter_external()
                     .enumerate()
                     .filter_map(|(i, point_id)| (i % 4 == 0).then_some(point_id))
@@ -568,6 +399,7 @@ mod tests {
 
                 let vector2_vecs_to_delete = id_tracker
                     .borrow()
+                    .point_mappings()
                     .iter_external()
                     .enumerate()
                     .filter_map(|(i, point_id)| (i % 10 == 7).then_some(point_id))
@@ -582,11 +414,8 @@ mod tests {
         // Ensure deleted points and vectors are stored properly before optimizing
         locked_holder
             .read()
-            .iter()
-            .map(|(_, segment)| match segment {
-                LockedSegment::Original(s) => s.read(),
-                LockedSegment::Proxy(_) => unreachable!(),
-            })
+            .iter_original()
+            .map(|(_, segment)| segment.read())
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 // We should still have all points
@@ -600,29 +429,18 @@ mod tests {
             });
 
         // Run vacuum index optimizer, make sure it optimizes properly
-        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
-        let suggested_to_optimize =
-            vacuum_optimizer.check_condition(locked_holder.clone(), &Default::default());
+        let suggested_to_optimize = vacuum_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
         assert_eq!(suggested_to_optimize.len(), 1);
-        let changed = vacuum_optimizer
-            .optimize(
-                locked_holder.clone(),
-                suggested_to_optimize,
-                permit,
-                budget.clone(),
-                &false.into(),
-            )
-            .unwrap();
+        let changed =
+            vacuum_optimizer.optimize_for_test(locked_holder.clone(), suggested_to_optimize);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure deleted points and vectors are optimized
         locked_holder
             .read()
-            .iter()
-            .map(|(_, segment)| match segment {
-                LockedSegment::Original(s) => s.read(),
-                LockedSegment::Proxy(_) => unreachable!(),
-            })
+            .iter_original()
+            .map(|(_, segment)| segment.read())
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 // We should have deleted some points

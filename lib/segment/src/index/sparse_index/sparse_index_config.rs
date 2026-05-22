@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use io::file_operations::{atomic_save_json, read_json};
+use common::fs::{atomic_save_json, read_json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,14 @@ impl SparseIndexType {
 
     pub fn is_persisted(self) -> bool {
         self == Self::Mmap || self == Self::ImmutableRam
+    }
+
+    pub fn from_on_disk(on_disk: bool) -> Self {
+        if on_disk {
+            Self::Mmap
+        } else {
+            Self::MutableRam
+        }
     }
 }
 

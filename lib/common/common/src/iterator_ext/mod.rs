@@ -1,12 +1,20 @@
 #[cfg(any(test, feature = "testing"))]
 use std::fmt::Debug;
+use std::sync::atomic::AtomicBool;
 
 use check_stopped::CheckStopped;
 use on_final_count::OnFinalCount;
 
+use crate::iterator_ext::stoppable_iter::StoppableIter;
+
 pub(super) mod on_final_count;
 
 mod check_stopped;
+mod fallible;
+pub mod ordering_iterator;
+pub mod stoppable_iter;
+
+pub use fallible::{FallibleIteratorExt, TransposeResultIter};
 
 pub trait IteratorExt: Iterator {
     /// Periodically check if the iteration should be stopped.
@@ -19,15 +27,13 @@ pub trait IteratorExt: Iterator {
         CheckStopped::new(self, every, f)
     }
 
-    /// Periodically check if the iteration should be stopped.
-    /// The closure `f` is called every 500 iterations, and should return `true` if the iteration should be stopped.
+    /// Stops the iterator if `is_stopped` is set to true
     #[inline]
-    fn check_stop<F>(self, f: F) -> CheckStopped<Self, F>
+    fn stop_if<'a>(self, is_stopped: &'a AtomicBool) -> StoppableIter<'a, Self>
     where
-        F: Fn() -> bool,
         Self: Sized,
     {
-        self.check_stop_every(500, f)
+        StoppableIter::new(self, is_stopped)
     }
 
     /// Will execute the callback when the iterator is dropped.
@@ -42,6 +48,30 @@ pub trait IteratorExt: Iterator {
         Self: Sized,
     {
         OnFinalCount::new(self, f)
+    }
+
+    /// Consume the iterator and call `black_box` on each item, for benchmarking purposes.
+    fn black_box(self)
+    where
+        Self: Sized,
+    {
+        self.for_each(|p| {
+            std::hint::black_box(p);
+        });
+    }
+
+    /// [`Iterator::any()`] but for fallible predicates.
+    fn try_any<F, E>(&mut self, mut f: F) -> Result<bool, E>
+    where
+        F: FnMut(Self::Item) -> Result<bool, E>,
+        Self: Sized,
+    {
+        self.find_map(|item| match f(item) {
+            Ok(true) => Some(Ok(true)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .unwrap_or(Ok(false))
     }
 }
 
@@ -111,4 +141,27 @@ pub fn check_exact_size_iterator_len<I: ExactSizeIterator>(mut iter: I) {
     }
     assert!(iter.next().is_none());
     assert_eq!(iter.len(), 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_any() {
+        let is_even = |n: i32| match n {
+            n if n < 0 => Err("negative"),
+            n => Ok(n % 2 == 0),
+        };
+
+        assert_eq!([1, 3, 4, 5].into_iter().try_any(is_even), Ok(true));
+        assert_eq!([1, 3, 5, 7].into_iter().try_any(is_even), Ok(false));
+        assert_eq!(std::iter::empty().try_any(is_even), Ok(false));
+        assert_eq!([1, 3, -1, 4].into_iter().try_any(is_even), Err("negative"));
+
+        // Short-circuits on first `Ok(true)` without evaluating the rest.
+        let mut iter = [1, 2, 3, -1].into_iter();
+        assert_eq!(iter.try_any(is_even), Ok(true));
+        assert_eq!(iter.next(), Some(3));
+    }
 }

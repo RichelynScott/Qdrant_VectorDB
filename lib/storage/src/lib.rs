@@ -10,6 +10,9 @@ use content_manager::errors::StorageError;
 use content_manager::toc::TableOfContent;
 use types::ClusterStatus;
 
+pub mod audit;
+pub mod audit_reader;
+mod common;
 pub mod content_manager;
 pub mod dispatcher;
 pub mod issues_subscribers;
@@ -31,7 +34,7 @@ pub mod serialize_peer_addresses {
         let addresses: HashMap<u64, String> = addresses
             .clone()
             .into_iter()
-            .map(|(id, address)| (id, format!("{address}")))
+            .map(|(id, address)| (id, address.to_string()))
             .collect();
         addresses.serialize(serializer)
     }

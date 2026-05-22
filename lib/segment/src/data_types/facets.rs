@@ -1,6 +1,9 @@
+use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::hash::Hash;
 
+use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -9,12 +12,13 @@ use validator::Validate;
 use crate::json_path::JsonPath;
 use crate::types::{Filter, IntPayloadType, UuidIntType, ValueVariants};
 
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize, Validate)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize, Validate, Hash)]
 pub struct FacetParams {
     pub key: JsonPath,
 
     #[validate(range(min = 1))]
     pub limit: usize,
+    #[validate(nested)]
     pub filter: Option<Filter>,
     #[serde(default)]
     pub exact: bool,
@@ -27,38 +31,55 @@ impl FacetParams {
 
 #[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum FacetValueRef<'a> {
-    Keyword(&'a str),
-    Int(&'a IntPayloadType),
-    Uuid(&'a u128),
+    Keyword(Cow<'a, str>),
+    Int(IntPayloadType),
+    Uuid(UuidIntType),
     Bool(bool),
 }
 
 impl FacetValueRef<'_> {
     pub fn to_owned(&self) -> FacetValue {
         match self {
-            FacetValueRef::Keyword(s) => FacetValue::Keyword((*s).to_string()),
-            FacetValueRef::Int(i) => FacetValue::Int(**i),
-            FacetValueRef::Uuid(uuid) => FacetValue::Uuid(**uuid),
-            FacetValueRef::Bool(b) => FacetValue::Bool(*b),
+            FacetValueRef::Keyword(str) => FacetValue::Keyword(str.to_string()),
+            &FacetValueRef::Int(int) => FacetValue::Int(int),
+            &FacetValueRef::Uuid(uuid) => FacetValue::Uuid(uuid),
+            &FacetValueRef::Bool(bool) => FacetValue::Bool(bool),
         }
     }
 }
 
+impl<'a> From<Cow<'a, str>> for FacetValueRef<'a> {
+    fn from(str: Cow<'a, str>) -> Self {
+        FacetValueRef::Keyword(str)
+    }
+}
+
 impl<'a> From<&'a str> for FacetValueRef<'a> {
-    fn from(s: &'a str) -> Self {
-        FacetValueRef::Keyword(s)
+    fn from(str: &'a str) -> Self {
+        FacetValueRef::Keyword(Cow::Borrowed(str))
     }
 }
 
-impl<'a> From<&'a IntPayloadType> for FacetValueRef<'a> {
-    fn from(i: &'a IntPayloadType) -> Self {
-        FacetValueRef::Int(i)
+impl<'a> From<Cow<'_, IntPayloadType>> for FacetValueRef<'a> {
+    fn from(int: Cow<'_, IntPayloadType>) -> Self {
+        FacetValueRef::Int(int.into_owned())
     }
 }
 
-impl<'a> From<&'a UuidIntType> for FacetValueRef<'a> {
-    fn from(uuid: &'a UuidIntType) -> Self {
-        FacetValueRef::Uuid(uuid)
+impl<'a> From<&IntPayloadType> for FacetValueRef<'a> {
+    fn from(int: &IntPayloadType) -> Self {
+        FacetValueRef::Int(*int)
+    }
+}
+impl<'a> From<Cow<'_, UuidIntType>> for FacetValueRef<'a> {
+    fn from(uuid: Cow<'_, UuidIntType>) -> Self {
+        FacetValueRef::Uuid(uuid.into_owned())
+    }
+}
+
+impl<'a> From<&'_ UuidIntType> for FacetValueRef<'a> {
+    fn from(uuid: &'_ UuidIntType) -> Self {
+        FacetValueRef::Uuid(*uuid)
     }
 }
 
@@ -68,8 +89,7 @@ pub enum FacetValue {
     Int(IntPayloadType),
     Uuid(UuidIntType),
     Bool(bool),
-    // other types to add?
-    // Bool(bool),
+    // TODO: Other types to add?
     // FloatRange(FloatRange),
 }
 
@@ -86,8 +106,24 @@ pub struct FacetHit<T: FacetValueTrait> {
     pub count: usize,
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct FacetResponse {
     pub hits: Vec<FacetValueHit>,
+}
+
+impl FacetResponse {
+    /// Convert a count map to top `limit` hits sorted by count descending.
+    ///
+    /// Shared utility used by Edge and Collection facet implementations.
+    pub fn top_hits(counts: HashMap<FacetValue, usize>, limit: usize) -> Self {
+        let hits = counts
+            .into_iter()
+            .map(|(value, count)| FacetValueHit { value, count })
+            .k_largest(limit)
+            .collect();
+
+        Self { hits }
+    }
 }
 
 impl<T: FacetValueTrait> Ord for FacetHit<T> {

@@ -4,12 +4,13 @@ use common::validation::validate_multi_vector;
 use segment::index::query_optimization::rescore_formula::parsed_formula::VariableId;
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use super::schema::BatchVectorStruct;
+use super::schema::validate_non_empty_dense;
 use super::{
-    Batch, ContextInput, FormulaQuery, Fusion, OrderByInterface, PointVectors, Query,
-    QueryInterface, RecommendInput, Sample, VectorInput,
+    Batch, BatchVectorStruct, ContextInput, Expression, FormulaQuery, Fusion, NamedVectorStruct,
+    PointVectors, Query, QueryInterface, RecommendInput, RelevanceFeedbackInput, Sample,
+    VectorInput,
 };
-use crate::rest::NamedVectorStruct;
+use crate::rest::FeedbackStrategy;
 
 impl Validate for NamedVectorStruct {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
@@ -33,14 +34,16 @@ impl Validate for QueryInterface {
 impl Validate for Query {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
-            Query::Nearest(vector) => vector.nearest.validate(),
-            Query::Recommend(recommend) => recommend.recommend.validate(),
-            Query::Discover(discover) => discover.discover.validate(),
-            Query::Context(context) => context.context.validate(),
-            Query::Fusion(fusion) => fusion.fusion.validate(),
+            Query::Nearest(vector) => vector.validate(),
+            Query::Recommend(recommend) => recommend.validate(),
+            Query::Discover(discover) => discover.validate(),
+            Query::Context(context) => context.validate(),
+            Query::Fusion(fusion) => fusion.validate(),
+            Query::Rrf(rrf) => rrf.validate(),
             Query::Formula(formula) => formula.validate(),
-            Query::OrderBy(order_by) => order_by.order_by.validate(),
-            Query::Sample(sample) => sample.sample.validate(),
+            Query::OrderBy(order_by) => order_by.validate(),
+            Query::Sample(sample) => sample.validate(),
+            Query::RelevanceFeedback(feedback) => feedback.validate(),
         }
     }
 }
@@ -61,8 +64,8 @@ impl Validate for VectorInput {
 
 impl Validate for RecommendInput {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        let no_positives = self.positive.as_ref().map(|p| p.is_empty()).unwrap_or(true);
-        let no_negatives = self.negative.as_ref().map(|n| n.is_empty()).unwrap_or(true);
+        let no_positives = self.positive.as_ref().is_none_or(|p| p.is_empty());
+        let no_negatives = self.negative.as_ref().is_none_or(|n| n.is_empty());
 
         if no_positives && no_negatives {
             let mut errors = validator::ValidationErrors::new();
@@ -93,6 +96,15 @@ impl Validate for ContextInput {
     }
 }
 
+impl Validate for FeedbackStrategy {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            FeedbackStrategy::Naive(simple_feedback_strategy) => {
+                simple_feedback_strategy.validate()
+            }
+        }
+    }
+}
 impl Validate for Fusion {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
@@ -103,12 +115,10 @@ impl Validate for Fusion {
 
 impl Validate for FormulaQuery {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        let Self {
-            // Formula validation will happen when parsing
-            formula: _formula,
-            defaults,
-        } = self;
+        let Self { formula, defaults } = self;
 
+        // validate formula Expression
+        formula.validate()?;
         let mut errors = validator::ValidationErrors::new();
 
         for (key, value) in defaults.iter() {
@@ -127,20 +137,11 @@ impl Validate for FormulaQuery {
                     let validation = ValidationError::new("Score default must be a number");
                     errors.add("defaults", validation);
                 }
-                _ => (),
+                VariableId::Score(_) | VariableId::Payload(_) | VariableId::Condition(_) => (),
             }
         }
 
         Ok(())
-    }
-}
-
-impl Validate for OrderByInterface {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            OrderByInterface::Key(_key) => Ok(()), // validated during parsing
-            OrderByInterface::Struct(order_by) => order_by.validate(),
-        }
     }
 }
 
@@ -155,7 +156,12 @@ impl Validate for Sample {
 impl Validate for BatchVectorStruct {
     fn validate(&self) -> Result<(), ValidationErrors> {
         match self {
-            BatchVectorStruct::Single(_) => Ok(()),
+            BatchVectorStruct::Single(vectors) => {
+                for vector in vectors {
+                    validate_non_empty_dense(vector)?;
+                }
+                Ok(())
+            }
             BatchVectorStruct::MultiDense(vectors) => {
                 for vector in vectors {
                     validate_multi_vector(vector)?;
@@ -221,14 +227,14 @@ impl Validate for Batch {
             BatchVectorStruct::Image(_) => {}
             BatchVectorStruct::Object(_) => {}
         }
-        if let Some(payload_vector) = &batch.payloads {
-            if payload_vector.len() != batch.ids.len() {
-                return Err(create_error(format!(
-                    "number of ids and payloads must be equal ({} != {})",
-                    batch.ids.len(),
-                    payload_vector.len(),
-                )));
-            }
+        if let Some(payload_vector) = &batch.payloads
+            && payload_vector.len() != batch.ids.len()
+        {
+            return Err(create_error(format!(
+                "number of ids and payloads must be equal ({} != {})",
+                batch.ids.len(),
+                payload_vector.len(),
+            )));
         }
         Ok(())
     }
@@ -247,4 +253,43 @@ impl Validate for PointVectors {
             self.vector.validate()
         }
     }
+}
+
+impl Validate for Expression {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            Expression::Constant(_) => Ok(()),
+            Expression::Variable(_) => Ok(()),
+            Expression::Condition(condition) => condition.validate(),
+            Expression::GeoDistance(_) => Ok(()),
+            Expression::Datetime(_) => Ok(()),
+            Expression::DatetimeKey(_) => Ok(()),
+            Expression::Mult(mult_expression) => mult_expression.validate(),
+            Expression::Sum(sum_expression) => sum_expression.validate(),
+            Expression::Neg(neg_expression) => neg_expression.validate(),
+            Expression::Abs(abs_expression) => abs_expression.validate(),
+            Expression::Div(div_expression) => div_expression.validate(),
+            Expression::Sqrt(sqrt_expression) => sqrt_expression.validate(),
+            Expression::Pow(pow_expression) => pow_expression.validate(),
+            Expression::Exp(exp_expression) => exp_expression.validate(),
+            Expression::Log10(log10_expression) => log10_expression.validate(),
+            Expression::Ln(ln_expression) => ln_expression.validate(),
+            Expression::LinDecay(lin_decay_expression) => lin_decay_expression.validate(),
+            Expression::ExpDecay(exp_decay_expression) => exp_decay_expression.validate(),
+            Expression::GaussDecay(gauss_decay_expression) => gauss_decay_expression.validate(),
+        }
+    }
+}
+
+/// Struct level validation for `FeedbackInput`
+pub fn validate_relevance_feedback_input(
+    relevance_feedback_input: &RelevanceFeedbackInput,
+) -> Result<(), ValidationError> {
+    if relevance_feedback_input.feedback.is_empty() {
+        let mut err = ValidationError::new("feedback");
+        err.message = Some(Cow::from("feedback elements must be non-empty"));
+        return Err(err);
+    }
+
+    Ok(())
 }

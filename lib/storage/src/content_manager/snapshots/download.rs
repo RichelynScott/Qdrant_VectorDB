@@ -1,16 +1,17 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use collection::common::sha_256::hash_file;
 use common::tempfile_ext::MaybeTempPath;
-use futures::StreamExt;
 use reqwest;
+use shard::snapshots::snapshot_data::SnapshotData;
 use tap::Tap;
-use tempfile::TempPath;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tempfile::TempDir;
 use url::Url;
 
 use crate::StorageError;
+use crate::content_manager::snapshots::download_result::DownloadResult;
+use crate::content_manager::snapshots::download_tar::download_and_unpack_tar;
 
 fn snapshot_prefix(url: &Url) -> OsString {
     Path::new(url.path())
@@ -19,57 +20,75 @@ fn snapshot_prefix(url: &Url) -> OsString {
         .unwrap_or_default()
 }
 
-/// Download a remote file from `url` to `path`
+/// Download and unpack a snapshot from `url` into a temporary directory.
 ///
-/// Returns a `TempPath` that will delete the downloaded file once it is dropped.
-/// To persist the file, use `download_file(...).keep()`.
-#[must_use = "returns a TempPath, if dropped the downloaded file is deleted"]
-async fn download_file(
+/// Returns a `TempDir` that will delete the downloaded file once it is dropped.
+/// To persist the file, use [`keep()`](TempDir::keep).
+#[must_use = "returns a TempDir, if dropped the downloaded file is deleted"]
+async fn _download_snapshot(
     client: &reqwest::Client,
     url: &Url,
     dir_path: &Path,
-) -> Result<TempPath, StorageError> {
-    let (file, temp_path) = tempfile::Builder::new()
-        .prefix(&snapshot_prefix(url))
+    compute_checksum: bool,
+) -> Result<(TempDir, Option<String>), StorageError> {
+    let download_start_time = tokio::time::Instant::now();
+
+    let snapshot_name = snapshot_prefix(url);
+
+    let tempdir = tempfile::Builder::new()
+        .prefix(&snapshot_name)
         .suffix(".download")
-        .tempfile_in(dir_path)?
-        .into_parts();
+        .tempdir_in(dir_path)?;
 
-    log::debug!("Downloading snapshot from {url} to {temp_path:?}");
+    let hash = download_and_unpack_tar(client, url, tempdir.path(), compute_checksum).await?;
 
-    let mut file = File::from_std(file);
+    let download_duration = download_start_time.elapsed();
+    log::debug!(
+        "Snapshot download completed: path={tempdir:?}, duration={:.2}s",
+        download_duration.as_secs_f64(),
+    );
 
-    let response = client.get(url.clone()).send().await?;
+    Ok((tempdir, hash))
+}
 
-    if !response.status().is_success() {
-        return Err(StorageError::bad_input(format!(
-            "Failed to download snapshot from {}: status - {}",
-            url,
-            response.status()
+/// Validate that the given path is within the allowed snapshots directory.
+///
+/// Canonicalizes both paths to resolve symlinks and `..` components,
+/// then checks that `path` is a descendant of `allowed_dir`.
+fn validate_snapshot_path(path: &Path, allowed_dir: &Path) -> Result<PathBuf, StorageError> {
+    let canonical_path = fs_err::canonicalize(path).map_err(|err| {
+        StorageError::bad_request(format!("Failed to resolve snapshot path {path:?}: {err}"))
+    })?;
+
+    let canonical_allowed = fs_err::canonicalize(allowed_dir).map_err(|err| {
+        StorageError::service_error(format!(
+            "Failed to resolve snapshots directory {allowed_dir:?}: {err}"
+        ))
+    })?;
+
+    if !canonical_path.starts_with(&canonical_allowed) {
+        return Err(StorageError::forbidden(format!(
+            "Snapshot file path must be inside the snapshots directory {canonical_allowed:?}",
         )));
     }
 
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        file.write_all(&chunk).await?;
-    }
-
-    file.flush().await?;
-
-    Ok(temp_path)
+    Ok(canonical_path)
 }
 
 /// Download a snapshot from the given URI.
 ///
-/// May returen a `TempPath` if a file was downloaded from a remote source. If it is dropped the
-/// downloaded file is deleted automatically. To keep the file `keep()` may be used.
+/// Returns a `DownloadResult` containing the snapshot data and optional checksum.
+///
+/// For `file://` URLs, `snapshots_path` is used to validate that the referenced file
+/// is within the snapshots directory. For `http`/`https` URLs, `download_dir` is used
+/// as the temporary download location.
 pub async fn download_snapshot(
     client: &reqwest::Client,
     url: Url,
-    snapshots_dir: &Path,
-) -> Result<MaybeTempPath, StorageError> {
+    download_dir: &Path,
+    snapshots_path: &Path,
+    compute_checksum: bool,
+) -> Result<DownloadResult, StorageError> {
     match url.scheme() {
         "file" => {
             let local_path = url.to_file_path().map_err(|_| {
@@ -82,15 +101,32 @@ pub async fn download_snapshot(
                     "Snapshot file {local_path:?} does not exist"
                 )));
             }
-            Ok(MaybeTempPath::Persistent(local_path))
+
+            // Restrict file:// URLs to the snapshots directory
+            let local_path = validate_snapshot_path(&local_path, snapshots_path)?;
+
+            let hash = if compute_checksum {
+                Some(hash_file(&local_path).await?)
+            } else {
+                None
+            };
+
+            Ok(DownloadResult {
+                snapshot: SnapshotData::Packed(MaybeTempPath::Persistent(local_path)),
+                hash,
+            })
         }
-        "http" | "https" => Ok(MaybeTempPath::Temporary(
-            download_file(client, &url, snapshots_dir).await?,
-        )),
+        "http" | "https" => {
+            let (snapshot_dir, hash) =
+                _download_snapshot(client, &url, download_dir, compute_checksum).await?;
+            Ok(DownloadResult {
+                snapshot: SnapshotData::Unpacked(snapshot_dir),
+                hash,
+            })
+        }
         _ => Err(StorageError::bad_request(format!(
-            "URL {} with schema {} is not supported",
-            url,
-            url.scheme()
+            "URL {url} with scheme {} is not supported",
+            url.scheme(),
         ))),
     }
 }

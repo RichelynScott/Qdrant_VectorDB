@@ -3,17 +3,20 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use api::grpc::HardwareUsage;
 use api::grpc::qdrant::points_internal_server::PointsInternal;
 use api::grpc::qdrant::{
     ClearPayloadPointsInternal, CoreSearchBatchPointsInternal, CountPointsInternal, CountResponse,
-    CreateFieldIndexCollectionInternal, DeleteFieldIndexCollectionInternal,
-    DeletePayloadPointsInternal, DeletePointsInternal, DeleteVectorsInternal, FacetCountsInternal,
-    FacetResponseInternal, GetPointsInternal, GetResponse, IntermediateResult,
-    PointsOperationResponseInternal, QueryBatchPointsInternal, QueryBatchResponseInternal,
-    QueryResultInternal, QueryShardPoints, RecommendPointsInternal, RecommendResponse,
-    ScrollPointsInternal, ScrollResponse, SearchBatchResponse, SetPayloadPointsInternal,
-    SyncPointsInternal, UpdateVectorsInternal, UpsertPointsInternal,
+    CreateFieldIndexCollectionInternal, CreateVectorNameInternal,
+    DeleteFieldIndexCollectionInternal, DeletePayloadPointsInternal, DeletePointsInternal,
+    DeleteVectorNameInternal, DeleteVectorsInternal, FacetCountsInternal, FacetResponseInternal,
+    GetPointsInternal, GetResponse, IntermediateResult, PointsOperationResponseInternal,
+    QueryBatchPointsInternal, QueryBatchResponseInternal, QueryResultInternal, QueryShardPoints,
+    RecommendPointsInternal, RecommendResponse, ScrollPointsInternal, ScrollResponse,
+    SearchBatchResponse, SetPayloadPointsInternal, SyncPointsInternal, UpdateBatchInternal,
+    UpdateVectorsInternal, UpsertPointsInternal,
 };
+use api::grpc::update_operation::Update;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::universal_query::shard_query::ShardQueryRequest;
 use collection::shards::shard::ShardId;
@@ -24,20 +27,25 @@ use segment::json_path::JsonPath;
 use segment::types::Filter;
 use storage::content_manager::toc::TableOfContent;
 use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
-use storage::rbac::Access;
+use storage::rbac::Auth;
 use tonic::{Request, Response, Status};
 
 use super::query_common::*;
 use super::update_common::*;
 use super::validate_and_log;
-use crate::common::inference::extract_token;
+use crate::common::inference::api_keys::extract_inference_auth;
+use crate::common::inference::params::InferenceParams;
+use crate::common::strict_mode::*;
 use crate::common::update::InternalUpdateParams;
 use crate::settings::ServiceConfig;
-use crate::tonic::verification::{StrictModeCheckedInternalTocProvider, UncheckedTocProvider};
-
-const FULL_ACCESS: Access = Access::full("Internal API");
+use crate::tonic::auth::extract_auth;
 
 /// This API is intended for P2P communication within a distributed deployment.
+///
+/// Note: unlike the public `PointsService`, this service does NOT attach
+/// `CollectionName` to gRPC responses. Internal endpoints
+/// (`/qdrant.PointsInternal/…`) are not in `GRPC_ENDPOINT_WHITELIST`, so
+/// attaching a collection name would have no effect on `/metrics` output.
 pub struct PointsInternalService {
     toc: Arc<TableOfContent>,
     service_config: ServiceConfig,
@@ -49,6 +57,343 @@ impl PointsInternalService {
             toc,
             service_config,
         }
+    }
+
+    async fn sync_internal(
+        &self,
+        sync_points_internal: SyncPointsInternal,
+        auth: Auth,
+        inference_params: InferenceParams,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let SyncPointsInternal {
+            sync_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = sync_points_internal;
+
+        let sync_points = extract_internal_request(sync_points)?;
+
+        // Exclude the `inference_usage` for internal call
+        let (response, _inference_usage) = sync(
+            self.toc.clone(),
+            sync_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            inference_params,
+        )
+        .await?
+        .into_inner();
+
+        Ok(Response::new(response))
+    }
+
+    async fn upsert_internal(
+        &self,
+        upsert_points_internal: UpsertPointsInternal,
+        auth: Auth,
+        inference_params: InferenceParams,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let UpsertPointsInternal {
+            upsert_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = upsert_points_internal;
+
+        let upsert_points = extract_internal_request(upsert_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            upsert_points.collection_name.clone(),
+        );
+
+        upsert(
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
+            upsert_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            inference_params.clone(),
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn delete_internal(
+        &self,
+        delete_points_internal: DeletePointsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let DeletePointsInternal {
+            delete_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = delete_points_internal;
+
+        let delete_points = extract_internal_request(delete_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            delete_points.collection_name.clone(),
+        );
+
+        delete(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            delete_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn update_vectors_internal(
+        &self,
+        update_vectors_internal: UpdateVectorsInternal,
+        auth: Auth,
+        inference_params: InferenceParams,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let UpdateVectorsInternal {
+            update_vectors,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = update_vectors_internal;
+
+        let update_point_vectors = extract_internal_request(update_vectors)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            update_point_vectors.collection_name.clone(),
+        );
+
+        crate::tonic::api::update_common::update_vectors(
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
+            update_point_vectors,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            inference_params.clone(),
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn delete_vectors_internal(
+        &self,
+        delete_vectors_internal: DeleteVectorsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let DeleteVectorsInternal {
+            delete_vectors,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = delete_vectors_internal;
+
+        let delete_point_vectors = extract_internal_request(delete_vectors)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            delete_point_vectors.collection_name.clone(),
+        );
+
+        crate::tonic::api::update_common::delete_vectors(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            delete_point_vectors,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn set_payload_internal(
+        &self,
+        set_payload_internal: SetPayloadPointsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let SetPayloadPointsInternal {
+            set_payload_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = set_payload_internal;
+
+        let set_payload_points = extract_internal_request(set_payload_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            set_payload_points.collection_name.clone(),
+        );
+
+        set_payload(
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
+            set_payload_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn overwrite_payload_internal(
+        &self,
+        overwrite_payload_internal: SetPayloadPointsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let SetPayloadPointsInternal {
+            set_payload_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = overwrite_payload_internal;
+
+        let set_payload_points = extract_internal_request(set_payload_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            set_payload_points.collection_name.clone(),
+        );
+
+        overwrite_payload(
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
+            set_payload_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn delete_payload_internal(
+        &self,
+        delete_payload_internal: DeletePayloadPointsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let DeletePayloadPointsInternal {
+            delete_payload_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = delete_payload_internal;
+
+        let delete_payload_points = extract_internal_request(delete_payload_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            delete_payload_points.collection_name.clone(),
+        );
+
+        delete_payload(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            delete_payload_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn clear_payload_internal(
+        &self,
+        clear_payload_internal: ClearPayloadPointsInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let ClearPayloadPointsInternal {
+            clear_payload_points,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = clear_payload_internal;
+
+        let clear_payload_points = extract_internal_request(clear_payload_points)?;
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
+            clear_payload_points.collection_name.clone(),
+        );
+
+        clear_payload(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            clear_payload_points,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+            hw_metrics,
+        )
+        .await
+    }
+
+    async fn create_field_index_internal(
+        &self,
+        create_field_index_collection: CreateFieldIndexCollectionInternal,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let CreateFieldIndexCollectionInternal {
+            create_field_index_collection,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = create_field_index_collection;
+
+        create_field_index_internal(
+            self.toc.clone(),
+            extract_internal_request(create_field_index_collection)?,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+        )
+        .await
+    }
+
+    async fn delete_field_index_internal(
+        &self,
+        delete_field_index_collection: DeleteFieldIndexCollectionInternal,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let DeleteFieldIndexCollectionInternal {
+            delete_field_index_collection,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = delete_field_index_collection;
+
+        delete_field_index_internal(
+            self.toc.clone(),
+            extract_internal_request(delete_field_index_collection)?,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+        )
+        .await
+    }
+
+    async fn create_vector_name_internal(
+        &self,
+        request: CreateVectorNameInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let CreateVectorNameInternal {
+            create_vector_name,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = request;
+
+        create_vector_name_internal(
+            self.toc.clone(),
+            extract_internal_request(create_vector_name)?,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+        )
+        .await
+    }
+
+    async fn delete_vector_name_internal(
+        &self,
+        request: DeleteVectorNameInternal,
+        auth: Auth,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        let DeleteVectorNameInternal {
+            delete_vector_name,
+            shard_id,
+            clock_tag,
+            wait_override,
+        } = request;
+
+        delete_vector_name_internal(
+            self.toc.clone(),
+            extract_internal_request(delete_vector_name)?,
+            InternalUpdateParams::from_grpc(shard_id, clock_tag, wait_override),
+            auth,
+        )
+        .await
     }
 }
 
@@ -100,7 +445,8 @@ pub async fn query_batch_internal(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
-        usage: request_hw_data.to_grpc_api(),
+        hardware_usage: request_hw_data.to_grpc_api(),
+        inference_usage: None, // No inference in internal API
     };
 
     Ok(Response::new(response))
@@ -157,9 +503,6 @@ async fn facet_counts_internal(
 impl PointsInternalService {
     /// Generates a new `RequestHwCounter` for the request.
     /// This counter is indented to be used for internal requests.
-    ///
-    /// So, it collects the hardware usage to the collection's counter ONLY if it was not
-    /// converted to a response.
     fn get_request_collection_hw_usage_counter_for_internal(
         &self,
         collection_name: String,
@@ -176,235 +519,94 @@ impl PointsInternalService {
 impl PointsInternal for PointsInternalService {
     async fn upsert(
         &self,
-        request: Request<UpsertPointsInternal>,
+        mut request: Request<UpsertPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let inference_token = extract_token(&request);
+        let auth = extract_auth(&mut request);
+        let api_keys = extract_inference_auth(&request);
+        let inference_params = InferenceParams::new(api_keys, None);
 
-        let UpsertPointsInternal {
-            upsert_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let upsert_points = extract_internal_request(upsert_points)?;
-
-        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(
-            upsert_points.collection_name.clone(),
-        );
-
-        upsert(
-            StrictModeCheckedInternalTocProvider::new(&self.toc),
-            upsert_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            inference_token,
-            hw_data,
-        )
-        .await
+        self.upsert_internal(request.into_inner(), auth, inference_params)
+            .await
     }
 
     async fn delete(
         &self,
-        request: Request<DeletePointsInternal>,
+        mut request: Request<DeletePointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let inference_token = extract_token(&request);
-
-        let DeletePointsInternal {
-            delete_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let delete_points = extract_internal_request(delete_points)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            delete_points.collection_name.clone(),
-        );
-
-        delete(
-            UncheckedTocProvider::new_unchecked(&self.toc),
-            delete_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            inference_token,
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.delete_internal(request.into_inner(), auth).await
     }
 
     async fn update_vectors(
         &self,
-        request: Request<UpdateVectorsInternal>,
+        mut request: Request<UpdateVectorsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let inference_token = extract_token(&request);
+        let auth = extract_auth(&mut request);
+        let api_keys = extract_inference_auth(&request);
+        let inference_params = InferenceParams::new(api_keys, None);
 
-        let UpdateVectorsInternal {
-            update_vectors: update_vectors_req,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let update_point_vectors = extract_internal_request(update_vectors_req)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            update_point_vectors.collection_name.clone(),
-        );
-
-        update_vectors(
-            StrictModeCheckedInternalTocProvider::new(&self.toc),
-            update_point_vectors,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            inference_token,
-            hw_metrics,
-        )
-        .await
+        self.update_vectors_internal(request.into_inner(), auth, inference_params)
+            .await
     }
 
     async fn delete_vectors(
         &self,
-        request: Request<DeleteVectorsInternal>,
+        mut request: Request<DeleteVectorsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let DeleteVectorsInternal {
-            delete_vectors: delete_vectors_req,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let delete_point_vectors = extract_internal_request(delete_vectors_req)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            delete_point_vectors.collection_name.clone(),
-        );
-
-        delete_vectors(
-            UncheckedTocProvider::new_unchecked(&self.toc),
-            delete_point_vectors,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.delete_vectors_internal(request.into_inner(), auth)
+            .await
     }
 
     async fn set_payload(
         &self,
-        request: Request<SetPayloadPointsInternal>,
+        mut request: Request<SetPayloadPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let SetPayloadPointsInternal {
-            set_payload_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let set_payload_points = extract_internal_request(set_payload_points)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            set_payload_points.collection_name.clone(),
-        );
-
-        set_payload(
-            StrictModeCheckedInternalTocProvider::new(&self.toc),
-            set_payload_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.set_payload_internal(request.into_inner(), auth).await
     }
 
     async fn overwrite_payload(
         &self,
-        request: Request<SetPayloadPointsInternal>,
+        mut request: Request<SetPayloadPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let SetPayloadPointsInternal {
-            set_payload_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let set_payload_points = extract_internal_request(set_payload_points)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            set_payload_points.collection_name.clone(),
-        );
-
-        overwrite_payload(
-            StrictModeCheckedInternalTocProvider::new(&self.toc),
-            set_payload_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.overwrite_payload_internal(request.into_inner(), auth)
+            .await
     }
 
     async fn delete_payload(
         &self,
-        request: Request<DeletePayloadPointsInternal>,
+        mut request: Request<DeletePayloadPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let DeletePayloadPointsInternal {
-            delete_payload_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let delete_payload_points = extract_internal_request(delete_payload_points)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            delete_payload_points.collection_name.clone(),
-        );
-
-        delete_payload(
-            UncheckedTocProvider::new_unchecked(&self.toc),
-            delete_payload_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.delete_payload_internal(request.into_inner(), auth)
+            .await
     }
 
     async fn clear_payload(
         &self,
-        request: Request<ClearPayloadPointsInternal>,
+        mut request: Request<ClearPayloadPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let ClearPayloadPointsInternal {
-            clear_payload_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        let clear_payload_points = extract_internal_request(clear_payload_points)?;
-
-        let hw_metrics = self.get_request_collection_hw_usage_counter_for_internal(
-            clear_payload_points.collection_name.clone(),
-        );
-
-        clear_payload(
-            UncheckedTocProvider::new_unchecked(&self.toc),
-            clear_payload_points,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            hw_metrics,
-        )
-        .await
+        let auth = extract_auth(&mut request);
+        self.clear_payload_internal(request.into_inner(), auth)
+            .await
     }
 
     async fn create_field_index(
@@ -413,18 +615,7 @@ impl PointsInternal for PointsInternalService {
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let CreateFieldIndexCollectionInternal {
-            create_field_index_collection,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
-
-        create_field_index_internal(
-            self.toc.clone(),
-            extract_internal_request(create_field_index_collection)?,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-        )
-        .await
+        self.create_field_index_internal(request.into_inner()).await
     }
 
     async fn delete_field_index(
@@ -433,26 +624,184 @@ impl PointsInternal for PointsInternalService {
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
-        let DeleteFieldIndexCollectionInternal {
-            delete_field_index_collection,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
+        self.delete_field_index_internal(request.into_inner()).await
+    }
 
-        delete_field_index_internal(
-            self.toc.clone(),
-            extract_internal_request(delete_field_index_collection)?,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-        )
-        .await
+    async fn create_vector_name(
+        &self,
+        mut request: Request<CreateVectorNameInternal>,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        validate_and_log(request.get_ref());
+
+        let auth = extract_auth(&mut request);
+        self.create_vector_name_internal(request.into_inner(), auth)
+            .await
+    }
+
+    async fn delete_vector_name(
+        &self,
+        mut request: Request<DeleteVectorNameInternal>,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        validate_and_log(request.get_ref());
+
+        let auth = extract_auth(&mut request);
+        self.delete_vector_name_internal(request.into_inner(), auth)
+            .await
+    }
+
+    async fn update_batch(
+        &self,
+        mut request: Request<UpdateBatchInternal>,
+    ) -> Result<Response<PointsOperationResponseInternal>, Status> {
+        validate_and_log(request.get_ref());
+
+        let auth = extract_auth(&mut request);
+        let api_keys = extract_inference_auth(&request);
+
+        // Update operation doesn't specify explicit timeout yet
+        let inference_params = InferenceParams::new(api_keys, None);
+
+        let request_inner = request.into_inner();
+        let batch_wait_override = request_inner.wait_override;
+
+        let mut total_usage = HardwareUsage::default();
+
+        let mut last_result = None;
+        // This API:
+        // - Sequentially applies all operations
+        // - If one operation fails, it will report the error immediately
+        // - If no operations are present, it will return an empty response
+        // - If all operations are successful, it will return the last operation result
+        for mut update in request_inner.operations {
+            // Propagate batch-level wait_override to individual operations if not already set
+            if let Some(batch_wo) = batch_wait_override
+                && let Some(ref mut op) = update.update
+            {
+                match op {
+                    Update::Sync(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::Upsert(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::Delete(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::UpdateVectors(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::DeleteVectors(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::SetPayload(inner) | Update::OverwritePayload(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::DeletePayload(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::ClearPayload(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::CreateFieldIndex(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::DeleteFieldIndex(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::CreateVectorName(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                    Update::DeleteVectorName(inner) => {
+                        inner.wait_override.get_or_insert(batch_wo);
+                    }
+                }
+            }
+
+            let result = match update.update {
+                None => {
+                    return Err(Status::invalid_argument("Update is missing"));
+                }
+                Some(update) => match update {
+                    Update::Sync(sync) => {
+                        self.sync_internal(sync, auth.clone(), inference_params.clone())
+                            .await?
+                    }
+                    Update::Upsert(upsert) => {
+                        self.upsert_internal(upsert, auth.clone(), inference_params.clone())
+                            .await?
+                    }
+                    Update::Delete(delete) => self.delete_internal(delete, auth.clone()).await?,
+                    Update::UpdateVectors(update_vectors) => {
+                        self.update_vectors_internal(
+                            update_vectors,
+                            auth.clone(),
+                            inference_params.clone(),
+                        )
+                        .await?
+                    }
+                    Update::DeleteVectors(delete_vectors) => {
+                        self.delete_vectors_internal(delete_vectors, auth.clone())
+                            .await?
+                    }
+                    Update::SetPayload(set_payload) => {
+                        self.set_payload_internal(set_payload, auth.clone()).await?
+                    }
+                    Update::OverwritePayload(overwrite_payload) => {
+                        self.overwrite_payload_internal(overwrite_payload, auth.clone())
+                            .await?
+                    }
+                    Update::DeletePayload(delete_payload) => {
+                        self.delete_payload_internal(delete_payload, auth.clone())
+                            .await?
+                    }
+                    Update::ClearPayload(clear_payload) => {
+                        self.clear_payload_internal(clear_payload, auth.clone())
+                            .await?
+                    }
+                    Update::CreateFieldIndex(create_field_index) => {
+                        self.create_field_index_internal(create_field_index).await?
+                    }
+                    Update::DeleteFieldIndex(delete_field_index) => {
+                        self.delete_field_index_internal(delete_field_index).await?
+                    }
+                    Update::CreateVectorName(op) => {
+                        self.create_vector_name_internal(op, auth.clone()).await?
+                    }
+                    Update::DeleteVectorName(op) => {
+                        self.delete_vector_name_internal(op, auth.clone()).await?
+                    }
+                },
+            };
+            let mut response = result.into_inner();
+
+            if let Some(usage) = response.hardware_usage.take() {
+                total_usage.add(usage);
+            }
+
+            last_result = Some(response)
+        }
+
+        if let Some(mut last_result) = last_result.take() {
+            last_result.hardware_usage = Some(total_usage);
+            Ok(Response::new(last_result))
+        } else {
+            // This response is possible if there are no operations in the request
+            Ok(Response::new(PointsOperationResponseInternal {
+                result: None,
+                time: 0.0,
+                hardware_usage: None,
+                inference_usage: None, // No inference in internal API
+            }))
+        }
     }
 
     async fn core_search_batch(
         &self,
-        request: Request<CoreSearchBatchPointsInternal>,
+        mut request: Request<CoreSearchBatchPointsInternal>,
     ) -> Result<Response<SearchBatchResponse>, Status> {
         validate_and_log(request.get_ref());
 
+        let auth = extract_auth(&mut request);
         let CoreSearchBatchPointsInternal {
             collection_name,
             search_points,
@@ -476,7 +825,7 @@ impl PointsInternal for PointsInternalService {
             search_points,
             None, // *Has* to be `None`!
             shard_id,
-            FULL_ACCESS.clone(),
+            auth,
             timeout,
             hw_data,
         )
@@ -487,10 +836,11 @@ impl PointsInternal for PointsInternalService {
 
     async fn recommend(
         &self,
-        request: Request<RecommendPointsInternal>,
+        mut request: Request<RecommendPointsInternal>,
     ) -> Result<Response<RecommendResponse>, Status> {
         validate_and_log(request.get_ref());
 
+        let auth = extract_auth(&mut request);
         let RecommendPointsInternal {
             recommend_points,
             ..  // shard_id - is not used in internal API,
@@ -508,7 +858,7 @@ impl PointsInternal for PointsInternalService {
         let res = recommend(
             UncheckedTocProvider::new_unchecked(&self.toc),
             recommend_points,
-            FULL_ACCESS.clone(),
+            auth,
             hw_data,
         )
         .await?;
@@ -518,10 +868,11 @@ impl PointsInternal for PointsInternalService {
 
     async fn scroll(
         &self,
-        request: Request<ScrollPointsInternal>,
+        mut request: Request<ScrollPointsInternal>,
     ) -> Result<Response<ScrollResponse>, Status> {
         validate_and_log(request.get_ref());
 
+        let auth = extract_auth(&mut request);
         let ScrollPointsInternal {
             scroll_points,
             shard_id,
@@ -540,7 +891,7 @@ impl PointsInternal for PointsInternalService {
             UncheckedTocProvider::new_unchecked(&self.toc),
             scroll_points,
             shard_id,
-            FULL_ACCESS.clone(),
+            auth,
             hw_data,
         )
         .await
@@ -548,10 +899,11 @@ impl PointsInternal for PointsInternalService {
 
     async fn get(
         &self,
-        request: Request<GetPointsInternal>,
+        mut request: Request<GetPointsInternal>,
     ) -> Result<Response<GetResponse>, Status> {
         validate_and_log(request.get_ref());
 
+        let auth = extract_auth(&mut request);
         let GetPointsInternal {
             get_points,
             shard_id,
@@ -570,7 +922,7 @@ impl PointsInternal for PointsInternalService {
             UncheckedTocProvider::new_unchecked(&self.toc),
             get_points,
             shard_id,
-            FULL_ACCESS.clone(),
+            auth,
             hw_data,
         )
         .await
@@ -578,10 +930,11 @@ impl PointsInternal for PointsInternalService {
 
     async fn count(
         &self,
-        request: Request<CountPointsInternal>,
+        mut request: Request<CountPointsInternal>,
     ) -> Result<Response<CountResponse>, Status> {
         validate_and_log(request.get_ref());
 
+        let auth = extract_auth(&mut request);
         let CountPointsInternal {
             count_points,
             shard_id,
@@ -596,7 +949,7 @@ impl PointsInternal for PointsInternalService {
             UncheckedTocProvider::new_unchecked(&self.toc),
             count_points,
             shard_id,
-            &FULL_ACCESS,
+            auth,
             hw_data,
         )
         .await?;
@@ -605,25 +958,17 @@ impl PointsInternal for PointsInternalService {
 
     async fn sync(
         &self,
-        request: Request<SyncPointsInternal>,
+        mut request: Request<SyncPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
-        let inference_token = extract_token(&request);
+        let auth = extract_auth(&mut request);
+        let api_keys = extract_inference_auth(&request);
 
-        let SyncPointsInternal {
-            sync_points,
-            shard_id,
-            clock_tag,
-        } = request.into_inner();
+        // Internal operation, we don't expect timeout here
+        let inference_params = InferenceParams::new(api_keys, None);
 
-        sync(
-            self.toc.clone(),
-            extract_internal_request(sync_points)?,
-            InternalUpdateParams::from_grpc(shard_id, clock_tag),
-            FULL_ACCESS.clone(),
-            inference_token,
-        )
-        .await
+        self.sync_internal(request.into_inner(), auth, inference_params)
+            .await
     }
 
     async fn query_batch(

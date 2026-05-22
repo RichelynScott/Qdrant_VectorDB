@@ -1,18 +1,23 @@
+use std::borrow::Cow;
 use std::{env, io};
 
 use api::grpc::transport_channel_pool::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_GRPC_TIMEOUT, DEFAULT_POOL_SIZE,
 };
 use collection::operations::validation;
+use collection::shards::shard::PeerId;
 use common::flags::FeatureFlags;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
 use serde::Deserialize;
 use storage::types::StorageConfig;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
+use crate::common::audit::AuditConfig;
 use crate::common::debugger::DebuggerConfig;
 use crate::common::inference::config::InferenceConfig;
 use crate::tracing;
+
+const MAX_PEER_ID: u64 = (1 << 53) - 1;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
 
@@ -22,8 +27,27 @@ pub struct ServiceConfig {
     pub host: String,
     pub http_port: u16,
     pub grpc_port: Option<u16>, // None means that gRPC is disabled
+
+    /// If specified, qdrant will serve a separate service for `/metrics` on this port.
+    /// Separate port is not protected by API keys and dedicated for internal monitoring systems.
+    /// This port should not be exposed to untrusted networks.
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
+
     pub max_request_size_mb: usize,
     pub max_workers: Option<usize>,
+    /// Keep-alive timeout for incoming HTTP connections in seconds.
+    #[serde(default = "default_http_keep_alive_timeout_sec")]
+    #[validate(range(min = 1))]
+    pub http_keep_alive_timeout_sec: u64,
+    /// Timeout for reading HTTP request data from clients in seconds.
+    #[serde(default = "default_http_client_request_timeout_sec")]
+    #[validate(range(min = 1))]
+    pub http_client_request_timeout_sec: u64,
+    /// Timeout for client disconnect handling in seconds.
+    #[serde(default = "default_http_client_disconnect_timeout_sec")]
+    #[validate(range(min = 1))]
+    pub http_client_disconnect_timeout_sec: u64,
     #[serde(default = "default_cors")]
     pub enable_cors: bool,
     #[serde(default)]
@@ -31,9 +55,23 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub verify_https_client_certificate: bool,
     pub api_key: Option<String>,
+
+    /// Same as `api_key`, can be used for rolling key rotation.
+    pub alt_api_key: Option<String>,
+
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
+
+    /// Enforce API key / JWT authentication on the internal (p2p) gRPC API.
+    ///
+    /// The regular API key is always forwarded on internal gRPC requests, but
+    /// the receiving side only verifies it when this flag is enabled. This is
+    /// opt-in to keep rolling upgrades safe: during an upgrade some nodes may
+    /// run a version that does not attach the key yet, so enabling enforcement
+    /// before every peer is upgraded would break intra-cluster communication.
+    #[serde(default)]
+    pub enforce_internal_auth: Option<bool>,
 
     #[serde(default)]
     pub hide_jwt_dashboard: Option<bool>,
@@ -54,6 +92,18 @@ pub struct ServiceConfig {
     /// Whether to enable reporting of measured hardware utilization in API responses.
     #[serde(default)]
     pub hardware_reporting: Option<bool>,
+
+    /// Global prefix for metrics.
+    #[serde(default)]
+    #[validate(custom(function = validate_metrics_prefix))]
+    pub metrics_prefix: Option<String>,
+
+    /// Whether to allow snapshot recovery from remote URLs (http/https).
+    /// If disabled, snapshot recovery will only work with local files and uploads.
+    /// Disabling this can mitigate SSRF risks in environments where the Qdrant node
+    /// has access to internal resources that should not be reachable by users.
+    #[serde(default = "default_snapshot_url_recovery")]
+    pub enable_snapshot_url_recovery: bool,
 }
 
 impl ServiceConfig {
@@ -65,6 +115,9 @@ impl ServiceConfig {
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
 pub struct ClusterConfig {
     pub enabled: bool, // disabled by default
+    #[serde(default)]
+    #[validate(range(min = 1, max = MAX_PEER_ID))]
+    pub peer_id: Option<PeerId>,
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1))]
     pub grpc_timeout_ms: u64,
@@ -142,7 +195,6 @@ pub struct TlsConfig {
     pub cert_ttl: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Validate)]
 pub struct GpuConfig {
     /// Enable GPU indexing.
@@ -218,6 +270,9 @@ pub struct Settings {
     pub gpu: Option<GpuConfig>,
     #[serde(default)]
     pub feature_flags: FeatureFlags,
+    /// Audit logging configuration.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
 }
 
 impl Settings {
@@ -226,12 +281,12 @@ impl Settings {
         let config_exists = |path| File::with_name(path).collect().is_ok();
 
         // Check if custom config file exists, report error if not
-        if let Some(ref path) = custom_config_path {
-            if !config_exists(path) {
-                load_errors.push(LogMsg::Error(format!(
-                    "Config file via --config-path is not found: {path}"
-                )));
-            }
+        if let Some(path) = &custom_config_path
+            && !config_exists(path)
+        {
+            load_errors.push(LogMsg::Error(format!(
+                "Config file via --config-path is not found: {path}"
+            )));
         }
 
         let env = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
@@ -286,10 +341,7 @@ impl Settings {
     }
 
     pub fn tls_config_is_undefined_error() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "TLS config is not defined in the Qdrant config file",
-        )
+        io::Error::other("TLS config is not defined in the Qdrant config file")
     }
 
     pub fn validate_and_warn(&self) {
@@ -299,14 +351,37 @@ impl Settings {
         // Using HMAC-SHA256, recommended secret size is 32 bytes
         const JWT_RECOMMENDED_SECRET_LENGTH: usize = 256 / 8;
 
+        let all_keys_are_empty = self
+            .service
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            && self
+                .service
+                .alt_api_key
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty();
+
+        let min_length = [
+            self.service.api_key.as_ref(),
+            self.service.alt_api_key.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|key| key.len())
+        .min()
+        .unwrap_or_default();
+
+        let any_api_key_is_short = min_length < JWT_RECOMMENDED_SECRET_LENGTH;
+
         // Log if JWT RBAC is enabled but no API key is set
         if self.service.jwt_rbac.unwrap_or_default() {
-            if self.service.api_key.clone().unwrap_or_default().is_empty() {
+            if all_keys_are_empty {
                 log::warn!("JWT RBAC configured but no API key set, JWT RBAC is not enabled")
             // Log if JWT RAC is enabled, API key is set but smaller than recommended size for JWT secret
-            } else if self.service.api_key.clone().unwrap_or_default().len()
-                < JWT_RECOMMENDED_SECRET_LENGTH
-            {
+            } else if any_api_key_is_short {
                 log::warn!(
                     "It is highly recommended to use an API key of {JWT_RECOMMENDED_SECRET_LENGTH} bytes when JWT RBAC is enabled",
                 )
@@ -357,6 +432,22 @@ const fn default_cors() -> bool {
     true
 }
 
+const fn default_snapshot_url_recovery() -> bool {
+    true
+}
+
+const fn default_http_keep_alive_timeout_sec() -> u64 {
+    5
+}
+
+const fn default_http_client_request_timeout_sec() -> u64 {
+    5
+}
+
+const fn default_http_client_disconnect_timeout_sec() -> u64 {
+    5
+}
+
 const fn default_timeout_ms() -> u64 {
     DEFAULT_GRPC_TIMEOUT.as_millis() as u64
 }
@@ -396,11 +487,33 @@ const fn default_tls_cert_ttl() -> Option<u64> {
     Some(3600)
 }
 
+/// Custom validation function for metrics prefixes.
+fn validate_metrics_prefix(prefix: &str) -> Result<(), ValidationError> {
+    // Prefix is not required
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    // Only allow alphanumeric characters or '_'
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(
+            ValidationError::new("invalid_metrics_prefix").with_message(Cow::Borrowed(
+                "Metrics prefix must be of all alphanumeric characters, with an exception for '_'",
+            )),
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::Write;
 
+    use fs_err as fs;
     use sealed_test::prelude::*;
 
     use super::*;
@@ -408,25 +521,45 @@ mod tests {
     /// Ensure we can successfully deserialize into [`Settings`] with just the default configuration.
     #[test]
     fn test_default_config() {
-        Config::builder()
+        let config = Config::builder()
             .add_source(File::from_str(DEFAULT_CONFIG, FileFormat::Yaml))
             .build()
             .expect("failed to build default config")
             .try_deserialize::<Settings>()
-            .expect("failed to deserialize default config")
+            .expect("failed to deserialize default config");
+
+        assert_eq!(
+            config.service.http_keep_alive_timeout_sec,
+            default_http_keep_alive_timeout_sec()
+        );
+        assert_eq!(
+            config.service.http_client_request_timeout_sec,
+            default_http_client_request_timeout_sec()
+        );
+        assert_eq!(
+            config.service.http_client_disconnect_timeout_sec,
+            default_http_client_disconnect_timeout_sec()
+        );
+
+        config
             .validate()
             .expect("failed to validate default config");
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#[sealed_test] uses std::fs::copy"
+    )]
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test(files = ["config/config.yaml", "config/development.yaml"])]
     fn test_runtime_development_config() {
         unsafe { env::set_var("RUN_MODE", "development") };
 
         // `sealed_test` copies files into the same directory as the test runs in.
         // We need them in a subdirectory.
-        std::fs::create_dir("config").expect("failed to create `config` subdirectory.");
-        std::fs::copy("config.yaml", "config/config.yaml").expect("failed to copy `config.yaml`.");
-        std::fs::copy("development.yaml", "config/development.yaml")
+        fs::create_dir("config").expect("failed to create `config` subdirectory.");
+        fs::copy("config.yaml", "config/config.yaml").expect("failed to copy `config.yaml`.");
+        fs::copy("development.yaml", "config/development.yaml")
             .expect("failed to copy `development.yaml`.");
 
         // Read config
@@ -439,6 +572,7 @@ mod tests {
         assert!(config.load_errors.is_empty(), "must not have load errors")
     }
 
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test]
     fn test_no_config_files() {
         let non_existing_config_path = "config/non_existing_config".to_string();
@@ -454,6 +588,7 @@ mod tests {
         assert!(!config.load_errors.is_empty(), "must have load errors")
     }
 
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test]
     fn test_custom_config() {
         let path = "config/custom.yaml";
@@ -471,5 +606,66 @@ mod tests {
 
         // Ensure our custom config is the most important
         assert_eq!(config.service.http_port, 9999);
+        assert_eq!(
+            config.service.http_keep_alive_timeout_sec,
+            default_http_keep_alive_timeout_sec()
+        );
+        assert_eq!(
+            config.service.http_client_request_timeout_sec,
+            default_http_client_request_timeout_sec()
+        );
+        assert_eq!(
+            config.service.http_client_disconnect_timeout_sec,
+            default_http_client_disconnect_timeout_sec()
+        );
+    }
+
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
+    #[sealed_test]
+    fn test_custom_http_transport_config() {
+        let path = "config/custom_http_transport.yaml";
+
+        {
+            fs::create_dir("config").unwrap();
+            let mut custom = fs::File::create(path).unwrap();
+            write!(
+                &mut custom,
+                "service:\n    http_keep_alive_timeout_sec: 120\n    http_client_request_timeout_sec: 45\n    http_client_disconnect_timeout_sec: 60"
+            )
+            .unwrap();
+            custom.flush().unwrap();
+        }
+
+        let config = Settings::new(Some(path.into())).unwrap();
+        config
+            .validate()
+            .expect("custom HTTP transport timeouts must pass validation");
+
+        assert_eq!(config.service.http_keep_alive_timeout_sec, 120);
+        assert_eq!(config.service.http_client_request_timeout_sec, 45);
+        assert_eq!(config.service.http_client_disconnect_timeout_sec, 60);
+    }
+
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
+    #[sealed_test]
+    fn test_invalid_http_transport_config() {
+        let path = "config/invalid_http_transport.yaml";
+
+        {
+            fs::create_dir("config").unwrap();
+            let mut custom = fs::File::create(path).unwrap();
+            write!(
+                &mut custom,
+                "service:\n    http_keep_alive_timeout_sec: 0\n    http_client_request_timeout_sec: 0\n    http_client_disconnect_timeout_sec: 0"
+            )
+            .unwrap();
+            custom.flush().unwrap();
+        }
+
+        let config = Settings::new(Some(path.into())).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "zero timeout values must fail validation"
+        );
     }
 }

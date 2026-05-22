@@ -4,7 +4,7 @@ use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::WriteOrdering;
 use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
 use itertools::Itertools;
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Uniform;
 use rand::rngs::ThreadRng;
 use segment::data_types::vectors::DenseVector;
@@ -60,7 +60,7 @@ mod group_by {
         let collection = simple_collection_fixture(collection_dir.path(), 1).await;
 
         let batch = BatchPersisted {
-            ids: (0..docs * chunks).map(|x| x.into()).collect_vec(),
+            ids: (0..docs * chunks).map(u64::into).collect_vec(),
             vectors: BatchVectorStructPersisted::Single(
                 (0..docs * chunks)
                     .map(|_| rand_dense_vector(&mut rng, 4))
@@ -85,6 +85,7 @@ mod group_by {
             .update_from_client_simple(
                 insert_points,
                 true,
+                None,
                 WriteOrdering::default(),
                 hw_counter.clone(),
             )
@@ -477,6 +478,8 @@ mod group_by {
 
 /// Tests out the different features working together. The individual features are already tested in other places.
 mod group_by_builder {
+    use std::sync::Arc;
+
     use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
     use collection::lookup::WithLookup;
@@ -487,7 +490,6 @@ mod group_by_builder {
     use common::counter::hardware_accumulator::HwMeasurementAcc;
     use segment::json_path::JsonPath;
     use segment::payload_json;
-    use tokio::sync::RwLock;
 
     use super::*;
 
@@ -495,7 +497,7 @@ mod group_by_builder {
 
     struct Resources {
         request: GroupRequest,
-        lookup_collection: RwLock<Collection>,
+        lookup_collection: Arc<Collection>,
         collection: Collection,
     }
 
@@ -525,7 +527,7 @@ mod group_by_builder {
         // insert chunk points
         {
             let batch = BatchPersisted {
-                ids: (0..docs * chunks_per_doc).map(|x| x.into()).collect_vec(),
+                ids: (0..docs * chunks_per_doc).map(u64::into).collect_vec(),
                 vectors: BatchVectorStructPersisted::Single(
                     (0..docs * chunks_per_doc)
                         .map(|_| rand_dense_vector(&mut rng, 4))
@@ -547,6 +549,7 @@ mod group_by_builder {
                 .update_from_client_simple(
                     insert_points,
                     true,
+                    None,
                     WriteOrdering::default(),
                     hw_counter.clone(),
                 )
@@ -562,7 +565,7 @@ mod group_by_builder {
         // insert doc points
         {
             let batch = BatchPersisted {
-                ids: (0..docs).map(|x| x.into()).collect_vec(),
+                ids: (0..docs).map(u64::into).collect_vec(),
                 vectors: BatchVectorStructPersisted::Single(
                     (0..docs)
                         .map(|_| rand_dense_vector(&mut rng, 4))
@@ -581,6 +584,7 @@ mod group_by_builder {
                 .update_from_client_simple(
                     insert_points,
                     true,
+                    None,
                     WriteOrdering::default(),
                     hw_counter.clone(),
                 )
@@ -590,7 +594,7 @@ mod group_by_builder {
             assert_eq!(insert_result.status, UpdateStatus::Completed);
         }
 
-        let lookup_collection = RwLock::new(lookup_collection);
+        let lookup_collection = Arc::new(lookup_collection);
 
         Resources {
             request,
@@ -641,7 +645,7 @@ mod group_by_builder {
             with_vectors: Some(true.into()),
         });
 
-        let collection_by_name = |_: String| async { Some(lookup_collection.read().await) };
+        let collection_by_name = |_: String| async { Some(lookup_collection.clone()) };
 
         let hw_acc = HwMeasurementAcc::new();
         let result = GroupBy::new(request.clone(), &collection, collection_by_name, hw_acc)

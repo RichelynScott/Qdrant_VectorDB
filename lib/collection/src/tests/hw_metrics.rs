@@ -3,22 +3,24 @@ use std::time::Duration;
 
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::{HwMeasurementAcc, HwSharedDrain};
+use common::save_on_disk::SaveOnDisk;
 use rand::rngs::ThreadRng;
-use rand::{RngCore, rng};
+use rand::{Rng, rng};
 use segment::data_types::vectors::{NamedQuery, VectorInternal, VectorStructInternal};
+use shard::query::query_enum::QueryEnum;
+use shard::search::CoreSearchRequestBatch;
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::CollectionUpdateOperations;
 use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
 };
-use crate::operations::query_enum::QueryEnum;
-use crate::operations::types::{CollectionError, CoreSearchRequest, CoreSearchRequestBatch};
-use crate::save_on_disk::SaveOnDisk;
+use crate::operations::types::{CollectionError, CoreSearchRequest};
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::create_collection_config_with_dim;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -30,7 +32,8 @@ async fn test_hw_metrics_cancellation() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -44,7 +47,7 @@ async fn test_hw_metrics_cancellation() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema.clone(),
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -54,7 +57,12 @@ async fn test_hw_metrics_cancellation() {
 
     let upsert_ops = make_random_points_upsert_op(10_000);
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
@@ -75,7 +83,7 @@ async fn test_hw_metrics_cancellation() {
         }],
     };
 
-    let outer_hw = HwSharedDrain::default();
+    let outer_hw = Arc::new(HwSharedDrain::default());
 
     {
         let hw_counter = HwMeasurementAcc::new_with_metrics_drain(outer_hw.clone());
@@ -83,7 +91,7 @@ async fn test_hw_metrics_cancellation() {
             .do_search(
                 Arc::new(req),
                 &current_runtime,
-                Some(Duration::from_millis(10)), // Very short duration to hit timeout before the search finishes
+                Duration::from_millis(10), // Very short duration to hit timeout before the search finishes
                 hw_counter,
             )
             .await;
@@ -93,9 +101,19 @@ async fn test_hw_metrics_cancellation() {
             search_res.unwrap_err(),
             CollectionError::Timeout { description: _ }
         ));
+    }
 
-        // Wait until the cancellation is processed is finished
-        std::thread::sleep(Duration::from_millis(50));
+    // Cancellation and draining hardware counters is asynchronous on CI runners.
+    // Poll with a bounded timeout to avoid timing-sensitive flakes.
+    let wait_timeout = Duration::from_secs(2);
+    let poll_interval = Duration::from_millis(10);
+    let wait_started = std::time::Instant::now();
+    while outer_hw.get_cpu() == 0 {
+        assert!(
+            wait_started.elapsed() <= wait_timeout,
+            "Timeout waiting for cancellation metrics to be drained",
+        );
+        tokio::time::sleep(poll_interval).await;
     }
 
     assert!(outer_hw.get_cpu() > 0);

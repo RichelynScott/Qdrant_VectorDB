@@ -2,9 +2,10 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use criterion::{Criterion, criterion_group, criterion_main};
+use quantization::encoded_storage::TestEncodedStorageBuilder;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-use quantization::encoded_vectors_pq::EncodedVectorsPQ;
-use rand::Rng;
+use quantization::encoded_vectors_pq::{self, EncodedVectorsPQ};
+use rand::RngExt;
 
 fn encode_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode");
@@ -18,17 +19,22 @@ fn encode_bench(c: &mut Criterion) {
         list.extend_from_slice(&vector);
     }
 
+    let vector_parameters = VectorParameters {
+        dim: vector_dim,
+        deprecated_count: None,
+        distance_type: DistanceType::Dot,
+        invert: false,
+    };
+    let quantized_vector_size =
+        encoded_vectors_pq::get_quantized_vector_size(&vector_parameters, 2);
     let pq_encoded = EncodedVectorsPQ::encode(
         (0..vectors_count).map(|i| &list[i * vector_dim..(i + 1) * vector_dim]),
-        Vec::<u8>::new(),
-        &VectorParameters {
-            dim: vector_dim,
-            count: vectors_count,
-            distance_type: DistanceType::Dot,
-            invert: false,
-        },
+        TestEncodedStorageBuilder::new(None, quantized_vector_size),
+        &vector_parameters,
+        vectors_count,
         2,
         2,
+        None,
         &AtomicBool::new(false),
     )
     .unwrap();

@@ -10,6 +10,23 @@ def setup(collection_name):
     yield
     drop_collection(collection_name=collection_name)
 
+def test_payload_indexing_validation(collection_name):
+    response = request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "test_payload",
+            "field_schema": {
+              "type": "integer",
+              "lookup": False,
+              "range": False,
+            }
+        }
+    )
+    assert response.status_code == 422
+    assert "Validation error: the 'lookup' and 'range' capabilities can't be both disabled" in response.json()["status"]["error"]
 
 def test_payload_indexing_operations(collection_name):
     # create payload
@@ -154,6 +171,8 @@ def test_datetime_indexing(collection_name):
     # create payload
     set_payload(collection_name, {datetime_key: "2015-01-01T00:00:00Z"}, [1])
     set_payload(collection_name, {datetime_key: "2015-02-01T08:00:00+02:00"}, [2])
+    # Use YYYY-MM-DDTHH:MM format (T separator, without seconds) — https://github.com/qdrant/qdrant/issues/8718
+    set_payload(collection_name, {datetime_key: "2015-03-01T12:30"}, [3])
 
     # Create index
     response = request_with_validation(
@@ -168,6 +187,20 @@ def test_datetime_indexing(collection_name):
     )
     assert response.ok
 
+    # Verify point with YYYY-MM-DDTHH:MM format was indexed (issue #8718)
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/scroll",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "with_vector": False,
+            "filter": {"must": [{"key": datetime_key, "range": {"gte": "2015-03-01T12:30", "lte": "2015-03-01T12:30"}}]},
+        },
+    )
+    assert response.ok, response.json()
+    point_ids = [p["id"] for p in response.json()["result"]["points"]]
+    assert 3 in point_ids, f"Point 3 with YYYY-MM-DDTHH:MM format not found in index results: {point_ids}"
+
     # test with mixed datetime format
     data = [
         ({"gte": "2015-01-01", "lte": "2015-01-01 00:00"}, [1]),
@@ -175,6 +208,9 @@ def test_datetime_indexing(collection_name):
         ({"gte": "2015-02-01T06:00:00", "lte": "2015-02-01T06:00:00Z"}, [2]),
         # date_optional_time
         ({"gte": "2015-02-01T06:00:00.000000000", "lte": "2015-02-01T06:00:00.000000000"}, [2]),
+        # YYYY-MM-DDTHH:MM (T separator, without seconds) — https://github.com/qdrant/qdrant/issues/8718
+        ({"gte": "2015-01-01T00:00", "lte": "2015-01-01T00:00"}, [1]),
+        ({"gte": "2015-02-01T06:00", "lte": "2015-02-01T06:00"}, [2]),
     ]
     for range_, expected_ids in data:
         response = request_with_validation(
@@ -305,6 +341,7 @@ def test_payload_schemas(collection_name):
             "type": "keyword",
             "is_tenant": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
         {
             "type": "integer",
@@ -312,14 +349,17 @@ def test_payload_schemas(collection_name):
             "range": True,
             "is_principal": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
         {
             "type": "float",
             "on_disk": True,
             "is_principal": True,
+            "enable_hnsw": True,
         },
         {
             "type": "geo",
+            "enable_hnsw": True,
         },
         {
             "type": "text",
@@ -327,19 +367,23 @@ def test_payload_schemas(collection_name):
             "lowercase": True,
             "min_token_len": 2,
             "max_token_len": 10,
+            "enable_hnsw": True,
         },
         {
             "type": "bool",
+            "enable_hnsw": True,
         },
         {
             "type": "datetime",
             "on_disk": True,
             "is_principal": True,
+            "enable_hnsw": True,
         },
         {
             "type": "uuid",
             "is_tenant": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
     ]
 

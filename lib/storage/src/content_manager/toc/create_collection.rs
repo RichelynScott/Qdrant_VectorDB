@@ -1,23 +1,19 @@
-use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use collection::collection::Collection;
 use collection::config::{self, CollectionConfigInternal, CollectionParams, ShardingMethod};
 use collection::operations::config_diff::DiffConfig as _;
-use collection::operations::types::{
-    CollectionResult, SparseVectorParams, VectorsConfig, check_sparse_compatible,
-};
-use collection::shards::CollectionId;
+use collection::operations::types::{CollectionResult, VectorsConfig};
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
-use segment::types::VectorNameBuf;
 
-use super::TableOfContent;
+use super::{COLLECTION_DELETE_SPIN_INTERVAL, COLLECTION_DELETE_WAIT_TIMEOUT, TableOfContent};
+use crate::common::utils::try_unwrap_with_timeout_async;
 use crate::content_manager::collection_meta_ops::*;
 use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus_ops::ConsensusOperations;
-use crate::content_manager::data_transfer;
 use crate::content_manager::errors::StorageError;
 
 impl TableOfContent {
@@ -42,17 +38,25 @@ impl TableOfContent {
             optimizers_config: optimizers_config_diff,
             replication_factor,
             write_consistency_factor,
-            init_from,
             quantization_config,
             sparse_vectors,
             strict_mode_config,
             uuid,
+            metadata,
         } = operation;
 
-        self.collections
-            .read()
-            .await
-            .validate_collection_not_exists(collection_name)?;
+        {
+            let collections = self.collections.read().await;
+            collections.validate_collection_not_exists(collection_name)?;
+
+            if let Some(max_collections) = self.storage_config.max_collections
+                && collections.len() >= max_collections
+            {
+                return Err(StorageError::bad_request(format!(
+                    "Can't create collection with name {collection_name}. Max collections limit reached: {max_collections}",
+                )));
+            }
+        }
 
         if self
             .alias_persistence
@@ -65,11 +69,6 @@ impl TableOfContent {
             )));
         }
 
-        if let Some(init_from) = &init_from {
-            self.check_collections_compatibility(&vectors, &sparse_vectors, &init_from.collection)
-                .await?;
-        }
-
         let collection_path = self.create_collection_path(collection_name).await?;
         // derive the snapshots path for the collection to be used across collection operation, the directories for the snapshot
         // is created only when a create snapshot api is invoked.
@@ -78,7 +77,7 @@ impl TableOfContent {
         let collection_defaults_config = self.storage_config.collection.as_ref();
 
         let default_shard_number = collection_defaults_config
-            .map(|x| x.shard_number)
+            .and_then(|x| x.shard_number)
             .unwrap_or_else(|| config::default_shard_number().get());
 
         let shard_number = match sharding_method.unwrap_or_default() {
@@ -95,11 +94,6 @@ impl TableOfContent {
                 }
             }
             ShardingMethod::Custom => {
-                if init_from.is_some() {
-                    return Err(StorageError::bad_input(
-                        "Can't initialize collection from another collection with custom sharding method",
-                    ));
-                }
                 if let Some(shard_number) = shard_number {
                     shard_number
                 } else {
@@ -109,11 +103,11 @@ impl TableOfContent {
         };
 
         let replication_factor = replication_factor
-            .or_else(|| collection_defaults_config.map(|i| i.replication_factor))
+            .or_else(|| collection_defaults_config.and_then(|i| i.replication_factor))
             .unwrap_or_else(|| config::default_replication_factor().get());
 
         let write_consistency_factor = write_consistency_factor
-            .or_else(|| collection_defaults_config.map(|i| i.write_consistency_factor))
+            .or_else(|| collection_defaults_config.and_then(|i| i.write_consistency_factor))
             .unwrap_or_else(|| config::default_write_consistency_factor().get());
 
         // Apply default vector config values if not set.
@@ -143,31 +137,25 @@ impl TableOfContent {
             sharding_method,
             on_disk_payload: on_disk_payload.unwrap_or(self.storage_config.on_disk_payload),
             replication_factor: NonZeroU32::new(replication_factor).ok_or_else(|| {
-                StorageError::BadInput {
-                    description: "`replication_factor` cannot be 0".to_string(),
-                }
+                StorageError::bad_input("`replication_factor` cannot be 0".to_string())
             })?,
             write_consistency_factor: NonZeroU32::new(write_consistency_factor).ok_or_else(
-                || StorageError::BadInput {
-                    description: "`write_consistency_factor` cannot be 0".to_string(),
-                },
+                || StorageError::bad_input("`write_consistency_factor` cannot be 0".to_string()),
             )?,
             read_fan_out_factor: None,
+            read_fan_out_delay_ms: None,
         };
-        let wal_config = match wal_config_diff {
-            None => self.storage_config.wal.clone(),
-            Some(diff) => diff.update(&self.storage_config.wal)?,
-        };
+        let wal_config = self.storage_config.wal.update_opt(wal_config_diff.as_ref());
 
-        let optimizers_config = match optimizers_config_diff {
-            None => self.storage_config.optimizers.clone(),
-            Some(diff) => diff.update(&self.storage_config.optimizers)?,
-        };
+        let optimizer_config = self
+            .storage_config
+            .optimizers
+            .update_opt(optimizers_config_diff.as_ref());
 
-        let hnsw_config = match hnsw_config_diff {
-            None => self.storage_config.hnsw_index.clone(),
-            Some(diff) => diff.update(&self.storage_config.hnsw_index)?,
-        };
+        let hnsw_config = self
+            .storage_config
+            .hnsw_index
+            .update_opt(hnsw_config_diff.as_ref());
 
         let quantization_config = match quantization_config {
             None => self
@@ -186,7 +174,7 @@ impl TableOfContent {
                     .as_ref()
                     .and_then(|i| i.strict_mode.clone())
                     .unwrap_or_default();
-                Some(diff.update(&default_config)?)
+                Some(default_config.update(&diff))
             }
             None => self
                 .storage_config
@@ -204,11 +192,12 @@ impl TableOfContent {
         let collection_config = CollectionConfigInternal {
             wal_config,
             params: collection_params,
-            optimizer_config: optimizers_config,
+            optimizer_config,
             hnsw_config,
             quantization_config,
             strict_mode_config,
             uuid,
+            metadata,
         };
 
         // No shard key mapping on creation, shard keys are set up after creating the collection
@@ -237,19 +226,50 @@ impl TableOfContent {
                 self.consensus_proposal_sender.clone(),
                 collection_name.to_string(),
             ),
-            Some(self.search_runtime.handle().clone()),
+            Some(self.adaptive_search_handle.clone()),
             Some(self.update_runtime.handle().clone()),
             self.optimizer_resource_budget.clone(),
             self.storage_config.optimizers_overwrite.clone(),
         )
         .await?;
 
+        collection.print_warnings().await;
+
         let local_shards = collection.get_local_shards().await;
 
         {
             let mut write_collections = self.collections.write().await;
             write_collections.validate_collection_not_exists(collection_name)?;
-            write_collections.insert(collection_name.to_string(), collection);
+            let existing_collection =
+                write_collections.insert(collection_name.to_string(), Arc::new(collection));
+            if let Some(existing_collection) = existing_collection {
+                debug_assert!(
+                    false,
+                    "Collection `{collection_name}` was not expected to exist"
+                );
+
+                existing_collection.stop_gracefully().await;
+
+                let removed_collection_res = try_unwrap_with_timeout_async(
+                    existing_collection,
+                    COLLECTION_DELETE_SPIN_INTERVAL,
+                    COLLECTION_DELETE_WAIT_TIMEOUT,
+                )
+                .await;
+
+                match removed_collection_res {
+                    Ok(collection) => drop(collection),
+                    Err(busy_collection) => {
+                        debug_assert!(false, "Collection `{collection_name}` is busy");
+                        log::error!(
+                            "Collection `{collection_name}` is busy and cannot be removed in time."
+                        );
+                        drop(busy_collection);
+                    }
+                };
+            }
+
+            self.telemetry.init_snapshot_telemetry(collection_name);
         }
 
         drop(collection_create_guard);
@@ -260,31 +280,7 @@ impl TableOfContent {
                 .await?;
         }
 
-        if let Some(init_from) = init_from {
-            self.run_data_initialization(init_from.collection, collection_name.to_string())
-                .await;
-        }
-
         Ok(true)
-    }
-
-    async fn check_collections_compatibility(
-        &self,
-        vectors: &VectorsConfig,
-        sparse_vectors: &Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
-        source_collection: &CollectionId,
-    ) -> Result<(), StorageError> {
-        let collection = self.get_collection_unchecked(source_collection).await?;
-        let collection_vectors_schema = collection.state().await.config.params.vectors;
-        collection_vectors_schema.check_compatible(vectors)?;
-        let collection_sparse_vectors_schema =
-            collection.state().await.config.params.sparse_vectors;
-        if let (Some(collection_sparse_vectors_schema), Some(sparse_vectors)) =
-            (&collection_sparse_vectors_schema, sparse_vectors)
-        {
-            check_sparse_compatible(collection_sparse_vectors_schema, sparse_vectors)?;
-        }
-        Ok(())
     }
 
     async fn on_peer_created(
@@ -316,45 +312,5 @@ impl TableOfContent {
             }
         }
         Ok(())
-    }
-
-    async fn run_data_initialization(
-        &self,
-        from_collection: CollectionId,
-        to_collection: CollectionId,
-    ) {
-        let collections = self.collections.clone();
-        let this_peer_id = self.this_peer_id;
-        self.general_runtime.spawn(async move {
-            // Create indexes
-            match data_transfer::transfer_indexes(
-                collections.clone(),
-                &from_collection,
-                &to_collection,
-                this_peer_id,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(err) => {
-                    log::error!("Initialization failed: {err}")
-                }
-            }
-
-            // Transfer data
-            match data_transfer::populate_collection(
-                collections,
-                &from_collection,
-                &to_collection,
-                this_peer_id,
-            )
-            .await
-            {
-                Ok(_) => log::info!(
-                    "Collection {to_collection} initialized with data from {from_collection}"
-                ),
-                Err(err) => log::error!("Initialization failed: {err}"),
-            }
-        });
     }
 }

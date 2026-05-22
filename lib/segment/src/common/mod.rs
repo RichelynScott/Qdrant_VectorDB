@@ -1,14 +1,12 @@
 pub mod anonymize;
+pub mod buffered_update_bitslice;
 pub mod error_logging;
+pub mod flags;
 pub mod macros;
-pub mod mmap_bitslice_buffered_update_wrapper;
-pub mod mmap_slice_buffered_update_wrapper;
+pub mod memory_usage;
 pub mod operation_error;
 pub mod operation_time_statistics;
 pub mod reciprocal_rank_fusion;
-pub mod rocksdb_buffered_delete_wrapper;
-pub mod rocksdb_buffered_update_wrapper;
-pub mod rocksdb_wrapper;
 pub mod score_fusion;
 pub mod utils;
 pub mod validate_snapshot_archive;
@@ -22,6 +20,7 @@ use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::types::{SegmentConfig, SparseVectorDataConfig, VectorDataConfig, VectorName};
 
 pub type Flusher = Box<dyn FnOnce() -> OperationResult<()> + Send>;
+
 /// Check that the given vector name is part of the segment config.
 ///
 /// Returns an error if incompatible.
@@ -68,13 +67,18 @@ fn check_query_vector(
                 check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::Discovery(discovery_query) => {
-            discovery_query.flat_iter().try_for_each(|vector| {
+        QueryVector::Discover(discover_query) => {
+            discover_query.flat_iter().try_for_each(|vector| {
                 check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::Context(discovery_context_query) => {
-            discovery_context_query.flat_iter().try_for_each(|vector| {
+        QueryVector::Context(context_query) => {
+            context_query.flat_iter().try_for_each(|vector| {
+                check_vector_against_config(VectorRef::from(vector), vector_config)
+            })?
+        }
+        QueryVector::FeedbackNaive(feedback_query) => {
+            feedback_query.flat_iter().try_for_each(|vector| {
                 check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
@@ -97,13 +101,18 @@ fn check_query_sparse_vector(
                 check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::Discovery(discovery_query) => {
-            discovery_query.flat_iter().try_for_each(|vector| {
+        QueryVector::Discover(discover_query) => {
+            discover_query.flat_iter().try_for_each(|vector| {
                 check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::Context(discovery_context_query) => {
-            discovery_context_query.flat_iter().try_for_each(|vector| {
+        QueryVector::Context(context_query) => {
+            context_query.flat_iter().try_for_each(|vector| {
+                check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
+            })?
+        }
+        QueryVector::FeedbackNaive(feedback_query) => {
+            feedback_query.flat_iter().try_for_each(|vector| {
                 check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
@@ -157,9 +166,7 @@ fn get_vector_config_or_error<'a>(
     segment_config
         .vector_data
         .get(vector_name)
-        .ok_or_else(|| OperationError::VectorNameNotExists {
-            received_name: vector_name.to_owned(),
-        })
+        .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))
 }
 
 /// Get the sparse vector config for the given name, or return a name error.
@@ -172,9 +179,7 @@ fn get_sparse_vector_config_or_error<'a>(
     segment_config
         .sparse_vector_data
         .get(vector_name)
-        .ok_or_else(|| OperationError::VectorNameNotExists {
-            received_name: vector_name.to_owned(),
-        })
+        .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))
 }
 
 /// Check if the given dense vector data is compatible with the given configuration.
@@ -226,11 +231,10 @@ fn check_sparse_vector_against_config(
 
 pub fn check_stopped(is_stopped: &AtomicBool) -> OperationResult<()> {
     if is_stopped.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(OperationError::Cancelled {
-            description: "Operation is stopped externally".to_string(),
-        });
+        return Err(OperationError::cancelled("Operation is stopped externally"));
     }
     Ok(())
 }
 
 pub const BYTES_IN_KB: usize = 1024;
+pub const BYTES_IN_MB: usize = 1_048_576;

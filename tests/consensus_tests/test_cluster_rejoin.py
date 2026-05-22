@@ -1,4 +1,5 @@
 import io
+import os
 import pathlib
 import shutil
 from time import sleep
@@ -11,13 +12,14 @@ from .utils import *
 N_PEERS = 3
 N_REPLICA = 2
 N_SHARDS = 3
+PORT_SEED = 15000
 
 
 @pytest.mark.parametrize("uris_in_env", [False, True])
 def test_rejoin_cluster(tmp_path: pathlib.Path, uris_in_env):
     assert_project_root()
     # Start cluster
-    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=10000, uris_in_env=uris_in_env)
+    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=PORT_SEED, uris_in_env=uris_in_env)
 
     create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA)
     wait_collection_exists_and_active_on_all_peers(collection_name="test_collection", peer_api_uris=peer_api_uris)
@@ -38,8 +40,10 @@ def test_rejoin_cluster(tmp_path: pathlib.Path, uris_in_env):
         print(f"creating collection {i}")
         # Drop test_collection
         drop_collection(peer_api_uris[0], "test_collection", timeout=5)
-        # Re-create test_collection
-        create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA, timeout=3)
+        # Re-create test_collection. The 3s timeout is intentionally tight to keep the loop
+        # fast; under CI load the consensus apply can exceed it even though the operation
+        # eventually commits, so we tolerate an HTTP timeout here.
+        create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA, timeout=3, fail_on_error=False)
         # Collection might not be ready yet, we don't care
         upsert_random_points(peer_api_uris[0], 100)
         print(f"before recovery end {i}")
@@ -56,7 +60,7 @@ def test_rejoin_cluster(tmp_path: pathlib.Path, uris_in_env):
     )
 
     # Restart last node
-    new_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_uri, port=20000, uris_in_env=uris_in_env)
+    new_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_uri, uris_in_env=uris_in_env)
 
     peer_api_uris[-1] = new_url
 
@@ -68,8 +72,8 @@ def test_rejoin_cluster(tmp_path: pathlib.Path, uris_in_env):
         print(f"after recovery start {i}")
         # Drop test_collection
         drop_collection(peer_api_uris[0], "test_collection", timeout=5)
-        # Re-create test_collection
-        create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA, timeout=3)
+        # Re-create test_collection. Same rationale as above for tolerating HTTP timeouts.
+        create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA, timeout=3, fail_on_error=False)
         upsert_random_points(peer_api_uris[0], 500, fail_on_error=False)
         print(f"after recovery end {i}")
         res = requests.get(f"{new_url}/collections")
@@ -100,6 +104,7 @@ def test_rejoin_origin_from_wal(tmp_path: pathlib.Path):
 
     rejoin_cluster_test(tmp_path, start_cluster, overwrite_first_voter)
 
+
 def test_rejoin_origin_from_state(tmp_path: pathlib.Path):
     """
     This test checks that Qdrant persists origin peer ID (`first_voter` field in `raft_state.json`)
@@ -120,6 +125,7 @@ def test_rejoin_origin_from_state(tmp_path: pathlib.Path):
         assert state["first_voter"] == origin_peer_id
 
     rejoin_cluster_test(tmp_path, start_preconfigured_cluster, assert_first_voter)
+
 
 @pytest.mark.skip("this test simulates and asserts past, incorrect behavior")
 def test_rejoin_no_origin(tmp_path: pathlib.Path):
@@ -199,6 +205,76 @@ def test_rejoin_recover_origin(tmp_path: pathlib.Path):
     assert len(info["remote_shards"]) == shards
 
 
+@pytest.mark.parametrize("uris_in_env", [False, True])
+def test_reject_rejoin_cluster_same_uri(tmp_path: pathlib.Path, uris_in_env):
+    """
+    A peer cannot join the cluster when its URI conflicts with a peer that is
+    already registered in consensus.
+
+    Allowing that would mean that multiple peer IDs live on the same URI, which
+    introduces all kinds of problems.
+
+    In practice this can happen if the storage directory of a peer is
+    accidentally wiped or lost. Because it has no Raft s tate, it will try to
+    re-join the cluster again on start with the same URI. The cluster must
+    reject it and startup of the peer must fail.
+
+    To resolve the situation the broken peer must either be restored. Otherwise
+    it must explicitly be removed from consensus first to allow it to join
+    again.
+    """
+
+    assert_project_root()
+
+    # Start cluster
+    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=PORT_SEED, uris_in_env=uris_in_env)
+
+    create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA)
+    wait_collection_exists_and_active_on_all_peers(collection_name="test_collection", peer_api_uris=peer_api_uris)
+    upsert_random_points(peer_api_uris[0], 100)
+
+    # Cluster consensus must have exactly N_PEERS peers
+    cluster_info = get_cluster_info(peer_api_uris[0])
+    assert len(cluster_info['peers']) == N_PEERS
+
+    # Persist peer ID and state of broken peer
+    broken_peer_id = get_cluster_info(peer_api_uris[-1])['peer_id']
+    broken_peer_state = cluster_info['peers'][str(broken_peer_id)]
+
+    # Stop last node
+    p = processes.pop()
+    broken_peer_port = p.p2p_port
+    p.kill()
+
+    # Wipe storage to break the last peer
+    # On restart it will try to join the cluster again
+    storage_path = peer_dirs[-1] / 'storage'
+    for filename in os.listdir(storage_path):
+        file_path = os.path.join(storage_path, filename)
+        if os.path.isfile(file_path) or os.path.islink(file_path):
+            os.unlink(file_path)
+        elif os.path.isdir(file_path):
+            shutil.rmtree(file_path)
+
+    for i in range(2):
+        # Restart last node on the same port it used before
+        new_url = start_peer(peer_dirs[-1], "peer_2_restarted.log", bootstrap_uri, port=broken_peer_port, uris_in_env=uris_in_env)
+        peer_api_uris[-1] = new_url
+
+        # Expect the process to crash, it cannot join the cluster with the same URL
+        # Expect exit code 101, see <https://doc.rust-lang.org/std/macro.panic.html#current-implementation>
+        processes[-1].proc.wait(timeout=20)
+        assert processes[-1].proc.returncode == 101
+        processes.pop().kill()
+
+        # Cluster consensus still have the same number of peers
+        cluster_info = get_cluster_info(peer_api_uris[0])
+        assert len(cluster_info['peers']) == N_PEERS
+
+        # The broken peer must still have the same peer ID and state (uri) in consensus
+        assert cluster_info['peers'][str(broken_peer_id)] == broken_peer_state
+
+
 def rejoin_cluster_test(
     tmp_path: pathlib.Path,
     start_cluster: Callable[[pathlib.Path, int], tuple[list[str], list[pathlib.Path], str]],
@@ -246,12 +322,19 @@ def rejoin_cluster_test(
     second_peer_uri, bootstrap_uri = start_first_peer(peer_dirs[1], "peer_0_1_restarted.log", second_peer.p2p_port)
     wait_for_peer_online(second_peer_uri)
 
+    # Wait until remove-origin ConfChange is applied on both surviving peers.
+    # Otherwise raft can drop the new peer's add-peer proposal as a conflicting
+    # in-flight conf change, and AddPeerToKnown silently times out at 10s.
+    wait_peer_added(second_peer_uri, expected_size=peers - 1)
+    wait_peer_added(peer_uris[2], expected_size=peers - 1)
+
     # Add new peer to cluster
     new_peer_uri, new_peer_dir = add_new_peer(tmp_path, peers, bootstrap_uri, collection)
 
     # Assert that new peer observe expected number of remote shards
     info = get_collection_cluster_info(new_peer_uri, collection)
     assert len(info["remote_shards"]) == expected_shards
+
 
 def start_preconfigured_cluster(tmp_path: pathlib.Path, peers: int = 3):
     assert_project_root()
@@ -266,12 +349,12 @@ def start_preconfigured_cluster(tmp_path: pathlib.Path, peers: int = 3):
     #
     # It's just an "empty" peer, but its peer ID is *not* committed into WAL. We can use this peer to
     # test that first peer ID is correctly recovered/propagated, even when it's not committed into WAL.
-    shutil.copytree("tests/consensus_tests/test_cluster_rejoin_data", f"{peer_dirs[0]}/storage")
+    shutil.copytree(PROJECT_ROOT / "tests/consensus_tests/test_cluster_rejoin_data", f"{peer_dirs[0]}/storage")
 
     # Modify peer URI in Raft state to prevent URI change on startup 🙄
-    p2p_port = get_port()
-    grpc_port = get_port()
-    http_port = get_port()
+    p2p_port = get_port_triple()
+    grpc_port = p2p_port + 1
+    http_port = p2p_port + 2
 
     with open(f"{peer_dirs[0]}/storage/raft_state.json", "r+") as file:
         state = json.load(file)
@@ -337,6 +420,194 @@ def move_all_shards_from_peer(peer_uri: str, collection: str = "test_collection"
 
     return current_peer_id, other_peer_id
 
+
+def test_replace_peer_without_shards_same_uri(tmp_path: pathlib.Path):
+    """
+    A new peer can replace an existing peer that has no shards by reusing its URI.
+
+    This bootstraps a new peer into the cluster, kills it and wipes its local
+    data without removing it from consensus, then bootstraps another new peer
+    reusing the killed peer's URI. Because the killed peer has no shard
+    replicas, the cluster should accept the replacement.
+    """
+
+    assert_project_root()
+
+    # Start cluster with fixed ports so we can reuse them later
+    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=PORT_SEED)
+
+    # Create collection with 1 shard and replication_factor=1 so data lives only on peer 0
+    create_collection(peer_api_uris[0], shard_number=1, replication_factor=1)
+    wait_collection_exists_and_active_on_all_peers(collection_name="test_collection", peer_api_uris=peer_api_uris)
+    upsert_random_points(peer_api_uris[0], 100)
+
+    # Add a 4th peer to the cluster
+    extra_peer_port = PORT_SEED + N_PEERS * 100
+    extra_peer_dir = make_peer_folder(tmp_path, N_PEERS)
+    extra_peer_api_uri = start_peer(extra_peer_dir, "peer_extra.log", bootstrap_uri, port=extra_peer_port)
+    wait_for_peer_online(extra_peer_api_uri)
+    wait_peer_added(peer_api_uris[0], expected_size=N_PEERS + 1)
+
+    # Remember the peer ID of the extra peer
+    extra_peer_id = get_cluster_info(extra_peer_api_uri)['peer_id']
+
+    # Verify extra peer has no shards
+    collection_cluster_info = get_collection_cluster_info(extra_peer_api_uri, "test_collection")
+    assert len(collection_cluster_info["local_shards"]) == 0
+
+    # Kill the extra peer and wipe its storage (do NOT remove from consensus)
+    p = processes.pop()
+    p.kill()
+    shutil.rmtree(extra_peer_dir / 'storage')
+
+    # The old peer is still registered in consensus
+    cluster_info = get_cluster_info(peer_api_uris[0])
+    assert str(extra_peer_id) in cluster_info['peers']
+
+    # Bootstrap a new peer reusing the same URI and port
+    new_extra_peer_dir = make_peer_folder(tmp_path, N_PEERS + 1)
+    new_extra_peer_api_uri = start_peer(new_extra_peer_dir, "peer_extra_replaced.log", bootstrap_uri, port=extra_peer_port)
+
+    # The new peer should successfully join, replacing the old one
+    wait_for_peer_online(new_extra_peer_api_uri)
+    wait_peer_added(peer_api_uris[0], expected_size=N_PEERS + 1)
+
+    new_peer_id = get_cluster_info(new_extra_peer_api_uri)['peer_id']
+    assert new_peer_id != extra_peer_id
+
+    # Old peer should have been removed from consensus and replaced by the new one
+    cluster_info = get_cluster_info(peer_api_uris[0])
+    assert str(extra_peer_id) not in cluster_info['peers']
+    assert str(new_peer_id) in cluster_info['peers']
+
+
+def test_replace_running_peer_without_shards_same_uri(tmp_path: pathlib.Path):
+    """
+    A new peer can replace a still-running peer that has no shards by reusing
+    its URI.
+
+    This bootstraps a new peer into the cluster (which has no shards), keeps it
+    running, then bootstraps another new peer that announces the same p2p URI.
+    Because the old peer has no shard replicas, the cluster should accept the
+    replacement. The old peer, still running, should observe its own removal and
+    transition its consensus thread status to 'Stopped'.
+    """
+
+    assert_project_root()
+
+    # Start cluster with fixed ports
+    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=PORT_SEED)
+
+    # Create collection with 1 shard and replication_factor=1 so data lives only on peer 0
+    create_collection(peer_api_uris[0], shard_number=1, replication_factor=1)
+    wait_collection_exists_and_active_on_all_peers(collection_name="test_collection", peer_api_uris=peer_api_uris)
+    upsert_random_points(peer_api_uris[0], 100)
+
+    # Add a 4th peer to the cluster
+    extra_peer_port = PORT_SEED + N_PEERS * 100
+    extra_peer_dir = make_peer_folder(tmp_path, N_PEERS)
+    extra_peer_api_uri = start_peer(extra_peer_dir, "peer_extra.log", bootstrap_uri, port=extra_peer_port)
+    wait_for_peer_online(extra_peer_api_uri)
+    wait_peer_added(peer_api_uris[0], expected_size=N_PEERS + 1)
+
+    # Remember the peer ID and p2p URI of the extra peer
+    extra_peer_id = get_cluster_info(extra_peer_api_uri)['peer_id']
+    extra_peer_p2p_uri = get_uri(extra_peer_port)
+
+    # Verify extra peer has no shards
+    collection_cluster_info = get_collection_cluster_info(extra_peer_api_uri, "test_collection")
+    assert len(collection_cluster_info["local_shards"]) == 0
+
+    # Do not kill the extra peer — it stays running
+
+    # Bootstrap a new peer on different ports but announcing the same p2p URI
+    # as the still-running extra peer. We must construct the process manually
+    # because start_peer always derives the URI from the port.
+    new_peer_port = PORT_SEED + (N_PEERS + 1) * 100
+    new_peer_p2p_port = new_peer_port + 0
+    busy_ports[new_peer_p2p_port] = True
+    new_peer_grpc_port = new_peer_port + 1
+    busy_ports[new_peer_grpc_port] = True
+    new_peer_http_port = new_peer_port + 2
+    busy_ports[new_peer_http_port] = True
+
+    new_peer_dir = make_peer_folder(tmp_path, N_PEERS + 1)
+    test_log_folder = init_pytest_log_folder()
+    log_file = open(f"{test_log_folder}/peer_extra_replaced.log", "w")
+
+    args = [
+        get_qdrant_exec(),
+        "--bootstrap", bootstrap_uri,
+        "--uri", extra_peer_p2p_uri,  # same URI as the old peer
+    ]
+    env = get_env(new_peer_p2p_port, new_peer_grpc_port, new_peer_http_port)
+    proc = Popen(args, env=env, cwd=new_peer_dir, stdout=log_file)
+    processes.append(PeerProcess(proc, new_peer_http_port, new_peer_grpc_port, new_peer_p2p_port))
+    new_extra_peer_api_uri = get_uri(new_peer_http_port)
+
+    # The old peer (still running) should observe its removal and stop consensus.
+    # We cannot wait for the new peer to be fully online because it announced
+    # the old peer's p2p URI and thus won't receive raft messages. Instead,
+    # wait for the old peer's consensus thread to transition to 'stopped'.
+    def old_peer_consensus_stopped():
+        try:
+            info = get_cluster_info(extra_peer_api_uri)
+            return info['consensus_thread_status']['consensus_thread_status'] == 'stopped'
+        except Exception:
+            return False
+
+    wait_for(old_peer_consensus_stopped)
+
+    # Old peer should have been removed from consensus
+    cluster_info = get_cluster_info(peer_api_uris[0])
+    assert str(extra_peer_id) not in cluster_info['peers']
+
+
+def test_reject_replace_peer_with_shards_same_uri(tmp_path: pathlib.Path):
+    """
+    A new peer cannot replace an existing peer that still has shards by reusing
+    its URI.
+
+    This creates a cluster and a collection with data on all peers, then
+    attempts to bootstrap a new peer reusing the URI of the last peer. Because
+    the last peer still has shard replicas, the cluster must reject it.
+    """
+
+    assert_project_root()
+
+    # Start cluster with fixed ports
+    peer_api_uris, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, port_seed=PORT_SEED)
+
+    # Create collection with enough shards and replication to ensure all peers have data
+    create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA)
+    wait_collection_exists_and_active_on_all_peers(collection_name="test_collection", peer_api_uris=peer_api_uris)
+    upsert_random_points(peer_api_uris[0], 100)
+
+    # Verify the last peer has shards
+    collection_cluster_info = get_collection_cluster_info(peer_api_uris[-1], "test_collection")
+    assert len(collection_cluster_info["local_shards"]) > 0
+
+    # Kill the last peer and wipe its storage (do NOT remove from consensus)
+    target_peer_id = get_cluster_info(peer_api_uris[-1])['peer_id']
+    p = processes.pop()
+    broken_peer_port = p.p2p_port
+    p.kill()
+    shutil.rmtree(peer_dirs[-1] / 'storage')
+
+    # Bootstrap a new peer reusing the same port (= same URI) as the killed peer
+    new_url = start_peer(peer_dirs[-1], "peer_replaced_rejected.log", bootstrap_uri, port=broken_peer_port)
+
+    # Expect the process to crash because the old peer still has shards
+    processes[-1].proc.wait(timeout=20)
+    assert processes[-1].proc.returncode == 101
+    processes.pop().kill()
+
+    # The old peer must still be registered in consensus with its original state
+    cluster_info = get_cluster_info(peer_api_uris[0])
+    assert str(target_peer_id) in cluster_info['peers']
+    assert len(cluster_info['peers']) == N_PEERS
+
+
 def remove_peer(peer_uri: str, peer_id: int | None = None):
     if peer_id is None:
         info = get_cluster_info(peer_uri)
@@ -344,6 +615,7 @@ def remove_peer(peer_uri: str, peer_id: int | None = None):
 
     resp = requests.delete(f"{peer_uri}/cluster/peer/{peer_id}")
     assert_http_ok(resp)
+
 
 def add_new_peer(tmp_path: pathlib.Path, peer_idx: int, bootstrap_uri: str, collection: str | None = None):
     peer_dir = make_peer_folder(tmp_path, peer_idx)
@@ -355,3 +627,9 @@ def add_new_peer(tmp_path: pathlib.Path, peer_idx: int, bootstrap_uri: str, coll
         wait_collection_on_all_peers(collection, [peer_uri])
 
     return peer_uri, peer_dir
+
+
+def get_cluster_info(peer_uri: str):
+    resp = requests.get(f"{peer_uri}/cluster")
+    assert_http_ok(resp)
+    return resp.json()['result']

@@ -1,20 +1,22 @@
 use std::borrow::Cow;
 
-use bytemuck::must_cast_slice;
+use bytemuck::Pod;
 use half::f16;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::named_vectors::CowMultiVector;
 use super::vectors::TypedMultiDenseVector;
 use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
-use crate::spaces::metric::Metric;
-use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
 use crate::types::{Distance, QuantizationConfig, VectorStorageDatatype};
 
-pub trait PrimitiveVectorElement:
-    Copy + Clone + Default + Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static
+pub trait PrimitiveVectorElement
+where
+    Self: Copy + Clone + Default + Send + Sync + 'static,
+    Self: Serialize + for<'a> Deserialize<'a>,
+    Self: FromBytes + Immutable + IntoBytes + KnownLayout,
+    Self: Pod,
 {
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]>;
 
@@ -23,7 +25,7 @@ pub trait PrimitiveVectorElement:
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]>;
 
     fn datatype() -> VectorStorageDatatype;
@@ -35,13 +37,6 @@ pub trait PrimitiveVectorElement:
     fn into_float_multivector(
         multivector: CowMultiVector<Self>,
     ) -> CowMultiVector<VectorElementType>;
-
-    /// Cast elements to a byte slice. Typically a wrapper around [`zerocopy`]
-    /// or [`bytemuck`] methods.
-    ///
-    /// TODO: once [`half::f16`] support the latest [`zerocopy`], we could
-    /// remove this method in favor of using [`zerocopy::IntoBytes`] directly.
-    fn as_bytes(vector: &[Self]) -> &[u8];
 }
 
 impl PrimitiveVectorElement for VectorElementType {
@@ -56,9 +51,9 @@ impl PrimitiveVectorElement for VectorElementType {
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
-        Cow::Borrowed(vector)
+        vector
     }
 
     fn datatype() -> VectorStorageDatatype {
@@ -76,10 +71,6 @@ impl PrimitiveVectorElement for VectorElementType {
     ) -> CowMultiVector<VectorElementType> {
         multivector
     }
-
-    fn as_bytes(vector: &[Self]) -> &[u8] {
-        IntoBytes::as_bytes(vector)
-    }
 }
 
 impl PrimitiveVectorElement for VectorElementTypeHalf {
@@ -94,7 +85,7 @@ impl PrimitiveVectorElement for VectorElementTypeHalf {
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         Cow::Owned(vector.iter().map(|&x| f16::to_f32(x)).collect_vec())
     }
@@ -130,10 +121,6 @@ impl PrimitiveVectorElement for VectorElementTypeHalf {
     fn datatype() -> VectorStorageDatatype {
         VectorStorageDatatype::Float16
     }
-
-    fn as_bytes(vector: &[Self]) -> &[u8] {
-        must_cast_slice(vector)
-    }
 }
 
 impl PrimitiveVectorElement for VectorElementTypeByte {
@@ -153,10 +140,10 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         if let QuantizationConfig::Binary(_) = quantization_config {
-            Cow::from(
+            Cow::Owned(
                 vector
                     .iter()
                     .map(|&x| VectorElementType::from(x) - 127.0)
@@ -167,17 +154,7 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
                 .iter()
                 .map(|&x| VectorElementType::from(x))
                 .collect_vec();
-            let preprocessed_vector = match distance {
-                Distance::Cosine => <CosineMetric as Metric<VectorElementType>>::preprocess(vector),
-                Distance::Euclid => <EuclidMetric as Metric<VectorElementType>>::preprocess(vector),
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementType>>::preprocess(vector)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementType>>::preprocess(vector)
-                }
-            };
-            Cow::from(preprocessed_vector)
+            Cow::Owned(distance.preprocess_vector::<VectorElementType>(vector))
         }
     }
 
@@ -211,9 +188,5 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
                 .collect_vec(),
             multivector.as_vec_ref().dim,
         ))
-    }
-
-    fn as_bytes(vector: &[Self]) -> &[u8] {
-        IntoBytes::as_bytes(vector)
     }
 }

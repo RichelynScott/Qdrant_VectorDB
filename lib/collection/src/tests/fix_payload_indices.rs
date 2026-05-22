@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::save_on_disk::SaveOnDisk;
 use segment::types::{PayloadFieldSchema, PayloadSchemaType};
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-use crate::save_on_disk::SaveOnDisk;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::*;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -20,7 +21,8 @@ async fn test_fix_payload_indices() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -34,7 +36,7 @@ async fn test_fix_payload_indices() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema.clone(),
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -46,26 +48,31 @@ async fn test_fix_payload_indices() {
 
     let upsert_ops = upsert_operation();
     shard
-        .update(upsert_ops.into(), true, hw_acc.clone())
+        .update(upsert_ops.into(), WaitUntil::Visible, None, hw_acc.clone())
         .await
         .unwrap();
 
     // Create payload index in shard locally, not in global collection configuration
     let index_op = create_payload_index_operation();
     shard
-        .update(index_op.into(), true, hw_acc.clone())
+        .update(index_op.into(), WaitUntil::Visible, None, hw_acc.clone())
         .await
         .unwrap();
 
     let delete_point_op = delete_point_operation(4);
     shard
-        .update(delete_point_op.into(), true, hw_acc.clone())
+        .update(
+            delete_point_op.into(),
+            WaitUntil::Visible,
+            None,
+            hw_acc.clone(),
+        )
         .await
         .unwrap();
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    drop(shard);
+    shard.stop_gracefully().await;
 
     payload_index_schema
         .write(|schema| {
@@ -88,7 +95,8 @@ async fn test_fix_payload_indices() {
         config.optimizer_config.clone(),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        true,
+        update_runtime.clone(),
         current_runtime,
         ResourceBudget::default(),
     )

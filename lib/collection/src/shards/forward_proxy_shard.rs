@@ -1,33 +1,38 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use ahash::HashSet;
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
-use common::types::TelemetryDetail;
+use common::types::{DeferredBehavior, TelemetryDetail};
+use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::facets::{FacetParams, FacetResponse};
-use segment::data_types::order_by::OrderBy;
-use segment::data_types::segment_manifest::SegmentManifests;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, PointIdType, ScoredPoint, SizeStats, SnapshotFormat, WithPayload,
-    WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, PointIdType, ScoredPoint, SizeStats, SnapshotFormat, StrictModeConfig,
+    WithPayload, WithPayloadInterface, WithVector,
 };
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use shard::count::CountRequestInternal;
+use shard::retrieve::record_internal::RecordInternal;
+use shard::scroll::ScrollRequestInternal;
+use shard::search::CoreSearchRequestBatch;
+use shard::snapshots::snapshot_manifest::SnapshotManifest;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::shard::ShardId;
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
+use crate::common::memory_reporter::CollectionMemoryReport;
 use crate::hash_ring::HashRingRouter;
 use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, PointSyncOperation,
 };
 use crate::operations::types::{
-    CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, OptimizersStatus, PointRequestInternal, RecordInternal,
-    UpdateResult, UpdateStatus,
+    CollectionError, CollectionInfo, CollectionResult, CountResult, OptimizersStatus,
+    PointRequestInternal, UpdateResult, UpdateStatus,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::{
@@ -36,8 +41,61 @@ use crate::operations::{
 };
 use crate::shards::local_shard::LocalShard;
 use crate::shards::remote_shard::RemoteShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::shards::telemetry::LocalShardTelemetry;
+
+/// Result of a single batch transfer, including timing breakdown.
+pub struct TransferBatchResult {
+    pub next_page_offset: Option<PointIdType>,
+    pub count: usize,
+    /// Time spent reading points from local storage (scroll + retrieve).
+    pub read_duration: Duration,
+    /// Time spent sending points to the remote shard (gRPC upsert).
+    pub send_duration: Duration,
+}
+
+/// A transfer batch that has been read from local storage but not yet sent to the remote shard.
+///
+/// Holds the forward proxy's update lock to prevent concurrent updates between reading and sending
+/// the batch. The lock is released when this struct is dropped.
+///
+/// Use [`PreparedTransferBatch::send`] to send the batch to a remote shard.
+pub struct PreparedTransferBatch {
+    pub operation: CollectionUpdateOperations,
+    pub next_page_offset: Option<PointIdType>,
+    pub count: usize,
+    pub read_duration: Duration,
+    /// Whether to wait for the remote to process the batch.
+    pub wait: bool,
+    /// Holds the update lock to prevent concurrent updates during the transfer.
+    _update_lock: OwnedMutexGuard<()>,
+}
+
+impl PreparedTransferBatch {
+    /// Send this batch to the given remote shard.
+    ///
+    /// The update lock is released after sending completes.
+    pub async fn send(self, remote_shard: &RemoteShard) -> CollectionResult<TransferBatchResult> {
+        let send_start = Instant::now();
+        remote_shard
+            .update(
+                // Don't add clock tag, this transfers points out of regular order (SyncPoints)
+                OperationWithClockTag::from(self.operation),
+                WaitUntil::from(self.wait),
+                None,
+                HwMeasurementAcc::disposable(), // Internal operation
+            )
+            .await?;
+        let send_duration = send_start.elapsed();
+
+        Ok(TransferBatchResult {
+            next_page_offset: self.next_page_offset,
+            count: self.count,
+            read_duration: self.read_duration,
+            send_duration,
+        })
+    }
+}
 
 /// ForwardProxyShard
 ///
@@ -50,25 +108,36 @@ pub struct ForwardProxyShard {
     pub(crate) wrapped_shard: LocalShard,
     pub(crate) remote_shard: RemoteShard,
     resharding_hash_ring: Option<HashRingRouter>,
+    filter: Option<Box<Filter>>,
     /// Lock required to protect transfer-in-progress updates.
     /// It should block data updating operations while the batch is being transferred.
-    update_lock: Mutex<()>,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl ForwardProxyShard {
+    #[allow(clippy::result_large_err)]
     pub fn new(
         shard_id: ShardId,
         wrapped_shard: LocalShard,
         remote_shard: RemoteShard,
         resharding_hash_ring: Option<HashRingRouter>,
-    ) -> Self {
+        filter: Option<Filter>,
+    ) -> Result<Self, (CollectionError, LocalShard)> {
         // Validate that `ForwardProxyShard` initialized correctly
+
+        if resharding_hash_ring.is_some() && filter.is_some() {
+            return Err((CollectionError::forward_proxy_error(
+                remote_shard.peer_id,
+                "ForwardProxyShard cannot have both resharding_hash_ring and filter set at the same time".to_string(),
+            ), wrapped_shard));
+        }
 
         debug_assert!({
             let is_regular = shard_id == remote_shard.id && resharding_hash_ring.is_none();
             let is_resharding = shard_id != remote_shard.id && resharding_hash_ring.is_some();
+            let is_replicating_points = shard_id != remote_shard.id && filter.is_some();
 
-            is_regular || is_resharding
+            is_regular || is_resharding || is_replicating_points
         });
 
         if shard_id == remote_shard.id && resharding_hash_ring.is_some() {
@@ -78,13 +147,14 @@ impl ForwardProxyShard {
             );
         }
 
-        Self {
+        Ok(Self {
             shard_id,
             wrapped_shard,
             remote_shard,
             resharding_hash_ring,
-            update_lock: Mutex::new(()),
-        }
+            filter: filter.map(Box::new),
+            update_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Create payload indexes in the remote shard same as in the wrapped shard.
@@ -98,14 +168,15 @@ impl ForwardProxyShard {
             // TODO: Is cancelling `RemoteShard::update` safe for *receiver*?
             self.remote_shard
                 .update(
-                    // TODO: Assign clock tag!? 🤔
+                    // Don't add clock tag, this transfers indices out of regular order
                     OperationWithClockTag::from(CollectionUpdateOperations::FieldIndexOperation(
                         FieldIndexOperations::CreateIndex(CreateIndex {
                             field_name: index_key,
                             field_schema: Some(index_type.try_into()?),
                         }),
                     )),
-                    false,
+                    WaitUntil::Wal,
+                    None,
                     HwMeasurementAcc::disposable(), // Internal operation
                 )
                 .await?;
@@ -113,40 +184,46 @@ impl ForwardProxyShard {
         Ok(())
     }
 
-    /// Move batch of points to the remote shard
+    /// Read a batch of points to transfer, without sending it yet.
     ///
-    /// Returns new point offset and actual number of transferred points. The new point offset can
-    /// be used to start the next batch from.
+    /// Returns a [`PreparedTransferBatch`] holding the batch data and the update lock. The lock
+    /// prevents concurrent updates between reading and sending. Use
+    /// [`PreparedTransferBatch::send`] to send the batch to a remote shard.
+    ///
+    /// This allows the caller to release other locks (e.g. the shard holder lock) before sending,
+    /// which avoids holding the shard holder lock during the potentially slow network transfer.
     ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn transfer_batch(
+    pub async fn read_transfer_batch(
         &self,
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: Option<&HashRingRouter>,
         merge_points: bool,
-        runtime_handle: &Handle,
-    ) -> CollectionResult<(Option<PointIdType>, usize)> {
+        runtime_handle: &AdaptiveSearchHandle,
+    ) -> CollectionResult<PreparedTransferBatch> {
         debug_assert!(batch_size > 0);
-        let _update_lock = self.update_lock.lock().await;
+        let update_lock = self.update_lock.clone().lock_owned().await;
 
+        let read_start = Instant::now();
         let (points, next_page_offset) = match hashring_filter {
             Some(hashring_filter) => {
                 self.read_batch_with_hashring(offset, batch_size, hashring_filter, runtime_handle)
                     .await?
             }
-            None => self.read_batch(offset, batch_size, runtime_handle).await?,
+            None => {
+                self.read_batch(offset, batch_size, self.filter.as_deref(), runtime_handle)
+                    .await?
+            }
         };
+        let read_duration = read_start.elapsed();
 
         // Only wait on last batch
         let wait = next_page_offset.is_none();
         let count = points.len();
 
-        // Use sync API to leverage potentially existing points
-        // Normally use SyncPoints, to completely replace everything in the target shard
-        // For resharding we need to merge points from multiple transfers, requiring a different operation
         let point_operation = if !merge_points {
             PointOperations::SyncPoints(PointSyncOperation {
                 from_id: offset,
@@ -156,17 +233,16 @@ impl ForwardProxyShard {
         } else {
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(points))
         };
-        let insert_points_operation = CollectionUpdateOperations::PointOperation(point_operation);
+        let operation = CollectionUpdateOperations::PointOperation(point_operation);
 
-        self.remote_shard
-            .update(
-                OperationWithClockTag::from(insert_points_operation),
-                wait,
-                HwMeasurementAcc::disposable(), // Internal operation
-            ) // TODO: Assign clock tag!? 🤔
-            .await?;
-
-        Ok((next_page_offset, count))
+        Ok(PreparedTransferBatch {
+            operation,
+            next_page_offset,
+            count,
+            read_duration,
+            wait,
+            _update_lock: update_lock,
+        })
     }
 
     /// Read a batch of points to transfer to the remote shard
@@ -185,22 +261,23 @@ impl ForwardProxyShard {
         &self,
         offset: Option<PointIdType>,
         batch_size: usize,
-        runtime_handle: &Handle,
+        filter: Option<&Filter>,
+        runtime_handle: &AdaptiveSearchHandle,
     ) -> CollectionResult<(Vec<PointStructPersisted>, Option<PointIdType>)> {
         let limit = batch_size + 1;
 
         let mut batch = self
             .wrapped_shard
-            .scroll_by(
+            .local_scroll_by_id(
                 offset,
                 limit,
                 &WithPayloadInterface::Bool(true),
                 &WithVector::Bool(true),
-                None,
+                filter,
                 runtime_handle,
-                None,
                 None,                           // No timeout
                 HwMeasurementAcc::disposable(), // Internal operation, no need to measure hardware here.
+                DeferredBehavior::IncludeAll, // We must transfer deferred points too so we include them in this scroll operation.
             )
             .await?;
 
@@ -237,7 +314,7 @@ impl ForwardProxyShard {
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: &HashRingRouter,
-        runtime_handle: &Handle,
+        runtime_handle: &AdaptiveSearchHandle,
     ) -> CollectionResult<(Vec<PointStructPersisted>, Option<PointIdType>)> {
         // Oversample batch size to account for points that will be filtered out by the hash ring
         let oversample_factor = match &hashring_filter {
@@ -260,16 +337,16 @@ impl ForwardProxyShard {
         // transferred.
         let mut batch = self
             .wrapped_shard
-            .scroll_by(
+            .local_scroll_by_id(
                 offset,
                 limit,
                 &WithPayloadInterface::Bool(false),
                 &WithVector::Bool(false),
                 None,
                 runtime_handle,
-                None,
                 None,                           // No timeout
                 HwMeasurementAcc::disposable(), // Internal operation, no need to measure hardware here.
+                DeferredBehavior::IncludeAll, // We must transfer deferred points too so we include them in this scroll op.
             )
             .await?;
 
@@ -297,6 +374,7 @@ impl ForwardProxyShard {
                 runtime_handle,
                 None,                           // No timeout
                 HwMeasurementAcc::disposable(), // Internal operation, no need to measure hardware here.
+                DeferredBehavior::IncludeAll,
             )
             .await?;
 
@@ -312,57 +390,84 @@ impl ForwardProxyShard {
         (self.wrapped_shard, self.remote_shard)
     }
 
-    /// Forward `create_snapshot` to `wrapped_shard`
-    pub async fn create_snapshot(
+    /// Forward `get_snapshot_creator` to `wrapped_shard`
+    pub async fn get_snapshot_creator(
         &self,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
+        manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
         self.wrapped_shard
-            .create_snapshot(temp_path, tar, format, save_wal)
+            .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
             .await
     }
 
-    pub fn segment_manifests(&self) -> CollectionResult<SegmentManifests> {
-        self.wrapped_shard.segment_manifests()
+    pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+        self.wrapped_shard.snapshot_manifest().await
     }
 
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.wrapped_shard.on_optimizer_config_update().await
     }
 
-    pub async fn on_strict_mode_config_update(&mut self) {
-        self.wrapped_shard.on_strict_mode_config_update().await
+    pub fn on_strict_mode_config_update(&mut self, new_strict_mode: &StrictModeConfig) {
+        self.wrapped_shard
+            .on_strict_mode_config_update(new_strict_mode)
     }
 
     pub fn trigger_optimizers(&self) {
         self.wrapped_shard.trigger_optimizers();
     }
 
-    pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
-        self.wrapped_shard.get_telemetry_data(detail)
+    pub async fn get_telemetry_data(
+        &self,
+        detail: TelemetryDetail,
+        timeout: Duration,
+    ) -> CollectionResult<LocalShardTelemetry> {
+        self.wrapped_shard.get_telemetry_data(detail, timeout).await
     }
 
-    pub fn get_optimization_status(&self) -> OptimizersStatus {
-        self.wrapped_shard.get_optimization_status()
+    pub async fn get_optimization_status(
+        &self,
+        timeout: Duration,
+    ) -> CollectionResult<OptimizersStatus> {
+        self.wrapped_shard.get_optimization_status(timeout).await
     }
 
-    pub fn get_size_stats(&self) -> SizeStats {
-        self.wrapped_shard.get_size_stats()
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
+        self.wrapped_shard.get_size_stats(timeout).await
     }
 
     pub fn update_tracker(&self) -> &UpdateTracker {
         self.wrapped_shard.update_tracker()
     }
 
-    pub fn estimate_cardinality(
+    pub fn optimizers_log(&self) -> Arc<ParkingMutex<TrackerLog>> {
+        self.wrapped_shard.optimizers_log()
+    }
+
+    pub async fn estimate_cardinality(
         &self,
         filter: Option<&Filter>,
-        hw_counter: &HardwareCounterCell,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CardinalityEstimation> {
-        self.wrapped_shard.estimate_cardinality(filter, hw_counter)
+        self.wrapped_shard
+            .estimate_cardinality(filter, hw_measurement_acc)
+            .await
+    }
+
+    pub async fn set_extended_wal_retention(&self) {
+        self.wrapped_shard.set_extended_wal_retention().await;
+    }
+
+    pub async fn set_normal_wal_retention(&self) {
+        self.wrapped_shard.set_normal_wal_retention().await;
+    }
+
+    pub async fn memory_report(&self) -> CollectionResult<CollectionMemoryReport> {
+        self.wrapped_shard.memory_report().await
     }
 }
 
@@ -376,7 +481,8 @@ impl ShardOperation for ForwardProxyShard {
     async fn update(
         &self,
         operation: OperationWithClockTag,
-        _wait: bool,
+        _wait: WaitUntil,
+        timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // If we apply `local_shard` update, we *have to* execute `remote_shard` update to completion
@@ -388,12 +494,52 @@ impl ShardOperation for ForwardProxyShard {
         // Shard update is within a write lock scope, because we need a way to block the shard updates
         // during the transfer restart and finalization.
 
-        // We always have to wait for the result of the update, cause after we release the lock,
-        // the transfer needs to have access to the latest version of points.
+        // We always have to wait for the operation to be written to segments, because after we
+        // release the lock, the transfer needs to have access to the latest version of points.
+        // Note that we wait on `Segment` and not on `Visible`, because with the latter we'd also
+        // wait on deferred points to be fully optimized which is not necessary for transfers.
         let mut result = self
             .wrapped_shard
-            .update(operation.clone(), true, hw_measurement_acc.clone())
+            .update(
+                operation.clone(),
+                WaitUntil::Segment,
+                timeout,
+                hw_measurement_acc.clone(),
+            )
             .await?;
+
+        let points_matching_filter_before = {
+            if let Some(filter) = &self.filter
+                && let Some(point_ids) = operation.operation.upsert_point_ids()
+            {
+                let filter = filter.clone();
+
+                let affected_points: HashSet<_> = self
+                    .wrapped_shard
+                    .local_scroll_by_id(
+                        None,
+                        point_ids.len(),
+                        &WithPayloadInterface::Bool(false),
+                        &WithVector::Bool(false),
+                        Some(&filter.with_point_ids(point_ids)),
+                        &self.wrapped_shard.search_runtime,
+                        None,                           // No timeout
+                        HwMeasurementAcc::disposable(), // Internal operation, no need to measure hardware here?
+                        DeferredBehavior::IncludeAll,
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|record| record.id)
+                    .collect();
+                // Operation is applicable to a subset of points, only forward those
+                Some(affected_points)
+            } else {
+                // If operation doesn't create new points, we can safely forward it as-is
+                // Worst-case, it will error out with "point not found" on the remote side
+                // Which we will ignore anyway
+                None
+            }
+        };
 
         let forward_operation = if let Some(ring) = &self.resharding_hash_ring {
             // If `ForwardProxyShard::resharding_hash_ring` is `Some`, we assume that proxy is used
@@ -411,60 +557,54 @@ impl ShardOperation for ForwardProxyShard {
                     .map(|(_, op)| op),
             };
 
-            // Strip the clock tag from the operation, because clock tags are incompatible between
-            // different shards.
-            //
-            // Even though we expect (and assert) that this whole branch is only executed when
-            // forwarding to a *different* remote shard, we still handle the case when local and
-            // remote shards are the same, *just in case*.
-            //
-            // In such case `split_by_shard` call above would be a no-op, and we can preserve the
-            // clock tag.
-            let tag = if self.shard_id != self.remote_shard.id {
-                None
-            } else {
-                log::warn!(
-                    "ForwardProxyShard contains resharding hashring, \
-                     but wrapped shard id and remote shard id are the same",
-                );
+            op.map(|op| OperationWithClockTag::new(op, operation.clock_tag))
+        } else if let Some(point_ids) = points_matching_filter_before {
+            let mut modified_operation = operation.clone();
+            modified_operation
+                .operation
+                .retain_point_ids(|point_id| point_ids.contains(point_id));
 
-                operation.clock_tag
-            };
-
-            op.map(|op| OperationWithClockTag::new(op, tag))
+            Some(modified_operation)
         } else {
-            // If `ForwardProxyShard::resharding_hash_ring` is `None`, we assume that proxy is used
-            // during *regular* shard transfer, so operation can be forwarded as-is, without any
-            // additional handling.
-
-            debug_assert_eq!(self.shard_id, self.remote_shard.id);
+            #[cfg(debug_assertions)]
+            if self.filter.is_none() {
+                // If `ForwardProxyShard` `resharding_hash_ring` and `filter` are `None`, we assume that proxy is used
+                // during *regular* shard transfer, so operation can be forwarded as-is, without any
+                // additional handling.
+                debug_assert_eq!(self.shard_id, self.remote_shard.id);
+            }
 
             Some(operation)
         };
 
-        if let Some(operation) = forward_operation {
-            let remote_result = self
-                .remote_shard
-                .update(operation, false, hw_measurement_acc)
-                .await
-                .map_err(|err| {
-                    CollectionError::forward_proxy_error(self.remote_shard.peer_id, err)
-                })?;
+        let Some(mut operation) = forward_operation else {
+            return Ok(result);
+        };
 
-            // Merge `result` and `remote_result`:
-            //
-            // - Pick `clock_tag` with *newer* `clock_tick`
-            let tick = result.clock_tag.map(|tag| tag.clock_tick);
-            let remote_tick = remote_result.clock_tag.map(|tag| tag.clock_tick);
+        // Strip the clock tag from the operation, because clock tags are incompatible between different shards.
+        if self.shard_id != self.remote_shard.id {
+            operation.clock_tag = None;
+        }
 
-            if remote_tick > tick || tick.is_none() {
-                result.clock_tag = remote_result.clock_tag;
-            }
+        let remote_result = self
+            .remote_shard
+            .update(operation, WaitUntil::Wal, None, hw_measurement_acc)
+            .await
+            .map_err(|err| CollectionError::forward_proxy_error(self.remote_shard.peer_id, err))?;
 
-            // - If any node *rejected* the operation, propagate `UpdateStatus::ClockRejected`
-            if remote_result.status == UpdateStatus::ClockRejected {
-                result.status = UpdateStatus::ClockRejected;
-            }
+        // Merge `result` and `remote_result`:
+        //
+        // - Pick `clock_tag` with *newer* `clock_tick`
+        let tick = result.clock_tag.map(|tag| tag.clock_tick);
+        let remote_tick = remote_result.clock_tag.map(|tag| tag.clock_tick);
+
+        if remote_tick > tick || tick.is_none() {
+            result.clock_tag = remote_result.clock_tag;
+        }
+
+        // - If any node *rejected* the operation, propagate `UpdateStatus::ClockRejected`
+        if remote_result.status == UpdateStatus::ClockRejected {
+            result.status = UpdateStatus::ClockRejected;
         }
 
         Ok(result)
@@ -473,28 +613,41 @@ impl ShardOperation for ForwardProxyShard {
     /// Forward read-only `scroll_by` to `wrapped_shard`
     async fn scroll_by(
         &self,
-        offset: Option<ExtendedPointId>,
-        limit: usize,
-        with_payload_interface: &WithPayloadInterface,
-        with_vector: &WithVector,
-        filter: Option<&Filter>,
-        search_runtime_handle: &Handle,
-        order_by: Option<&OrderBy>,
+        request: Arc<ScrollRequestInternal>,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .scroll_by(
+            .scroll_by(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .await
+    }
+
+    async fn local_scroll_by_id(
+        &self,
+        offset: Option<ExtendedPointId>,
+        limit: usize,
+        with_payload_interface: &WithPayloadInterface,
+        with_vector: &WithVector,
+        filter: Option<&Filter>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        let local_shard = &self.wrapped_shard;
+        local_shard
+            .local_scroll_by_id(
                 offset,
                 limit,
                 with_payload_interface,
                 with_vector,
                 filter,
                 search_runtime_handle,
-                order_by,
                 timeout,
                 hw_measurement_acc,
+                deferred_behavior,
             )
             .await
     }
@@ -506,7 +659,7 @@ impl ShardOperation for ForwardProxyShard {
     async fn core_search(
         &self,
         request: Arc<CoreSearchRequestBatch>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
@@ -519,13 +672,20 @@ impl ShardOperation for ForwardProxyShard {
     async fn count(
         &self,
         request: Arc<CountRequestInternal>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<CountResult> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .count(
+                request,
+                search_runtime_handle,
+                timeout,
+                hw_measurement_acc,
+                deferred_behavior,
+            )
             .await
     }
 
@@ -534,9 +694,10 @@ impl ShardOperation for ForwardProxyShard {
         request: Arc<PointRequestInternal>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
@@ -547,6 +708,7 @@ impl ShardOperation for ForwardProxyShard {
                 search_runtime_handle,
                 timeout,
                 hw_measurement_acc,
+                deferred_behavior,
             )
             .await
     }
@@ -554,7 +716,7 @@ impl ShardOperation for ForwardProxyShard {
     async fn query_batch(
         &self,
         requests: Arc<Vec<ShardQueryRequest>>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
@@ -567,7 +729,7 @@ impl ShardOperation for ForwardProxyShard {
     async fn facet(
         &self,
         request: Arc<FacetParams>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
@@ -575,5 +737,9 @@ impl ShardOperation for ForwardProxyShard {
         local_shard
             .facet(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
+    }
+
+    async fn stop_gracefully(self) {
+        self.wrapped_shard.stop_gracefully().await
     }
 }

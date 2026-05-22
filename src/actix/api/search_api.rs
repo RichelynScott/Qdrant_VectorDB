@@ -7,15 +7,13 @@ use collection::operations::types::{
     CoreSearchRequest, SearchGroupsRequest, SearchRequest, SearchRequestBatch,
 };
 use itertools::Itertools;
-use storage::content_manager::collection_verification::{
-    check_strict_mode, check_strict_mode_batch,
-};
+use storage::content_manager::collection_verification::check_strict_mode;
 use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
 use super::CollectionPath;
 use super::read_params::ReadParams;
-use crate::actix::auth::ActixAccess;
+use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{
     get_request_hardware_counter, process_response, process_response_error,
 };
@@ -24,14 +22,14 @@ use crate::common::query::{
 };
 use crate::settings::ServiceConfig;
 
-#[post("/collections/{name}/points/search")]
+#[post("/collections/{collection_name}/points/search")]
 async fn search_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<SearchRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let SearchRequest {
         search_request,
@@ -41,9 +39,9 @@ async fn search_points(
     let pass = match check_strict_mode(
         &search_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -58,7 +56,7 @@ async fn search_points(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
@@ -66,12 +64,12 @@ async fn search_points(
     let timing = Instant::now();
 
     let result = do_core_search_points(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         search_request.into(),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -86,15 +84,28 @@ async fn search_points(
     process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points/search/batch")]
+#[post("/collections/{collection_name}/points/search/batch")]
 async fn batch_search_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<SearchRequestBatch>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
+    let pass = match check_strict_mode(
+        &*request,
+        params.timeout_as_secs(),
+        &collection.collection_name,
+        &dispatcher,
+        &auth,
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(err) => return process_response_error(err, Instant::now(), None),
+    };
+
     let requests = request
         .into_inner()
         .searches
@@ -114,22 +125,9 @@ async fn batch_search_points(
         })
         .collect::<Vec<_>>();
 
-    let pass = match check_strict_mode_batch(
-        requests.iter().map(|i| &i.0),
-        params.timeout_as_secs(),
-        &collection.name,
-        &dispatcher,
-        &access,
-    )
-    .await
-    {
-        Ok(pass) => pass,
-        Err(err) => return process_response_error(err, Instant::now(), None),
-    };
-
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
@@ -137,11 +135,11 @@ async fn batch_search_points(
     let timing = Instant::now();
 
     let result = do_search_batch_points(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         requests,
         params.consistency,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -161,14 +159,14 @@ async fn batch_search_points(
     process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points/search/groups")]
+#[post("/collections/{collection_name}/points/search/groups")]
 async fn search_point_groups(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<SearchGroupsRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let SearchGroupsRequest {
         search_group_request,
@@ -178,9 +176,9 @@ async fn search_point_groups(
     let pass = match check_strict_mode(
         &search_group_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -195,19 +193,19 @@ async fn search_point_groups(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let result = do_search_point_groups(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         search_group_request,
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -216,14 +214,14 @@ async fn search_point_groups(
     process_response(result, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points/search/matrix/pairs")]
+#[post("/collections/{collection_name}/points/search/matrix/pairs")]
 async fn search_points_matrix_pairs(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<SearchMatrixRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let SearchMatrixRequest {
         search_request,
@@ -233,9 +231,9 @@ async fn search_points_matrix_pairs(
     let pass = match check_strict_mode(
         &search_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -250,19 +248,19 @@ async fn search_points_matrix_pairs(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let response = do_search_points_matrix(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         CollectionSearchMatrixRequest::from(search_request),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -272,14 +270,14 @@ async fn search_points_matrix_pairs(
     process_response(response, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points/search/matrix/offsets")]
+#[post("/collections/{collection_name}/points/search/matrix/offsets")]
 async fn search_points_matrix_offsets(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<SearchMatrixRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let SearchMatrixRequest {
         search_request,
@@ -289,9 +287,9 @@ async fn search_points_matrix_offsets(
     let pass = match check_strict_mode(
         &search_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -306,19 +304,19 @@ async fn search_points_matrix_offsets(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let response = do_search_points_matrix(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         CollectionSearchMatrixRequest::from(search_request),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )

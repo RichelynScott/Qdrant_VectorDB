@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use parking_lot::RwLock;
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::ThreadRng;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::only_default_vector;
@@ -13,15 +13,19 @@ use segment::segment::Segment;
 use segment::segment_constructor::simple_segment_constructor::{
     VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment, build_simple_segment,
 };
-use segment::types::{Distance, Payload, PointIdType, SeqNumberType};
+use segment::types::{Distance, HnswGlobalConfig, Payload, PointIdType, SeqNumberType};
+use shard::operations::optimization::OptimizerThresholds;
+use shard::segment_holder::locked::LockedSegmentHolder;
 
 use crate::collection_manager::holders::segment_holder::SegmentHolder;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
 use crate::collection_manager::optimizers::merge_optimizer::MergeOptimizer;
-use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::config::CollectionParams;
 use crate::operations::types::VectorsConfig;
 use crate::operations::vector_params_builder::VectorParamsBuilder;
+use crate::optimizers_builder::build_segment_optimizer_config;
+
+pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn empty_segment(path: &Path) -> Segment {
     build_simple_segment(path, 4, Distance::Dot).unwrap()
@@ -44,10 +48,10 @@ impl PointIdGenerator {
     pub fn unique(&mut self) -> PointIdType {
         for _ in 0..100_000 {
             let id = self.random();
-            if let PointIdType::NumId(num) = id {
-                if self.used.insert(num) {
-                    return id;
-                }
+            if let PointIdType::NumId(num) = id
+                && self.used.insert(num)
+            {
+                return id;
             }
         }
         panic!("failed to generate unique point ID after 100000 attempts");
@@ -207,7 +211,7 @@ pub fn build_segment_2(path: &Path) -> Segment {
     segment2
 }
 
-pub fn build_test_holder(path: &Path) -> RwLock<SegmentHolder> {
+pub fn build_test_holder(path: &Path) -> LockedSegmentHolder {
     let segment1 = build_segment_1(path);
     let segment2 = build_segment_2(path);
 
@@ -216,7 +220,7 @@ pub fn build_test_holder(path: &Path) -> RwLock<SegmentHolder> {
     let _sid1 = holder.add_new(segment1);
     let _sid2 = holder.add_new(segment2);
 
-    RwLock::new(holder)
+    LockedSegmentHolder::new(holder)
 }
 
 pub(crate) fn get_merge_optimizer(
@@ -225,23 +229,26 @@ pub(crate) fn get_merge_optimizer(
     dim: usize,
     optimizer_thresholds: Option<OptimizerThresholds>,
 ) -> MergeOptimizer {
+    let collection_params = CollectionParams {
+        vectors: VectorsConfig::Single(VectorParamsBuilder::new(dim as u64, Distance::Dot).build()),
+        ..CollectionParams::empty()
+    };
+    let hnsw_config = Default::default();
+    let segment_config =
+        build_segment_optimizer_config(&collection_params, &hnsw_config, &Default::default());
+
     MergeOptimizer::new(
         5,
         optimizer_thresholds.unwrap_or(OptimizerThresholds {
             max_segment_size_kb: 100_000,
             memmap_threshold_kb: 1_000_000,
             indexing_threshold_kb: 1_000_000,
+            deferred_internal_id: None,
         }),
         segment_path.to_owned(),
         collection_temp_dir.to_owned(),
-        CollectionParams {
-            vectors: VectorsConfig::Single(
-                VectorParamsBuilder::new(dim as u64, Distance::Dot).build(),
-            ),
-            ..CollectionParams::empty()
-        },
-        Default::default(),
-        Default::default(),
+        segment_config,
+        HnswGlobalConfig::default(),
     )
 }
 
@@ -250,22 +257,25 @@ pub(crate) fn get_indexing_optimizer(
     collection_temp_dir: &Path,
     dim: usize,
 ) -> IndexingOptimizer {
+    let collection_params = CollectionParams {
+        vectors: VectorsConfig::Single(VectorParamsBuilder::new(dim as u64, Distance::Dot).build()),
+        ..CollectionParams::empty()
+    };
+    let hnsw_config = Default::default();
+    let segment_config =
+        build_segment_optimizer_config(&collection_params, &hnsw_config, &Default::default());
+
     IndexingOptimizer::new(
         2,
         OptimizerThresholds {
             max_segment_size_kb: 100_000,
             memmap_threshold_kb: 100,
             indexing_threshold_kb: 100,
+            deferred_internal_id: None,
         },
         segment_path.to_owned(),
         collection_temp_dir.to_owned(),
-        CollectionParams {
-            vectors: VectorsConfig::Single(
-                VectorParamsBuilder::new(dim as u64, Distance::Dot).build(),
-            ),
-            ..CollectionParams::empty()
-        },
-        Default::default(),
-        Default::default(),
+        segment_config,
+        HnswGlobalConfig::default(),
     )
 }

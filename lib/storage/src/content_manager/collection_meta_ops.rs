@@ -8,20 +8,24 @@ use collection::operations::config_diff::{
 use collection::operations::types::{
     SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
 };
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
 use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
 use collection::shards::{CollectionId, replica_set};
 use schemars::JsonSchema;
+use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::types::{
-    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    Payload, PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
     VectorNameBuf,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// Re-export staging types when the feature is enabled
+#[cfg(feature = "staging")]
+pub use super::staging::TestSlowDown;
 use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
@@ -100,13 +104,6 @@ impl From<RenameAlias> for AliasOperations {
 }
 
 /// Operation for creating new collection and (optionally) specify index params
-#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
-#[serde(rename_all = "snake_case")]
-pub struct InitFrom {
-    pub collection: CollectionId,
-}
-
-/// Operation for creating new collection and (optionally) specify index params
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateCollection {
@@ -163,9 +160,6 @@ pub struct CreateCollection {
     #[serde(alias = "optimizer_config")]
     #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>,
-    /// Specify other collection to copy data from.
-    #[serde(default)]
-    pub init_from: Option<InitFrom>,
     /// Quantization parameters. If none - quantization is disabled.
     #[serde(default, alias = "quantization")]
     #[validate(nested)]
@@ -179,6 +173,11 @@ pub struct CreateCollection {
     #[serde(default)]
     #[schemars(skip)]
     pub uuid: Option<Uuid>,
+    /// Arbitrary JSON metadata for the collection
+    /// This can be used to store application-specific information
+    /// such as creation time, migration data, inference model info, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Payload>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -195,8 +194,45 @@ impl CreateCollectionOperation {
         collection_name: String,
         create_collection: CreateCollection,
     ) -> StorageResult<Self> {
+        // Apply the same vector-name validation that the
+        // `PUT /collections/{name}/vectors/{vector_name}` endpoint enforces
+        // (length 0..=200, no filesystem-unsafe characters), so both creation
+        // paths reject the same set of bad names. The `Validate` derive on
+        // `CreateCollection` only walks `BTreeMap` *values*, never keys, so this
+        // has to run imperatively here.
+        //
+        // The unnamed slot used by `VectorsConfig::Single` is exempt: its
+        // implicit key is the empty `DEFAULT_VECTOR_NAME` constant and a
+        // `Single` config has no user-supplied name to validate.
+        if let collection::operations::types::VectorsConfig::Multi(multi) =
+            &create_collection.vectors
+        {
+            for vector_name in multi.keys() {
+                common::validation::validate_vector_name(vector_name).map_err(|err| {
+                    StorageError::bad_input(format!(
+                        "Invalid dense vector name `{vector_name}`: {err}",
+                    ))
+                })?;
+            }
+        }
+        if let Some(sparse_config) = &create_collection.sparse_vectors {
+            for vector_name in sparse_config.keys() {
+                common::validation::validate_vector_name(vector_name).map_err(|err| {
+                    StorageError::bad_input(format!(
+                        "Invalid sparse vector name `{vector_name}`: {err}",
+                    ))
+                })?;
+            }
+        }
+
         // validate vector names are unique between dense and sparse vectors
         if let Some(sparse_config) = &create_collection.sparse_vectors {
+            if sparse_config.contains_key(DEFAULT_VECTOR_NAME) {
+                return Err(StorageError::bad_input(
+                    "Sparse vector name cannot be empty",
+                ));
+            }
+
             let mut dense_names = create_collection.vectors.params_iter().map(|p| p.0);
             if let Some(duplicate_name) = dense_names.find(|name| sparse_config.contains_key(*name))
             {
@@ -237,6 +273,7 @@ pub struct UpdateCollection {
     /// Custom params for Optimizers.  If none - it is left unchanged.
     /// This operation is blocking, it will only proceed once all current optimizations are complete
     #[serde(alias = "optimizer_config")]
+    #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>, // TODO: Allow updates for other configuration params as well
     /// Collection base params. If none - it is left unchanged.
     pub params: Option<CollectionParamsDiff>,
@@ -252,6 +289,10 @@ pub struct UpdateCollection {
     pub sparse_vectors: Option<SparseVectorsConfig>,
     #[validate(nested)]
     pub strict_mode_config: Option<StrictModeConfig>,
+    /// Metadata to update for the collection. If provided, this will merge with existing metadata.
+    /// To remove metadata, set it to an empty object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Payload>,
 }
 
 /// Operation for updating parameters of the existing collection
@@ -275,6 +316,7 @@ impl UpdateCollectionOperation {
                 quantization_config: None,
                 sparse_vectors: None,
                 strict_mode_config: None,
+                metadata: None,
             },
             shard_replica_changes: None,
         }
@@ -372,6 +414,7 @@ pub struct CreateShardKey {
     pub collection_name: String,
     pub shard_key: ShardKey,
     pub placement: ShardsPlacement,
+    pub initial_state: Option<ReplicaState>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
@@ -393,6 +436,19 @@ pub struct DropPayloadIndex {
     pub field_name: PayloadKeyType,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct CreateNamedVector {
+    pub collection_name: String,
+    pub vector_name: segment::types::VectorNameBuf,
+    pub config: shard::operations::vector_name_ops::VectorNameConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+pub struct DeleteNamedVector {
+    pub collection_name: String,
+    pub vector_name: segment::types::VectorNameBuf,
+}
+
 /// Enumeration of all possible collection update operations
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -408,7 +464,14 @@ pub enum CollectionMetaOperations {
     DropShardKey(DropShardKey),
     CreatePayloadIndex(CreatePayloadIndex),
     DropPayloadIndex(DropPayloadIndex),
-    Nop { token: usize }, // Empty operation
+    CreateNamedVector(CreateNamedVector),
+    DeleteNamedVector(DeleteNamedVector),
+    Nop {
+        token: usize,
+    }, // Empty operation
+    /// Introduce artificial delay to a specific peer node
+    #[cfg(feature = "staging")]
+    TestSlowDown(TestSlowDown),
 }
 
 /// Use config of the existing collection to generate a create collection operation
@@ -423,6 +486,7 @@ impl From<CollectionConfigInternal> for CreateCollection {
             quantization_config,
             strict_mode_config,
             uuid,
+            metadata,
         } = value;
 
         let CollectionParams {
@@ -432,6 +496,7 @@ impl From<CollectionConfigInternal> for CreateCollection {
             replication_factor,
             write_consistency_factor,
             read_fan_out_factor: _,
+            read_fan_out_delay_ms: _,
             on_disk_payload,
             sparse_vectors,
         } = params;
@@ -446,11 +511,11 @@ impl From<CollectionConfigInternal> for CreateCollection {
             hnsw_config: Some(hnsw_config.into()),
             wal_config: Some(wal_config.into()),
             optimizers_config: Some(optimizer_config.into()),
-            init_from: None,
             quantization_config,
             sparse_vectors,
             strict_mode_config,
             uuid,
+            metadata,
         }
     }
 }

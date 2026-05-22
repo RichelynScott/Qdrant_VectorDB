@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::{ShardTransfer, ShardTransferKey, ShardTransferMethod};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::replica_set::ReplicaState;
-use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::shard::PeerId;
 use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
 
 pub fn validate_transfer_exists(
@@ -174,69 +174,39 @@ pub fn validate_transfer(
                 "Source and target shard must have the same shard key, but they have {source_shard_key:?} and {target_shard_key:?}",
             )));
         }
+    } else if transfer.filter.is_some() {
+        let Some(destination_replicas) = destination_replicas else {
+            return Err(CollectionError::service_error(format!(
+                "Destination shard {} does not exist",
+                transfer.shard_id,
+            )));
+        };
+
+        let Some(to_shard_id) = transfer.to_shard_id else {
+            return Err(CollectionError::bad_request(
+                "Target shard is not set for filtered points transfer",
+            ));
+        };
+
+        if transfer.shard_id == to_shard_id {
+            return Err(CollectionError::bad_request(format!(
+                "Source and target shard must be different for filtered points transfer, both are {to_shard_id}",
+            )));
+        }
+
+        if let Some(ReplicaState::Dead) = destination_replicas.get(&transfer.to) {
+            return Err(CollectionError::bad_request(format!(
+                "Filtered shard transfer can't be started, \
+                     because destination shard {}/{to_shard_id} is dead",
+                transfer.to,
+            )));
+        }
     } else if let Some(to_shard_id) = transfer.to_shard_id {
         return Err(CollectionError::bad_request(format!(
-            "Target shard {to_shard_id} can only be set for {:?} transfers",
+            "Target shard {to_shard_id} can only be set for {:?} or filtered streaming records transfers",
             ShardTransferMethod::ReshardingStreamRecords,
         )));
     }
 
     Ok(())
-}
-
-/// Selects a best peer to transfer shard from.
-///
-/// Requirements:
-/// 1. Peer should have an active replica of the shard
-/// 2. There should be no active transfers from this peer with the same shard
-/// 3. Prefer peer with the lowest number of active transfers
-///
-/// If there are no peers that satisfy the requirements, returns `None`.
-pub fn suggest_transfer_source(
-    shard_id: ShardId,
-    target_peer: PeerId,
-    current_transfers: &[ShardTransfer],
-    shard_peers: &HashMap<PeerId, ReplicaState>,
-) -> Option<PeerId> {
-    let mut candidates = HashSet::new();
-
-    for (&peer_id, &state) in shard_peers {
-        // We allow transfers *from* `ReshardingScaleDown` replicas, because they contain a *superset*
-        // of points in a regular replica
-        let is_active = matches!(
-            state,
-            ReplicaState::Active | ReplicaState::ReshardingScaleDown
-        );
-
-        if is_active && peer_id != target_peer {
-            candidates.insert(peer_id);
-        }
-    }
-
-    let currently_transferring = current_transfers
-        .iter()
-        .filter(|transfer| transfer.shard_id == shard_id)
-        .flat_map(|transfer| [transfer.from, transfer.to])
-        .collect::<HashSet<PeerId>>();
-
-    candidates = candidates
-        .difference(&currently_transferring)
-        .cloned()
-        .collect();
-
-    let transfer_counts = current_transfers
-        .iter()
-        .fold(HashMap::new(), |mut counts, transfer| {
-            *counts.entry(transfer.from).or_insert(0_usize) += 1;
-            counts
-        });
-
-    // Sort candidates by the number of active transfers
-    let mut candidates = candidates
-        .into_iter()
-        .map(|peer_id| (peer_id, transfer_counts.get(&peer_id).unwrap_or(&0)))
-        .collect::<Vec<(PeerId, &usize)>>();
-    candidates.sort_unstable_by_key(|(_, count)| **count);
-
-    candidates.first().map(|(peer_id, _)| *peer_id)
 }

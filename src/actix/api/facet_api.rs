@@ -8,20 +8,20 @@ use tokio::time::Instant;
 
 use crate::actix::api::CollectionPath;
 use crate::actix::api::read_params::ReadParams;
-use crate::actix::auth::ActixAccess;
+use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{
     get_request_hardware_counter, process_response, process_response_error,
 };
 use crate::settings::ServiceConfig;
 
-#[post("/collections/{name}/facet")]
+#[post("/collections/{collection_name}/facet")]
 async fn facet(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<FacetRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let timing = Instant::now();
 
@@ -33,9 +33,9 @@ async fn facet(
     let pass = match check_strict_mode(
         &facet_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -52,19 +52,19 @@ async fn facet(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
 
     let response = dispatcher
-        .toc(&access, &pass)
+        .toc(&auth, &pass)
         .facet(
-            &collection.name,
+            &collection.collection_name,
             facet_params,
             shard_selection,
             params.consistency,
-            access,
+            auth,
             params.timeout(),
             request_hw_counter.get_counter(),
         )

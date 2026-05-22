@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::AHashMap;
@@ -12,7 +13,6 @@ use segment::types::{
     WithVector,
 };
 use serde_json::Value;
-use tokio::sync::RwLockReadGuard;
 
 use super::aggregator::GroupsAggregator;
 use super::types::QueryGroupRequest;
@@ -28,9 +28,7 @@ use crate::operations::types::{
 use crate::operations::universal_query::collection_query::{
     CollectionQueryGroupsRequest, CollectionQueryRequest,
 };
-use crate::operations::universal_query::shard_query::{
-    ScoringQuery, ShardPrefetch, ShardQueryRequest,
-};
+use crate::operations::universal_query::shard_query::{self, ShardPrefetch, ShardQueryRequest};
 use crate::recommendations::recommend_into_core_search;
 
 const MAX_GET_GROUPS_REQUESTS: usize = 5;
@@ -81,7 +79,7 @@ impl GroupRequest {
         }
     }
 
-    pub async fn into_query_group_request<'a, F, Fut>(
+    pub async fn into_query_group_request<F, Fut>(
         self,
         collection: &Collection,
         collection_by_name: F,
@@ -92,7 +90,7 @@ impl GroupRequest {
     ) -> CollectionResult<QueryGroupRequest>
     where
         F: Fn(String) -> Fut,
-        Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+        Fut: Future<Output = Option<Arc<Collection>>>,
     {
         let query_search = match self.source {
             SourceRequest::Search(search_req) => ShardQueryRequest::from(search_req),
@@ -133,7 +131,6 @@ impl GroupRequest {
             group_by: self.group_by,
             group_size: self.group_size,
             groups: self.limit,
-            with_lookup: self.with_lookup,
         })
     }
 }
@@ -320,7 +317,8 @@ pub async fn group_by(
 ) -> CollectionResult<Vec<PointGroup>> {
     let start = std::time::Instant::now();
     let collection_params = collection.collection_config.read().await.params.clone();
-    let score_ordering = ScoringQuery::order(request.source.query.as_ref(), &collection_params)?;
+    let score_ordering =
+        shard_query::query_result_order(request.source.query.as_ref(), &collection_params)?;
 
     let mut aggregator = GroupsAggregator::new(
         request.groups,
@@ -535,7 +533,7 @@ fn values_to_any_variants(values: &[Value]) -> Vec<AnyVariants> {
     // gather string values
     let strs: IndexSet<_, FnvBuildHasher> = values
         .iter()
-        .filter_map(|v| v.as_str().map(|s| s.into()))
+        .filter_map(|v| v.as_str().map(Into::into))
         .collect();
 
     if !strs.is_empty() {

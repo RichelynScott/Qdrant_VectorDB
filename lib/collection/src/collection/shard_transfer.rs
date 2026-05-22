@@ -4,13 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::defaults;
+use fs_err::tokio as tokio_fs;
 use parking_lot::Mutex;
+use semver::Version;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::Collection;
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::local_shard::LocalShard;
-use crate::shards::replica_set::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_holder::ShardHolder;
 use crate::shards::transfer::transfer_tasks_pool::{TransferTaskItem, TransferTaskProgress};
@@ -33,6 +36,35 @@ impl Collection {
             .check_transfer_exists(transfer_key)
     }
 
+    async fn is_prevent_unoptimized(&self) -> bool {
+        self.effective_optimizers_config()
+            .await
+            .map(|config| config.prevent_unoptimized.unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Legacy default shard transfer method for Qdrant <1.18.0
+    pub async fn legacy_default_shard_transfer_method(&self) -> ShardTransferMethod {
+        if self.is_prevent_unoptimized().await {
+            // With prevent_unoptimized, use snapshot as the default method.
+            // For automatic transfers, mod.rs prefers WalDelta when all peers
+            // support it and falls back to this default otherwise.
+            log::info!("Using snapshot transfer method because prevent_unoptimized is enabled");
+            ShardTransferMethod::Snapshot
+        } else {
+            self.shared_storage_config
+                .default_shard_transfer_method
+                .unwrap_or(ShardTransferMethod::StreamRecords)
+        }
+    }
+
+    /// Default shard transfer method for Qdrant 1.18.0+
+    pub fn default_shard_transfer_method(&self) -> ShardTransferMethod {
+        self.shared_storage_config
+            .default_shard_transfer_method
+            .unwrap_or(ShardTransferMethod::Snapshot)
+    }
+
     pub async fn start_shard_transfer<T, F>(
         &self,
         mut shard_transfer: ShardTransfer,
@@ -45,14 +77,32 @@ impl Collection {
         T: Future<Output = ()> + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        // Select transfer method
+        // The coordinating peer must pick the transfer method before submitting
+        // to consensus, so that every peer applies the same method for a given
+        // transfer.
+        //
+        // Once every peer is at 1.18.0+, all submission sites guarantee the
+        // method is set, so a missing method indicates a bug — refuse it.
+        // For mixed clusters (some peers <1.18.0), an older submission site
+        // may still send `None`; fall back to this peer's local default to
+        // preserve compatibility.
         if shard_transfer.method.is_none() {
-            let method = self
-                .shared_storage_config
-                .default_shard_transfer_method
-                .unwrap_or_default();
-            log::warn!("No shard transfer method selected, defaulting to {method:?}");
-            shard_transfer.method.replace(method);
+            let all_peers_enforce = self
+                .channel_service
+                .all_peers_at_version(&Version::new(1, 18, 0));
+            if all_peers_enforce {
+                return Err(CollectionError::service_error(format!(
+                    "Shard transfer {}:{} -> {} has no method set; the coordinating peer must \
+                     pick a transfer method before submitting to consensus",
+                    shard_transfer.shard_id, shard_transfer.from, shard_transfer.to,
+                )));
+            }
+            let default_method = self.legacy_default_shard_transfer_method().await;
+            log::warn!(
+                "No shard transfer method selected, defaulting to {default_method:?} \
+                 (cluster contains peers older than 1.18.0)",
+            );
+            shard_transfer.method = Some(default_method);
         }
 
         let do_transfer = {
@@ -79,7 +129,10 @@ impl Collection {
             let from_is_local = from_replica_set.is_local().await;
             let to_is_local = to_replica_set.is_local().await;
 
-            let initial_state = match shard_transfer.method.unwrap_or_default() {
+            // Checked at the top of the function — the method is always set by the
+            // peer that submitted this transfer to consensus.
+            let transfer_method = shard_transfer.method.expect("transfer method must be set");
+            let initial_state = match transfer_method {
                 ShardTransferMethod::StreamRecords => ReplicaState::Partial,
 
                 ShardTransferMethod::Snapshot | ShardTransferMethod::WalDelta => {
@@ -111,7 +164,7 @@ impl Collection {
 
                 let shard = LocalShard::build(
                     to_shard_id,
-                    self.name(),
+                    self.name().to_string(),
                     &to_replica_set.shard_path,
                     self.collection_config.clone(),
                     self.shared_storage_config.clone(),
@@ -124,7 +177,10 @@ impl Collection {
                 .await?;
 
                 let old_shard = to_replica_set.set_local(shard, Some(initial_state)).await?;
-                debug_assert!(old_shard.is_none(), "We should not have a local shard yet");
+                if let Some(old_shard) = old_shard {
+                    debug_assert!(false, "We should not have a local shard yet");
+                    old_shard.stop_gracefully().await;
+                }
             } else {
                 to_replica_set
                     .ensure_replica_with_state(shard_transfer.to, initial_state)
@@ -166,6 +222,24 @@ impl Collection {
 
         let progress = Arc::new(Mutex::new(TransferTaskProgress::new()));
 
+        // With prevent_unoptimized, fall back to snapshot which preserves deferred
+        // point state exactly (raw segment copy). stream_records sends deferred
+        // points but they won't be deferred on the target.
+        // Otherwise use the configured cluster default transfer method, except
+        // never fall back to wal_delta: it's the method most likely to be
+        // failing (the only currently-fallible automatic transfer), and a same-
+        // method fallback would just be refused in the driver. Use snapshot as
+        // a safe fallback in that case, which is also the 1.18.0+ default.
+        let fallback_method = if self.is_prevent_unoptimized().await {
+            ShardTransferMethod::Snapshot
+        } else {
+            match self.default_shard_transfer_method() {
+                ShardTransferMethod::WalDelta => ShardTransferMethod::Snapshot,
+                method @ (ShardTransferMethod::StreamRecords
+                | ShardTransferMethod::Snapshot
+                | ShardTransferMethod::ReshardingStreamRecords) => method,
+            }
+        };
         let transfer_task = transfer::driver::spawn_transfer_task(
             shard_holder,
             progress.clone(),
@@ -175,6 +249,7 @@ impl Collection {
             channel_service,
             self.snapshots_path.clone(),
             temp_dir,
+            fallback_method,
             on_finish,
             on_error,
         );
@@ -221,50 +296,50 @@ impl Collection {
         let dest_replica_set =
             shard_holder.get_shard(transfer.to_shard_id.unwrap_or(transfer.shard_id));
 
-        if let Some(replica_set) = dest_replica_set {
-            if replica_set.peer_state(transfer.to).is_some() {
-                // Promote *destination* replica/shard to `Active` if:
-                //
-                // - replica *exists*
-                //   - replica should be created when shard transfer (or resharding) is started
-                //   - replica might *not* exist, if it (or the whole *peer*) was removed right
-                //     before transfer is finished
-                // - transfer is *not* resharding
-                //   - resharding requires multiple transfers, so destination shard is promoted
-                //     *explicitly* when all transfers are finished
+        if let Some(replica_set) = dest_replica_set
+            && replica_set.peer_state(transfer.to).is_some()
+        {
+            // Promote *destination* replica/shard to `Active` if:
+            //
+            // - replica *exists*
+            //   - replica should be created when shard transfer (or resharding) is started
+            //   - replica might *not* exist, if it (or the whole *peer*) was removed right
+            //     before transfer is finished
+            // - transfer is *not* resharding
+            //   - resharding requires multiple transfers, so destination shard is promoted
+            //     *explicitly* when all transfers are finished
 
-                // TODO(resharding): Do not change replica state at all, when finishing resharding transfer?
-                //
-                // We switch replica into correct state when *starting* resharding transfer, and
-                // we want to *keep* it in the same state *after* resharding transfer is finished...
-                let state = if is_resharding_transfer {
-                    let resharding_direction =
-                        self.resharding_state().await.map(|state| state.direction);
+            // TODO(resharding): Do not change replica state at all, when finishing resharding transfer?
+            //
+            // We switch replica into correct state when *starting* resharding transfer, and
+            // we want to *keep* it in the same state *after* resharding transfer is finished...
+            let state = if is_resharding_transfer {
+                let resharding_direction =
+                    self.resharding_state().await.map(|state| state.direction);
 
-                    match resharding_direction {
-                        Some(ReshardingDirection::Up) => ReplicaState::Resharding,
-                        Some(ReshardingDirection::Down) => ReplicaState::ReshardingScaleDown,
-                        None => {
-                            log::error!(
-                                "Can't finish resharding shard transfer correctly, \
+                match resharding_direction {
+                    Some(ReshardingDirection::Up) => ReplicaState::Resharding,
+                    Some(ReshardingDirection::Down) => ReplicaState::ReshardingScaleDown,
+                    None => {
+                        log::error!(
+                            "Can't finish resharding shard transfer correctly, \
                                  because resharding is not in progress anymore!",
-                            );
+                        );
 
-                            ReplicaState::Dead
-                        }
+                        ReplicaState::Dead
                     }
-                } else {
-                    ReplicaState::Active
-                };
-
-                if transfer.to == self.this_peer_id {
-                    replica_set.set_replica_state(transfer.to, state)?;
-                } else {
-                    replica_set.add_remote(transfer.to, state).await?;
                 }
+            } else {
+                ReplicaState::Active
+            };
 
-                is_dest_replica_active = state == ReplicaState::Active;
+            if transfer.to == self.this_peer_id {
+                replica_set.set_replica_state(transfer.to, state).await?;
+            } else {
+                replica_set.add_remote(transfer.to, state).await?;
             }
+
+            is_dest_replica_active = state == ReplicaState::Active;
         }
 
         // Handle *source* replica
@@ -299,20 +374,15 @@ impl Collection {
         Ok(())
     }
 
-    /// Handles abort of the transfer
-    ///
-    /// 1. Unregister the transfer
-    /// 2. Stop transfer task
-    /// 3. Unwrap the proxy
-    /// 4. Remove temp shard, or mark it as dead
+    /// Return if it was a resharding transfer so it can be handled correctly (aborted or ignored)
     pub async fn abort_shard_transfer(
         &self,
-        transfer_key: ShardTransferKey,
-        shard_holder: Option<&ShardHolder>,
+        transfer: ShardTransfer,
+        shard_holder: &ShardHolder,
     ) -> CollectionResult<()> {
         // TODO: Ensure cancel safety!
-
-        log::debug!("Aborting shard transfer {transfer_key:?}");
+        let transfer_key = transfer.key();
+        log::debug!("Aborting shard transfer {transfer:?}");
 
         let _transfer_result = self
             .transfer_tasks
@@ -321,18 +391,7 @@ impl Collection {
             .stop_task(&transfer_key)
             .await;
 
-        let mut shard_holder_guard = None;
-
-        let shard_holder = match shard_holder {
-            Some(shard_holder) => shard_holder,
-            None => shard_holder_guard.insert(self.shards_holder.read().await),
-        };
-
-        let Some(transfer) = shard_holder.get_transfer(&transfer_key) else {
-            return Ok(());
-        };
-
-        let is_resharding_transfer = transfer.method.is_some_and(|method| method.is_resharding());
+        let is_resharding_transfer = transfer.is_resharding();
 
         let shard_id = transfer_key.to_shard_id.unwrap_or(transfer_key.shard_id);
 
@@ -352,7 +411,9 @@ impl Collection {
                     //   and so failed transfer does not introduce any inconsistencies to points
                     //   that are not affected by resharding in all other shards
                 } else if transfer.sync {
-                    replica_set.set_replica_state(transfer.to, ReplicaState::Dead)?;
+                    replica_set
+                        .set_replica_state(transfer.to, ReplicaState::Dead)
+                        .await?;
                 } else {
                     self.invalidate_clean_local_shards([transfer
                         .to_shard_id
@@ -373,18 +434,47 @@ impl Collection {
 
         shard_holder.register_abort_transfer(&transfer_key)?;
 
-        if is_resharding_transfer {
-            let resharding_state = shard_holder.resharding_state.read().clone();
+        Ok(())
+    }
 
-            // `abort_resharding` locks `shard_holder`!
-            drop(shard_holder_guard);
+    /// Handles abort of the transfer and also aborts resharding if the transfer was related to resharding
+    ///
+    /// 1. Unregister the transfer
+    /// 2. Stop transfer task
+    /// 3. Unwrap the proxy
+    /// 4. Remove temp shard, or mark it as dead
+    pub async fn abort_shard_transfer_and_resharding(
+        &self,
+        transfer_key: ShardTransferKey,
+    ) -> CollectionResult<()> {
+        // Look up transfer and any resharding state we need to abort
+        let resharding_state = {
+            let shard_holder = self.shards_holder.read().await;
 
-            if let Some(state) = resharding_state {
-                self.abort_resharding(state.key(), false).await?;
+            let Some(transfer) = shard_holder.get_transfer(&transfer_key) else {
+                return Ok(());
+            };
+
+            if transfer.is_resharding() {
+                shard_holder.resharding_state.read().clone()
+            } else {
+                None
             }
+        };
+
+        // Abort resharding before the transfer to be idempotent
+        if let Some(state) = resharding_state {
+            self.abort_resharding(state.key(), false).await?;
         }
 
-        Ok(())
+        // Resharding may already have aborted the transfer so we check it again
+        let shard_holder = self.shards_holder.read().await;
+
+        let Some(transfer) = shard_holder.get_transfer(&transfer_key) else {
+            return Ok(());
+        };
+
+        self.abort_shard_transfer(transfer, &shard_holder).await
     }
 
     /// Initiate local partial shard
@@ -399,9 +489,9 @@ impl Collection {
         let collection_path = self.path.clone();
 
         async move {
-            let shards_holder = shards_holder.read_owned().await;
+            let shards_holder_guard = shards_holder.clone().read_owned().await;
 
-            let Some(replica_set) = shards_holder.get_shard(shard_id) else {
+            let Some(replica_set) = shards_holder_guard.get_shard(shard_id) else {
                 return Err(CollectionError::service_error(format!(
                     "Shard {shard_id} doesn't exist, repartition is not supported yet"
                 )));
@@ -413,49 +503,18 @@ impl Collection {
                 .wait_for_local(defaults::CONSENSUS_META_OP_WAIT)
                 .await?;
 
-            if !replica_set.is_local().await {
-                // We have proxy or something, we need to unwrap it
-                log::warn!("Unwrapping proxy shard {shard_id}");
-                replica_set.un_proxify_local().await?;
-            }
-
-            if replica_set.is_dummy().await {
-                // We can reach here because of either of these:
-                // 1. Qdrant is in recovery mode, and user intentionally triggered a transfer
-                // 2. Shard is dirty (shard initializing flag), and Qdrant triggered a transfer to recover from Dead state after an update fails
-                //
-                // In both cases, it's safe to drop existing local shard data
-                log::debug!(
-                    "Initiating transfer to dummy shard {}. Initializing empty local shard first",
-                    replica_set.shard_id,
-                );
-                replica_set.init_empty_local_shard().await?;
-
-                let shard_flag = shard_initializing_flag_path(&collection_path, shard_id);
-
-                if tokio::fs::try_exists(&shard_flag).await.is_ok() {
-                    // We can delete initializing flag without waiting for transfer to finish
-                    // because if transfer fails in between, Qdrant will retry it.
-                    tokio::fs::remove_file(&shard_flag).await?;
-                    log::debug!("Removing shard initializing flag {shard_flag:?}");
-                }
-            }
-
             let this_peer_id = replica_set.this_peer_id();
 
             let shard_transfer_requested = tokio::task::spawn_blocking(move || {
                 // We can guarantee that replica_set is not None, cause we checked it before
                 // and `shards_holder` is holding the lock.
                 // This is a workaround for lifetime checker.
-                let replica_set = shards_holder.get_shard(shard_id).unwrap();
-                let shard_transfer_registered = shards_holder.shard_transfers.wait_for(
+                let replica_set = shards_holder_guard.get_shard(shard_id).unwrap();
+                let shard_transfer_registered = shards_holder_guard.shard_transfers.wait_for(
                     |shard_transfers| {
-                        shard_transfers.iter().any(|shard_transfer| {
-                            let to_shard_id = shard_transfer
-                                .to_shard_id
-                                .unwrap_or(shard_transfer.shard_id);
-                            to_shard_id == shard_id && shard_transfer.to == this_peer_id
-                        })
+                        shard_transfers
+                            .iter()
+                            .any(|shard_transfer| shard_transfer.is_target(this_peer_id, shard_id))
                     },
                     Duration::from_secs(60),
                 );
@@ -473,7 +532,7 @@ impl Collection {
                     )
             });
 
-            match shard_transfer_requested.await {
+            match AbortOnDropHandle::new(shard_transfer_requested).await {
                 Ok(true) => Ok(()),
 
                 Ok(false) => {
@@ -491,7 +550,50 @@ impl Collection {
                      Failed to execute wait-for-consensus-notification task: \
                      {err}"
                 ))),
+            }?;
+
+            // At this point we made sure that receiver replica is synced and expecting incoming
+            // shard transfer.
+            // Further checks are an extra safety net, in normal situation they should not fail.
+
+            let shards_holder_guard = shards_holder.read_owned().await;
+
+            let Some(replica_set) = shards_holder_guard.get_shard(shard_id) else {
+                return Err(CollectionError::service_error(format!(
+                    "Shard {shard_id} doesn't exist, repartition is not supported yet"
+                )));
+            };
+
+            if replica_set.is_proxy().await {
+                debug_assert!(false, "We should not have proxy shard here");
+                // We have proxy or something, we need to unwrap it
+                log::error!("Unwrapping proxy shard {shard_id}");
+                replica_set.un_proxify_local().await?;
             }
+
+            if replica_set.is_dummy().await {
+                // We can reach here because of either of these:
+                // 1. Qdrant is in recovery mode, and user intentionally triggered a transfer
+                // 2. Shard is dirty (shard initializing flag), and Qdrant triggered a transfer to recover from Dead state after an update fails
+                //
+                // In both cases, it's safe to drop existing local shard data
+                log::debug!(
+                    "Initiating transfer to dummy shard {}. Initializing empty local shard first",
+                    replica_set.shard_id,
+                );
+                replica_set.init_empty_local_shard().await?;
+
+                let shard_flag = shard_initializing_flag_path(&collection_path, shard_id);
+
+                if tokio_fs::try_exists(&shard_flag).await.is_ok() {
+                    // We can delete initializing flag without waiting for transfer to finish
+                    // because if transfer fails in between, Qdrant will retry it.
+                    tokio_fs::remove_file(&shard_flag).await?;
+                    log::debug!("Removed shard initializing flag {shard_flag:?}");
+                }
+            }
+
+            Ok(())
         }
     }
 

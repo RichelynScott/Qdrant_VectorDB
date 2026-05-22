@@ -4,17 +4,19 @@ use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::DeferredBehavior;
 use futures::future;
 use futures::future::try_join_all;
 use itertools::{Itertools, process_results};
 use segment::data_types::facets::{FacetParams, FacetValue, FacetValueHit};
 use segment::types::{Condition, FieldCondition, Filter, Match};
-use tokio::runtime::Handle;
+use shard::common::stopping_guard::StoppingGuard;
 use tokio::time::error::Elapsed;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::LocalShard;
 use crate::collection_manager::holders::segment_holder::LockedSegment;
-use crate::common::stopping_guard::StoppingGuard;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::types::{CollectionError, CollectionResult};
 
 impl LocalShard {
@@ -22,12 +24,10 @@ impl LocalShard {
     pub async fn approx_facet(
         &self,
         request: Arc<FacetParams>,
-        search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<FacetValueHit>> {
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
-
         let stopping_guard = StoppingGuard::new();
 
         let spawn_read = |segment: LockedSegment, hw_counter: &HardwareCounterCell| {
@@ -35,16 +35,24 @@ impl LocalShard {
             let is_stopped = stopping_guard.get_is_stopped();
 
             let hw_counter = hw_counter.fork();
-            search_runtime_handle.spawn_blocking(move || {
-                let get_segment = segment.get();
-                let read_segment = get_segment.read();
+            let cpu_utilization = hw_counter.cpu_utilization();
+            let task = search_runtime_handle.spawn_blocking(move || {
+                let work = || {
+                    let get_segment = segment.get();
+                    let read_segment = get_segment.read();
 
-                read_segment.facet(&request, &is_stopped, &hw_counter)
-            })
+                    read_segment.facet(&request, &is_stopped, &hw_counter)
+                };
+                match cpu_utilization {
+                    Some(cu) => cu.measure(work),
+                    None => work(),
+                }
+            });
+            AbortOnDropHandle::new(task)
         };
 
         let all_reads = {
-            let segments_lock = self.segments().read();
+            let segments_lock = self.segments.read();
 
             let hw_counter = hw_measurement_acc.get_counter_cell();
 
@@ -58,7 +66,7 @@ impl LocalShard {
             )
         }
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         let merged_hits = process_results(all_reads, |reads| {
             reads.reduce(|mut acc, map| {
@@ -90,17 +98,14 @@ impl LocalShard {
     pub async fn exact_facet(
         &self,
         request: Arc<FacetParams>,
-        search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<FacetValueHit>> {
         // To return exact counts we need to consider that the same point can be in different segments if it has different versions.
         // So, we need to consider all point ids for a given filter in all segments to do an accurate count.
         //
         // To do this we will perform exact counts for each of the values in the field.
-
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
-
         let instant = std::time::Instant::now();
 
         // Get unique values for the field
@@ -125,7 +130,13 @@ impl LocalShard {
             let hw_acc = hw_measurement_acc.clone();
             async move {
                 let count = self
-                    .read_filtered(filter.as_ref(), search_runtime_handle, hw_acc)
+                    .read_filtered(
+                        filter.as_ref(),
+                        search_runtime_handle,
+                        hw_acc,
+                        Some(timeout.saturating_sub(instant.elapsed())),
+                        DeferredBehavior::Exclude,
+                    )
                     .await?
                     .len();
                 CollectionResult::Ok(FacetValueHit { value, count })
@@ -137,7 +148,7 @@ impl LocalShard {
             future::try_join_all(hits_futures),
         )
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         Ok(hits)
     }
@@ -145,7 +156,7 @@ impl LocalShard {
     async fn unique_values(
         &self,
         request: Arc<FacetParams>,
-        handle: &Handle,
+        handle: &AdaptiveSearchHandle,
         timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<BTreeSet<FacetValue>> {
@@ -157,23 +168,32 @@ impl LocalShard {
             let is_stopped = stopping_guard.get_is_stopped();
 
             let hw_counter = hw_counter.fork();
-            handle.spawn_blocking(move || {
-                let get_segment = segment.get();
-                let read_segment = get_segment.read();
+            let cpu_utilization = hw_counter.cpu_utilization();
+            let task = handle.spawn_blocking(move || {
+                let work = || {
+                    let get_segment = segment.get();
+                    let read_segment = get_segment.read();
 
-                read_segment.unique_values(
-                    &request.key,
-                    request.filter.as_ref(),
-                    &is_stopped,
-                    &hw_counter,
-                )
-            })
+                    read_segment.unique_values(
+                        &request.key,
+                        request.filter.as_ref(),
+                        &is_stopped,
+                        &hw_counter,
+                    )
+                };
+
+                match cpu_utilization {
+                    Some(cu) => cu.measure(work),
+                    None => work(),
+                }
+            });
+            AbortOnDropHandle::new(task)
         };
 
         let hw_counter = hw_measurement_acc.get_counter_cell();
 
         let all_reads = {
-            let segments_lock = self.segments().read();
+            let segments_lock = self.segments.read();
 
             tokio::time::timeout(
                 timeout,
@@ -185,7 +205,7 @@ impl LocalShard {
             )
         }
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         let all_values =
             process_results(all_reads, |reads| reads.flatten().collect::<BTreeSet<_>>())?;

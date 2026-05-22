@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use num_cmp::NumCmp;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
@@ -9,7 +11,7 @@ use crate::types::{
     DateTimePayloadType, FloatPayloadType, IntPayloadType, Order, Range, RangeInterface,
 };
 
-#[derive(Deserialize, Serialize, JsonSchema, Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Serialize, JsonSchema, Copy, Clone, Debug, Default, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     #[default]
@@ -45,7 +47,7 @@ impl From<Direction> for Order {
     }
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum StartFrom {
     Integer(IntPayloadType),
@@ -55,7 +57,47 @@ pub enum StartFrom {
     Datetime(DateTimePayloadType),
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq)]
+impl Hash for StartFrom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            StartFrom::Integer(i) => i.hash(state),
+            StartFrom::Float(f) => OrderedFloat(*f).hash(state),
+            StartFrom::Datetime(dt) => dt.hash(state),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[serde(expecting = "Expected a string, or an object with a key, direction and/or start_from")]
+pub enum OrderByInterface {
+    Key(JsonPath),
+    Struct(OrderBy),
+}
+
+impl From<OrderByInterface> for OrderBy {
+    fn from(interface: OrderByInterface) -> Self {
+        match interface {
+            OrderByInterface::Key(key) => OrderBy {
+                key,
+                direction: None,
+                start_from: None,
+            },
+            OrderByInterface::Struct(order_by) => order_by,
+        }
+    }
+}
+
+impl Validate for OrderByInterface {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        match self {
+            OrderByInterface::Key(_) => Ok(()), // validated during parsing
+            OrderByInterface::Struct(order_by) => order_by.validate(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct OrderBy {
     /// Payload key to order by
@@ -77,9 +119,11 @@ impl OrderBy {
                 // TODO: When we introduce integer ranges, we'll stop doing lossy conversion to f64 here
                 // Accepting an integer as start_from simplifies the client generation.
                 StartFrom::Integer(i) => {
-                    RangeInterface::Float(self.direction().as_range_from(*i as f64))
+                    RangeInterface::Float(self.direction().as_range_from(OrderedFloat(*i as f64)))
                 }
-                StartFrom::Float(f) => RangeInterface::Float(self.direction().as_range_from(*f)),
+                StartFrom::Float(f) => {
+                    RangeInterface::Float(self.direction().as_range_from(OrderedFloat(*f)))
+                }
                 StartFrom::Datetime(dt) => {
                     RangeInterface::DateTime(self.direction().as_range_from(*dt))
                 }

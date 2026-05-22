@@ -1,11 +1,43 @@
 use std::path::{Path, PathBuf};
 
 use collection::operations::types::{CollectionError, CollectionResult};
+use fs_err as fs;
 
 use crate::content_manager::toc::TableOfContent;
+use crate::types::StorageConfig;
 
 const TEMP_SUBDIR_NAME: &str = "tmp";
 const FILE_UPLOAD_SUBDIR_NAME: &str = "upload";
+
+/// Remove all temporary directories based on storage configuration.
+///
+/// Should be called early during startup, before loading collection data and
+/// applying WAL, to ensure no stale temp files (e.g. from interrupted snapshot
+/// transfers) interfere with recovery.
+pub fn clear_tmp_directories(storage_config: &StorageConfig) -> CollectionResult<()> {
+    let snapshots_temp = storage_config.snapshots_path.join(TEMP_SUBDIR_NAME);
+    let storage_temp = storage_config.storage_path.join(TEMP_SUBDIR_NAME);
+    let optional_temp = storage_config
+        .temp_path
+        .as_deref()
+        .map(|p| Path::new(p).join(TEMP_SUBDIR_NAME));
+
+    for path in [Some(snapshots_temp), Some(storage_temp), optional_temp]
+        .into_iter()
+        .flatten()
+    {
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|e| {
+                CollectionError::service_error(format!(
+                    "Failed to remove temp directory at {}: {e:?}",
+                    path.display(),
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
+}
 
 /// Functions for managing temporary storages of TOC.
 ///
@@ -30,16 +62,16 @@ const FILE_UPLOAD_SUBDIR_NAME: &str = "upload";
 ///
 /// Subdirectories are required for simpler cleanup on the start of the process.
 impl TableOfContent {
-    pub fn temp_path(&self) -> Option<&str> {
+    pub fn temp_path(&self) -> Option<&Path> {
         self.storage_config.temp_path.as_deref()
     }
 
     fn get_snapshots_temp_path(&self) -> PathBuf {
-        Path::new(self.snapshots_path()).join(TEMP_SUBDIR_NAME)
+        self.snapshots_path().join(TEMP_SUBDIR_NAME)
     }
 
     fn get_storage_temp_path(&self) -> PathBuf {
-        Path::new(self.storage_path()).join(TEMP_SUBDIR_NAME)
+        self.storage_path().join(TEMP_SUBDIR_NAME)
     }
 
     fn get_optional_temp_path(&self) -> Option<PathBuf> {
@@ -52,7 +84,7 @@ impl TableOfContent {
         let path = self.get_snapshots_temp_path();
 
         if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
+            fs::create_dir_all(&path).map_err(|e| {
                 CollectionError::service_error(format!(
                     "Failed to create snapshots temp directory at {}: {:?}",
                     path.display(),
@@ -68,7 +100,7 @@ impl TableOfContent {
         let path = self.get_storage_temp_path();
 
         if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
+            fs::create_dir_all(&path).map_err(|e| {
                 CollectionError::service_error(format!(
                     "Failed to create storage temp directory at {}: {:?}",
                     path.display(),
@@ -83,7 +115,7 @@ impl TableOfContent {
     pub fn optional_temp_path(&self) -> CollectionResult<Option<PathBuf>> {
         if let Some(path) = self.get_optional_temp_path() {
             if !path.exists() {
-                std::fs::create_dir_all(&path).map_err(|e| {
+                fs::create_dir_all(&path).map_err(|e| {
                     CollectionError::service_error(format!(
                         "Failed to create optional temp directory at {}: {:?}",
                         path.display(),
@@ -127,7 +159,7 @@ impl TableOfContent {
         let upload_dir = tmp_storage_dir.join(FILE_UPLOAD_SUBDIR_NAME);
 
         if !upload_dir.exists() {
-            std::fs::create_dir_all(&upload_dir).map_err(|e| {
+            fs::create_dir_all(&upload_dir).map_err(|e| {
                 CollectionError::service_error(format!(
                     "Failed to create upload directory at {}: {:?}",
                     upload_dir.display(),
@@ -139,42 +171,6 @@ impl TableOfContent {
     }
 
     pub fn clear_all_tmp_directories(&self) -> CollectionResult<()> {
-        let snapshots_temp_path = self.get_snapshots_temp_path();
-        let storage_temp_path = self.get_storage_temp_path();
-        let optional_temp_path = self.get_optional_temp_path();
-
-        if snapshots_temp_path.exists() {
-            std::fs::remove_dir_all(&snapshots_temp_path).map_err(|e| {
-                CollectionError::service_error(format!(
-                    "Failed to remove snapshots temp directory at {}: {:?}",
-                    snapshots_temp_path.display(),
-                    e,
-                ))
-            })?;
-        }
-
-        if storage_temp_path.exists() {
-            std::fs::remove_dir_all(&storage_temp_path).map_err(|e| {
-                CollectionError::service_error(format!(
-                    "Failed to remove storage temp directory at {}: {:?}",
-                    storage_temp_path.display(),
-                    e,
-                ))
-            })?;
-        }
-
-        if let Some(path) = optional_temp_path {
-            if path.exists() {
-                std::fs::remove_dir_all(&path).map_err(|e| {
-                    CollectionError::service_error(format!(
-                        "Failed to remove optional temp directory at {}: {:?}",
-                        path.display(),
-                        e,
-                    ))
-                })?;
-            }
-        }
-
-        Ok(())
+        clear_tmp_directories(&self.storage_config)
     }
 }

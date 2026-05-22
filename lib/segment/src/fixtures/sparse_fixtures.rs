@@ -12,17 +12,16 @@ use sparse::common::sparse_vector_fixture::random_sparse_vector;
 use sparse::index::inverted_index::InvertedIndex;
 
 use crate::common::operation_error::OperationResult;
-use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
-use crate::fixtures::payload_context_fixture::FixtureIdTracker;
-use crate::index::VectorIndex;
+use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
+use crate::index::VectorIndexRead;
 use crate::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use crate::index::sparse_index::sparse_vector_index::{
     SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
-use crate::vector_storage::VectorStorage;
-use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
+use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
+use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead};
 
 /// Prepares a sparse vector index with a given iterator of sparse vectors
 pub fn fixture_sparse_index_from_iter<I: InvertedIndex>(
@@ -39,7 +38,7 @@ pub fn fixture_sparse_index_from_iter<I: InvertedIndex>(
     let storage_dir = &data_dir.join("storage");
 
     // setup
-    let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(vectors.len())));
+    let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(vectors.len())));
     let payload_storage = InMemoryPayloadStorage::default();
     let wrapped_payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
     let payload_index = StructPayloadIndex::open(
@@ -48,15 +47,13 @@ pub fn fixture_sparse_index_from_iter<I: InvertedIndex>(
         std::collections::HashMap::new(),
         payload_dir,
         true,
+        true,
     )?;
     let wrapped_payload_index = Arc::new(AtomicRefCell::new(payload_index));
 
-    let db = open_db(storage_dir, &[DB_VECTOR_CF]).unwrap();
-    let vector_storage = Arc::new(AtomicRefCell::new(open_simple_sparse_vector_storage(
-        db,
-        DB_VECTOR_CF,
-        &stopped,
-    )?));
+    let vector_storage = Arc::new(AtomicRefCell::new(VectorStorageEnum::SparseMmap(
+        MmapSparseVectorStorage::open_or_create(storage_dir)?,
+    )));
     let mut borrowed_storage = vector_storage.borrow_mut();
 
     let num_vectors = vectors.len();
@@ -124,16 +121,6 @@ macro_rules! fixture_for_all_indices {
         eprintln!("InvertedIndexCompressedMmap<f32>");
         $test::<
             ::sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap<f32>
-        >($($args)*);
-
-        eprintln!("InvertedIndexImmutableRam");
-        $test::<
-            ::sparse::index::inverted_index::inverted_index_immutable_ram::InvertedIndexImmutableRam
-        >($($args)*);
-
-        eprintln!("InvertedIndexMmap");
-        $test::<
-            ::sparse::index::inverted_index::inverted_index_mmap::InvertedIndexMmap
         >($($args)*);
     };
 }

@@ -3,9 +3,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use common::counter::hardware_counter::HardwareCounterCell;
+    use quantization::encoded_storage::TestEncodedStorageBuilder;
     use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-    use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin};
-    use rand::{Rng, SeedableRng};
+    use quantization::encoded_vectors_binary::{
+        self, BitsStoreType, EncodedVectorsBin, Encoding, QueryEncoding,
+    };
+    use rand::{RngExt, SeedableRng};
 
     use crate::metrics::{dot_similarity, l1_similarity, l2_similarity};
 
@@ -40,15 +43,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::Dot,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -86,15 +95,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::Dot,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -132,15 +147,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::Dot,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -175,15 +196,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::Dot,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -217,15 +244,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L1,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -278,15 +311,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L1,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -339,15 +378,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L1,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -397,15 +442,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L1,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -455,15 +506,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L2,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -516,15 +573,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L2,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -577,15 +640,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L2,
                 invert: false,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -635,15 +704,21 @@ mod tests {
             vector_data.push(generate_vector(vector_dim, &mut rng));
         }
 
+        let quantized_vector_size = encoded_vectors_binary::get_quantized_vector_size_from_params::<
+            TBitsStoreType,
+        >(vector_dim, Encoding::OneBit);
         let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
             &VectorParameters {
                 dim: vector_dim,
-                count: vectors_count,
+                deprecated_count: None,
                 distance_type: DistanceType::L2,
                 invert: true,
             },
+            Encoding::OneBit,
+            QueryEncoding::SameAsStorage,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();

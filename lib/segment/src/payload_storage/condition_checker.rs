@@ -2,12 +2,13 @@
 
 use std::str::FromStr;
 
+use ordered_float::OrderedFloat;
 use serde_json::Value;
 
 use crate::types::{
     AnyVariants, DateTimePayloadType, FieldCondition, FloatPayloadType, GeoBoundingBox, GeoPoint,
-    GeoPolygon, GeoRadius, Match, MatchAny, MatchExcept, MatchText, MatchValue, Range,
-    RangeInterface, ValueVariants, ValuesCount,
+    GeoPolygon, GeoRadius, Match, MatchAny, MatchExcept, MatchPhrase, MatchText, MatchTextAny,
+    MatchValue, Range, RangeInterface, ValueVariants, ValuesCount,
 };
 
 /// Threshold representing the point to which iterating through an IndexSet is more efficient than using hashing.
@@ -23,7 +24,11 @@ pub trait ValueChecker {
     fn _check(&self, payload: &Value) -> bool {
         match payload {
             Value::Array(values) => values.iter().any(|x| self.check_match(x)),
-            _ => self.check_match(payload),
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Object(_) => self.check_match(payload),
         }
     }
 
@@ -155,13 +160,29 @@ impl ValueChecker for Match {
                 (Value::Bool(stored), ValueVariants::Bool(val)) => stored == val,
                 (Value::String(stored), ValueVariants::String(val)) => stored == val,
                 (Value::Number(stored), ValueVariants::Integer(val)) => {
-                    stored.as_i64().map(|num| num == *val).unwrap_or(false)
+                    stored.as_i64().is_some_and(|num| num == *val)
                 }
                 _ => false,
             },
-            Match::Text(MatchText { text }) => match payload {
-                Value::String(stored) => stored.contains(text),
-                _ => false,
+            Match::Text(MatchText { text }) | Match::Phrase(MatchPhrase { phrase: text }) => {
+                match payload {
+                    Value::String(stored) => stored.contains(text),
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::Array(_)
+                    | Value::Object(_) => false,
+                }
+            }
+            Match::TextAny(MatchTextAny { text_any }) => match payload {
+                Value::String(stored) => text_any
+                    .split_whitespace()
+                    .any(|token| stored.contains(token)),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => false,
             },
             Match::Any(MatchAny { any }) => match (payload, any) {
                 (Value::String(stored), AnyVariants::Strings(list)) => {
@@ -212,14 +233,18 @@ impl ValueChecker for Match {
     }
 }
 
-impl ValueChecker for Range<FloatPayloadType> {
+impl ValueChecker for Range<OrderedFloat<FloatPayloadType>> {
     fn check_match(&self, payload: &Value) -> bool {
         match payload {
             Value::Number(num) => num
                 .as_f64()
-                .map(|number| self.check_range(number))
+                .map(|number| self.check_range(OrderedFloat(number)))
                 .unwrap_or(false),
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Array(_)
+            | Value::Object(_) => false,
         }
     }
 }
@@ -241,11 +266,15 @@ impl ValueChecker for GeoBoundingBox {
                 let lat_op = obj.get("lat").and_then(|x| x.as_f64());
 
                 if let (Some(lon), Some(lat)) = (lon_op, lat_op) {
-                    return self.check_point(&GeoPoint { lon, lat });
+                    return self.check_point(&GeoPoint::new_unchecked(lon, lat));
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -258,11 +287,15 @@ impl ValueChecker for GeoRadius {
                 let lat_op = obj.get("lat").and_then(|x| x.as_f64());
 
                 if let (Some(lon), Some(lat)) = (lon_op, lat_op) {
-                    return self.check_point(&GeoPoint { lon, lat });
+                    return self.check_point(&GeoPoint::new_unchecked(lon, lat));
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -275,11 +308,17 @@ impl ValueChecker for GeoPolygon {
                 let lat_op = obj.get("lat").and_then(|x| x.as_f64());
 
                 if let (Some(lon), Some(lat)) = (lon_op, lat_op) {
-                    return self.convert().check_point(&GeoPoint { lon, lat });
+                    return self
+                        .convert()
+                        .check_point(&GeoPoint::new_unchecked(lon, lat));
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -320,18 +359,12 @@ mod tests {
         ]);
 
         let near_berlin_query = GeoRadius {
-            center: GeoPoint {
-                lat: 52.511,
-                lon: 13.423637,
-            },
-            radius: 2000.0,
+            center: GeoPoint::new_unchecked(13.413637, 52.521976),
+            radius: OrderedFloat(2000.0),
         };
         let miss_geo_query = GeoRadius {
-            center: GeoPoint {
-                lat: 52.511,
-                lon: 20.423637,
-            },
-            radius: 2000.0,
+            center: GeoPoint::new_unchecked(20.423637, 52.511),
+            radius: OrderedFloat(2000.0),
         };
 
         assert!(near_berlin_query.check(&berlin_and_moscow));

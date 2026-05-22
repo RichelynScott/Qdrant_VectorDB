@@ -1,3 +1,5 @@
+#![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -38,6 +40,7 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let vector_params1 = VectorParamsBuilder::new(4, Distance::Dot).build();
@@ -62,6 +65,7 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -109,7 +113,13 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     ));
     let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default(), hw_counter)
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 

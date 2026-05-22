@@ -1,5 +1,6 @@
 use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
+use api::rest::models::InferenceUsage;
 use api::rest::{QueryGroupsRequest, QueryRequest, QueryRequestBatch, QueryResponse};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use itertools::Itertools;
@@ -12,24 +13,30 @@ use tokio::time::Instant;
 
 use super::CollectionPath;
 use super::read_params::ReadParams;
-use crate::actix::auth::ActixAccess;
+use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{self, get_request_hardware_counter};
-use crate::common::inference::InferenceToken;
+use crate::common::inference::api_keys::InferenceApiKeys;
+use crate::common::inference::params::InferenceParams;
 use crate::common::inference::query_requests_rest::{
+    CollectionQueryGroupsRequestWithUsage, CollectionQueryRequestWithUsage,
     convert_query_groups_request_from_rest, convert_query_request_from_rest,
 };
 use crate::common::query::do_query_point_groups;
 use crate::settings::ServiceConfig;
 
-#[post("/collections/{name}/points/query")]
+#[cfg(test)]
+pub const THIS_FILE: &str = file!();
+
+#[post("/collections/{collection_name}/points/query")]
+#[allow(clippy::too_many_arguments)]
 async fn query_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<QueryRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
-    inference_token: InferenceToken,
+    ActixAuth(auth): ActixAuth,
+    api_keys: InferenceApiKeys,
 ) -> impl Responder {
     let QueryRequest {
         internal: query_request,
@@ -38,7 +45,7 @@ async fn query_points(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
@@ -49,25 +56,32 @@ async fn query_points(
         Some(shard_keys) => shard_keys.into(),
     };
     let hw_measurement_acc = request_hw_counter.get_counter();
-    let result = async move {
-        let request = convert_query_request_from_rest(query_request, &inference_token).await?;
+    let mut inference_usage = InferenceUsage::default();
+
+    let inference_params = InferenceParams::new(api_keys, params.timeout());
+
+    let result = async {
+        let CollectionQueryRequestWithUsage { request, usage } =
+            convert_query_request_from_rest(query_request, &inference_params).await?;
+
+        inference_usage.merge_opt(usage);
 
         let pass = check_strict_mode(
             &request,
             params.timeout_as_secs(),
-            &collection.name,
+            &collection.collection_name,
             &dispatcher,
-            &access,
+            &auth,
         )
         .await?;
 
         let points = dispatcher
-            .toc(&access, &pass)
+            .toc(&auth, &pass)
             .query_batch(
-                &collection.name,
+                &collection.collection_name,
                 vec![(request, shard_selection)],
                 params.consistency,
-                access,
+                auth,
                 params.timeout(),
                 hw_measurement_acc,
             )
@@ -84,39 +98,54 @@ async fn query_points(
     }
     .await;
 
-    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
+    helpers::process_response_with_inference_usage(
+        result,
+        timing,
+        request_hw_counter.to_rest_api(),
+        inference_usage.into_non_empty(),
+    )
 }
 
-#[post("/collections/{name}/points/query/batch")]
+#[allow(clippy::too_many_arguments)]
+#[post("/collections/{collection_name}/points/query/batch")]
 async fn query_points_batch(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<QueryRequestBatch>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
-    inference_token: InferenceToken,
+    ActixAuth(auth): ActixAuth,
+    api_keys: InferenceApiKeys,
 ) -> impl Responder {
     let QueryRequestBatch { searches } = request.into_inner();
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
     let hw_measurement_acc = request_hw_counter.get_counter();
 
-    let result = async move {
+    let mut all_usages: InferenceUsage = InferenceUsage::default();
+
+    let inference_params = InferenceParams::new(api_keys, params.timeout());
+
+    let result = async {
         let mut batch = Vec::with_capacity(searches.len());
-        for request in searches {
+
+        for request_item in searches {
             let QueryRequest {
                 internal,
                 shard_key,
-            } = request;
+            } = request_item;
 
-            let request = convert_query_request_from_rest(internal, &inference_token).await?;
+            let CollectionQueryRequestWithUsage { request, usage } =
+                convert_query_request_from_rest(internal, &inference_params).await?;
+
+            all_usages.merge_opt(usage);
+
             let shard_selection = match shard_key {
                 None => ShardSelectorInternal::All,
                 Some(shard_keys) => shard_keys.into(),
@@ -128,19 +157,20 @@ async fn query_points_batch(
         let pass = check_strict_mode_batch(
             batch.iter().map(|i| &i.0),
             params.timeout_as_secs(),
-            &collection.name,
+            Some(batch.len()),
+            &collection.collection_name,
             &dispatcher,
-            &access,
+            &auth,
         )
         .await?;
 
         let res = dispatcher
-            .toc(&access, &pass)
+            .toc(&auth, &pass)
             .query_batch(
-                &collection.name,
+                &collection.collection_name,
                 batch,
                 params.consistency,
-                access,
+                auth,
                 params.timeout(),
                 hw_measurement_acc,
             )
@@ -157,18 +187,24 @@ async fn query_points_batch(
     }
     .await;
 
-    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
+    helpers::process_response_with_inference_usage(
+        result,
+        timing,
+        request_hw_counter.to_rest_api(),
+        all_usages.into_non_empty(),
+    )
 }
 
-#[post("/collections/{name}/points/query/groups")]
+#[allow(clippy::too_many_arguments)]
+#[post("/collections/{collection_name}/points/query/groups")]
 async fn query_points_groups(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<QueryGroupsRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
-    inference_token: InferenceToken,
+    ActixAuth(auth): ActixAuth,
+    api_keys: InferenceApiKeys,
 ) -> impl Responder {
     let QueryGroupsRequest {
         search_group_request,
@@ -177,45 +213,56 @@ async fn query_points_groups(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
     let hw_measurement_acc = request_hw_counter.get_counter();
+    let mut inference_usage = InferenceUsage::default();
 
-    let result = async move {
+    let inference_params = InferenceParams::new(api_keys, params.timeout());
+
+    let result = async {
         let shard_selection = match shard_key {
             None => ShardSelectorInternal::All,
             Some(shard_keys) => shard_keys.into(),
         };
-        let query_group_request =
-            convert_query_groups_request_from_rest(search_group_request, inference_token).await?;
+        let CollectionQueryGroupsRequestWithUsage { request, usage } =
+            convert_query_groups_request_from_rest(search_group_request, inference_params).await?;
+
+        inference_usage.merge_opt(usage);
 
         let pass = check_strict_mode(
-            &query_group_request,
+            &request,
             params.timeout_as_secs(),
-            &collection.name,
+            &collection.collection_name,
             &dispatcher,
-            &access,
+            &auth,
         )
         .await?;
 
-        do_query_point_groups(
-            dispatcher.toc(&access, &pass),
-            &collection.name,
-            query_group_request,
+        let query_result = do_query_point_groups(
+            dispatcher.toc(&auth, &pass),
+            &collection.collection_name,
+            request,
             params.consistency,
             shard_selection,
-            access,
+            auth,
             params.timeout(),
             hw_measurement_acc,
         )
-        .await
+        .await?;
+        Ok(query_result)
     }
     .await;
 
-    helpers::process_response(result, timing, request_hw_counter.to_rest_api())
+    helpers::process_response_with_inference_usage(
+        result,
+        timing,
+        request_hw_counter.to_rest_api(),
+        inference_usage.into_non_empty(),
+    )
 }
 
 pub fn config_query_api(cfg: &mut web::ServiceConfig) {

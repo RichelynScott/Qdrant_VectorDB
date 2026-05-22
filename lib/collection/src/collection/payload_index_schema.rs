@@ -1,24 +1,18 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::save_on_disk::SaveOnDisk;
 use segment::json_path::JsonPath;
-use segment::types::{Filter, PayloadFieldSchema, PayloadKeyType};
-use serde::{Deserialize, Serialize};
+use segment::types::{Filter, PayloadFieldSchema};
+use shard::files::PAYLOAD_INDEX_CONFIG_FILE;
+pub use shard::payload_index_schema::PayloadIndexSchema;
 
 use crate::collection::Collection;
 use crate::operations::types::{CollectionResult, UpdateResult};
 use crate::operations::universal_query::formula::ExpressionInternal;
 use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
 use crate::problems::unindexed_field;
-use crate::save_on_disk::SaveOnDisk;
-
-pub const PAYLOAD_INDEX_CONFIG_FILE: &str = "payload_index.json";
-
-#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
-pub struct PayloadIndexSchema {
-    pub schema: HashMap<PayloadKeyType, PayloadFieldSchema>,
-}
+use crate::shards::shard_trait::WaitUntil;
 
 impl Collection {
     pub(crate) fn payload_index_file(collection_path: &Path) -> PathBuf {
@@ -70,7 +64,7 @@ impl Collection {
             }),
         );
 
-        self.update_all_local(create_index_operation, wait, hw_acc)
+        self.update_all_local(create_index_operation, WaitUntil::from(wait), hw_acc, false)
             .await
     }
 
@@ -89,12 +83,17 @@ impl Collection {
         let result = self
             .update_all_local(
                 delete_index_operation,
-                false,
+                WaitUntil::from(false),
                 HwMeasurementAcc::disposable(), // Unmeasured API
+                false,
             )
             .await?;
 
         Ok(result)
+    }
+
+    pub fn payload_key_index_schema(&self, key: &JsonPath) -> Option<PayloadFieldSchema> {
+        self.payload_index_schema.read().schema.get(key).cloned()
     }
 
     /// Returns an arbitrary payload key along with acceptable
@@ -104,18 +103,14 @@ impl Collection {
         &self,
         filter: &Filter,
     ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
-        self.payload_index_schema
-            .read()
-            .one_unindexed_filter_key(filter)
+        one_unindexed_filter_key(&self.payload_index_schema.read(), filter)
     }
 
     pub fn one_unindexed_expression_key(
         &self,
         expr: &ExpressionInternal,
     ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
-        self.payload_index_schema
-            .read()
-            .one_unindexed_expression_key(expr)
+        one_unindexed_expression_key(&self.payload_index_schema.read(), expr)
     }
 }
 
@@ -124,47 +119,45 @@ enum PotentiallyUnindexed<'a> {
     Expression(&'a ExpressionInternal),
 }
 
-impl PayloadIndexSchema {
-    /// Returns an arbitrary payload key with acceptable schemas
-    /// used by `filter` which can be indexed but currently is not.
-    /// If this function returns `None` all indexable keys in `filter` are indexed.
-    fn one_unindexed_key(
-        &self,
-        suspect: PotentiallyUnindexed<'_>,
-    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
-        let mut extractor = unindexed_field::Extractor::new(&self.schema);
+/// Returns an arbitrary payload key with acceptable schemas
+/// used by `filter` which can be indexed but currently is not.
+/// If this function returns `None` all indexable keys in `filter` are indexed.
+fn one_unindexed_key(
+    schema: &PayloadIndexSchema,
+    suspect: PotentiallyUnindexed<'_>,
+) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
+    let mut extractor = unindexed_field::Extractor::new(&schema.schema);
 
-        match suspect {
-            PotentiallyUnindexed::Filter(filter) => {
-                extractor.update_from_filter_once(None, filter);
-            }
-            PotentiallyUnindexed::Expression(expression) => {
-                extractor.update_from_expression(expression);
-            }
+    match suspect {
+        PotentiallyUnindexed::Filter(filter) => {
+            extractor.update_from_filter_once(None, filter);
         }
-
-        // Get the first unindexed field from the extractor.
-        extractor
-            .unindexed_schema()
-            .iter()
-            .next()
-            .map(|(key, schema)| (key.clone(), schema.clone()))
+        PotentiallyUnindexed::Expression(expression) => {
+            extractor.update_from_expression(expression);
+        }
     }
 
-    /// Returns an arbitrary payload key with acceptable schemas
-    /// used by `filter` which can be indexed but currently is not.
-    /// If this function returns `None` all indexable keys in `filter` are indexed.
-    pub fn one_unindexed_filter_key(
-        &self,
-        filter: &Filter,
-    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
-        self.one_unindexed_key(PotentiallyUnindexed::Filter(filter))
-    }
+    // Get the first unindexed field from the extractor.
+    extractor
+        .unindexed_schema()
+        .iter()
+        .next()
+        .map(|(key, schema)| (key.clone(), schema.clone()))
+}
 
-    pub fn one_unindexed_expression_key(
-        &self,
-        expr: &ExpressionInternal,
-    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
-        self.one_unindexed_key(PotentiallyUnindexed::Expression(expr))
-    }
+/// Returns an arbitrary payload key with acceptable schemas
+/// used by `filter` which can be indexed but currently is not.
+/// If this function returns `None` all indexable keys in `filter` are indexed.
+pub fn one_unindexed_filter_key(
+    schema: &PayloadIndexSchema,
+    filter: &Filter,
+) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
+    one_unindexed_key(schema, PotentiallyUnindexed::Filter(filter))
+}
+
+pub fn one_unindexed_expression_key(
+    schema: &PayloadIndexSchema,
+    expr: &ExpressionInternal,
+) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
+    one_unindexed_key(schema, PotentiallyUnindexed::Expression(expr))
 }

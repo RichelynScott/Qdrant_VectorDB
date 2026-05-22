@@ -13,7 +13,11 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow = "1.0.98"
-flate2 = { version = "1.1.1" }
+anyhow = { workspace = true }
+flate2 = { version = "1.1.9" }
+fs-err = { workspace = true }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+fs-err = { workspace = true, features = ["debug"] }

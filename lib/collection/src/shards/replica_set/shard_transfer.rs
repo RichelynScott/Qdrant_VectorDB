@@ -2,12 +2,12 @@ use std::ops::Deref as _;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use segment::types::PointIdType;
+use segment::types::{Filter, PointIdType};
 
 use super::ShardReplicaSet;
 use crate::hash_ring::HashRingRouter;
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::forward_proxy_shard::ForwardProxyShard;
+use crate::shards::forward_proxy_shard::{ForwardProxyShard, PreparedTransferBatch};
 use crate::shards::local_shard::clock_map::RecoveryPoint;
 use crate::shards::queue_proxy_shard::QueueProxyShard;
 use crate::shards::remote_shard::RemoteShard;
@@ -24,6 +24,7 @@ impl ShardReplicaSet {
         &self,
         remote_shard: RemoteShard,
         resharding_hash_ring: Option<HashRingRouter>,
+        filter: Option<Filter>,
     ) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
@@ -78,15 +79,25 @@ impl ShardReplicaSet {
             unreachable!()
         };
 
-        let proxy_shard = ForwardProxyShard::new(
+        let proxy_shard_res = ForwardProxyShard::new(
             self.shard_id,
             local_shard,
             remote_shard,
             resharding_hash_ring,
+            filter,
         );
-        let _ = local.insert(Shard::ForwardProxy(proxy_shard));
 
-        Ok(())
+        match proxy_shard_res {
+            Ok(proxy_shard) => {
+                let _ = local.insert(Shard::ForwardProxy(proxy_shard));
+                Ok(())
+            }
+            Err((err, local_shard)) => {
+                log::warn!("Failed to proxify shard, reverting to local shard: {err}");
+                let _ = local.insert(Shard::Local(local_shard));
+                Err(err)
+            }
+        }
     }
 
     /// Queue proxy our local shard, pointing to the remote shard.
@@ -331,20 +342,21 @@ impl ShardReplicaSet {
         let _ = local.insert(Shard::Local(local_shard));
     }
 
-    /// Custom operation for transferring data from one shard to another during transfer
+    /// Read a transfer batch without sending it yet.
     ///
-    /// Returns new point offset and transferred count
+    /// Returns a [`PreparedTransferBatch`] that holds the update lock. The caller can then drop
+    /// other locks (e.g. the shard holder lock) before calling [`PreparedTransferBatch::send`].
     ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn transfer_batch(
+    pub async fn read_transfer_batch(
         &self,
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: Option<&HashRingRouter>,
         merge_points: bool,
-    ) -> CollectionResult<(Option<PointIdType>, usize)> {
+    ) -> CollectionResult<PreparedTransferBatch> {
         let local = self.local.read().await;
 
         let Some(Shard::ForwardProxy(proxy)) = local.deref() else {
@@ -355,7 +367,7 @@ impl ShardReplicaSet {
         };
 
         proxy
-            .transfer_batch(
+            .read_transfer_batch(
                 offset,
                 batch_size,
                 hashring_filter,
@@ -469,10 +481,22 @@ impl ShardReplicaSet {
         };
 
         let (local_shard, remote_shard) = queue_proxy.forget_updates_and_finalize();
-        let forward_proxy = ForwardProxyShard::new(self.shard_id, local_shard, remote_shard, None);
-        let _ = local.insert(Shard::ForwardProxy(forward_proxy));
+        let forward_proxy_res =
+            ForwardProxyShard::new(self.shard_id, local_shard, remote_shard, None, None);
 
-        Ok(())
+        match forward_proxy_res {
+            Ok(forward_proxy) => {
+                let _ = local.insert(Shard::ForwardProxy(forward_proxy));
+                Ok(())
+            }
+            Err((err, local_shard)) => {
+                log::warn!(
+                    "Failed to transform queue proxy shard into forward proxy, reverting to local shard: {err}"
+                );
+                let _ = local.insert(Shard::Local(local_shard));
+                Err(err)
+            }
+        }
     }
 
     pub async fn resolve_wal_delta(

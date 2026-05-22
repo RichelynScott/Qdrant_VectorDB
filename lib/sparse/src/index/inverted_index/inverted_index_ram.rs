@@ -2,12 +2,13 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::storage_version::StorageVersion;
 use common::types::PointOffsetType;
-use io::storage_version::StorageVersion;
+use common::universal_io::Result;
 
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
-use crate::index::inverted_index::InvertedIndex;
+use crate::index::inverted_index::{InvertedIndex, out_of_bounds};
 use crate::index::posting_list::{PostingList, PostingListIterator};
 use crate::index::posting_list_common::PostingElementEx;
 
@@ -41,7 +42,7 @@ impl InvertedIndex for InvertedIndexRam {
         false
     }
 
-    fn open(_path: &Path) -> std::io::Result<Self> {
+    fn open(_path: &Path) -> Result<Self> {
         panic!("InvertedIndexRam is not supposed to be loaded");
     }
 
@@ -53,19 +54,24 @@ impl InvertedIndex for InvertedIndexRam {
         &'a self,
         id: DimOffset,
         _hw_counter: &'a HardwareCounterCell,
-    ) -> Option<PostingListIterator<'a>> {
-        self.get(&id).map(|posting_list| posting_list.iter())
+    ) -> Result<PostingListIterator<'a>> {
+        Ok(self.get(id)?.iter())
     }
 
     fn len(&self) -> usize {
         self.postings.len()
     }
 
-    fn posting_list_len(&self, id: &DimId, _hw_counter: &HardwareCounterCell) -> Option<usize> {
-        self.get(id).map(|posting_list| posting_list.elements.len())
+    fn posting_list_len(&self, id: DimOffset, _hw_counter: &HardwareCounterCell) -> Result<usize> {
+        Ok(self.get(id)?.elements.len())
     }
 
     fn files(_path: &Path) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn immutable_files(_path: &Path) -> Vec<PathBuf> {
+        // `InvertedIndexRam` has no files
         Vec::new()
     }
 
@@ -125,9 +131,10 @@ impl InvertedIndexRam {
         }
     }
 
-    /// Get posting list for dimension id
-    pub fn get(&self, id: &DimId) -> Option<&PostingList> {
-        self.postings.get((*id) as usize)
+    pub fn get(&self, id: DimOffset) -> Result<&PostingList> {
+        self.postings
+            .get(id as usize)
+            .ok_or_else(|| out_of_bounds(id, self.len()))
     }
 
     /// Upsert a vector into the inverted index.
@@ -155,7 +162,7 @@ impl InvertedIndexRam {
 
         let new_vector_size = vector.len() * size_of::<PostingElementEx>();
 
-        for (dim_id, weight) in vector.indices.into_iter().zip(vector.values.into_iter()) {
+        for (dim_id, weight) in vector.indices.into_iter().zip(vector.values) {
             let dim_id = dim_id as usize;
             match self.postings.get_mut(dim_id) {
                 Some(posting) => {
@@ -211,7 +218,7 @@ mod tests {
             None,
         );
         for i in 1..4 {
-            let posting_list = inverted_index_ram.get(&i).unwrap();
+            let posting_list = inverted_index_ram.get(i).unwrap();
             let posting_list = posting_list.elements.as_slice();
             assert_eq!(posting_list.len(), 4);
             assert_eq!(posting_list.first().unwrap().weight, 10.0);
@@ -245,7 +252,7 @@ mod tests {
 
         // updated existing dimension
         for i in 1..3 {
-            let posting_list = inverted_index_ram.get(&i).unwrap();
+            let posting_list = inverted_index_ram.get(i).unwrap();
             let posting_list = posting_list.elements.as_slice();
             assert_eq!(posting_list.len(), 4);
             assert_eq!(posting_list.first().unwrap().weight, 10.0);
@@ -255,7 +262,7 @@ mod tests {
         }
 
         // fetch 30th posting
-        let postings = inverted_index_ram.get(&30).unwrap();
+        let postings = inverted_index_ram.get(30).unwrap();
         let postings = postings.elements.as_slice();
         assert_eq!(postings.len(), 1);
         let posting = postings.first().unwrap();

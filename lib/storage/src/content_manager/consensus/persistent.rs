@@ -1,7 +1,6 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::fs::{File, create_dir_all};
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
+use fs_err as fs;
+use fs_err::File;
 use http::Uri;
 use parking_lot::RwLock;
 use raft::RaftState;
@@ -98,16 +99,26 @@ impl Persistent {
         *peer_metadata_by_id.write() = metadata_by_id;
         *cluster_metadata = new_cluster_metadata;
 
+        // Last Raft commit and last snapshot index must be equal and persisted in one operation
+        // Our `ConsensusManager::new` function relies on this for reconciling WAL clears
+        debug_assert_eq!(
+            state.hard_state.commit, latest_snapshot_meta.index,
+            "applied Raft commit and last snapshot index must be equal",
+        );
+
         self.save()
     }
 
     /// Returns state and if it was initialized for the first time
+    ///
+    /// `peer_id` is used only when raft state is not found.
     pub fn load_or_init(
         storage_path: impl AsRef<Path>,
         first_peer: bool,
         reinit: bool,
+        peer_id: Option<PeerId>,
     ) -> Result<Self, StorageError> {
-        create_dir_all(storage_path.as_ref())?;
+        fs::create_dir_all(storage_path.as_ref())?;
         let path_legacy = storage_path.as_ref().join(STATE_FILE_NAME_CBOR);
         let path_json = storage_path.as_ref().join(STATE_FILE_NAME);
         let mut state = if path_json.exists() {
@@ -122,7 +133,10 @@ impl Persistent {
             state
         } else {
             log::info!("Initializing new raft state at {}", path_json.display());
-            Self::init(path_json.clone(), first_peer, None)?
+            if let Some(peer_id) = peer_id {
+                log::debug!("Using peer ID: {peer_id}");
+            };
+            Self::init(path_json.clone(), first_peer, peer_id)?
         };
 
         let state = if reinit {
@@ -156,13 +170,11 @@ impl Persistent {
     fn remove_unknown_peer_metadata(&self) -> Result<(), StorageError> {
         let is_updated = {
             let mut peer_metadata = self.peer_metadata_by_id.write();
-            let peer_metadata_len = peer_metadata.len();
-
             let peer_address = self.peer_address_by_id.read();
-            peer_metadata.retain(|peer_id, _| peer_address.contains_key(peer_id));
-
-            // Check, if peer metadata was updated
-            peer_metadata_len != peer_metadata.len()
+            peer_metadata
+                .extract_if(|peer_id, _| !peer_address.contains_key(peer_id))
+                .count()
+                > 0
         };
 
         if is_updated {
@@ -204,14 +216,6 @@ impl Persistent {
         self.save()
     }
 
-    pub fn set_peer_address_by_id(
-        &mut self,
-        peer_address_by_id: PeerAddressById,
-    ) -> Result<(), StorageError> {
-        *self.peer_address_by_id.write() = peer_address_by_id;
-        self.save()
-    }
-
     pub fn insert_peer(&mut self, peer_id: PeerId, address: Uri) -> Result<(), StorageError> {
         let address_display = address.to_string();
         match self
@@ -250,7 +254,9 @@ impl Persistent {
     }
 
     pub fn get_cluster_metadata_keys(&self) -> Vec<String> {
-        self.cluster_metadata.keys().cloned().collect()
+        let mut keys: Vec<String> = self.cluster_metadata.keys().cloned().collect();
+        keys.sort_unstable();
+        keys
     }
 
     pub fn get_cluster_metadata_key(&self, key: &str) -> serde_json::Value {
@@ -318,11 +324,11 @@ impl Persistent {
     fn init(
         path: PathBuf,
         first_peer: bool,
-        this_peer_id: Option<PeerId>,
+        peer_id: Option<PeerId>,
     ) -> Result<Self, StorageError> {
         // Do not generate too big peer ID, to avoid problems with serialization
         // (especially in json format)
-        let this_peer_id = this_peer_id.unwrap_or_else(|| rand::random::<PeerId>() % (1 << 53));
+        let this_peer_id = peer_id.unwrap_or_else(|| rand::random::<PeerId>() % (1 << 53) + 1);
         let voters = if first_peer {
             vec![this_peer_id]
         } else {
@@ -339,7 +345,7 @@ impl Persistent {
                 conf_state: ConfState::from((voters, vec![])),
             },
             apply_progress_queue: Default::default(),
-            first_voter: if first_peer { Some(this_peer_id) } else { None },
+            first_voter: first_peer.then_some(this_peer_id),
             peer_address_by_id: Default::default(),
             peer_metadata_by_id: Default::default(),
             cluster_metadata: Default::default(),
@@ -353,23 +359,24 @@ impl Persistent {
     }
 
     fn load(path: PathBuf) -> Result<Self, StorageError> {
-        let file = File::open(&path)?;
-        let mut state: Self = serde_cbor::from_reader(&file)?;
+        let reader = BufReader::new(File::open(&path)?);
+        let mut state: Self = serde_cbor::from_reader(reader)?;
         state.path = path;
         Ok(state)
     }
 
     fn load_json(path: PathBuf) -> Result<Self, StorageError> {
-        let file = File::open(&path)?;
-        let mut state: Self = serde_json::from_reader(&file)?;
+        let reader = BufReader::new(File::open(&path)?);
+        let mut state: Self = serde_json::from_reader(reader)?;
         state.path = path;
         Ok(state)
     }
 
     pub fn save(&self) -> Result<(), StorageError> {
         let result = AtomicFile::new(&self.path, AllowOverwrite).write(|file| {
-            let writer = BufWriter::new(file);
-            serde_json::to_writer(writer, self)
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self)?;
+            writer.flush()
         });
         log::trace!("Saved state: {self:?}");
         self.dirty.store(result.is_err(), Ordering::Relaxed);

@@ -6,36 +6,39 @@ use std::time::Duration;
 use ahash::AHashSet;
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
-use common::types::TelemetryDetail;
+use common::types::{DeferredBehavior, TelemetryDetail};
+use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::facets::{FacetParams, FacetResponse};
-use segment::data_types::order_by::OrderBy;
-use segment::data_types::segment_manifest::SegmentManifests;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, PointIdType, ScoredPoint, SizeStats, SnapshotFormat, WithPayload,
-    WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, PointIdType, ScoredPoint, SizeStats, SnapshotFormat, StrictModeConfig,
+    WithPayload, WithPayloadInterface, WithVector,
 };
-use tokio::runtime::Handle;
-use tokio::sync::{RwLock, oneshot};
+use shard::count::CountRequestInternal;
+use shard::retrieve::record_internal::RecordInternal;
+use shard::scroll::ScrollRequestInternal;
+use shard::search::CoreSearchRequestBatch;
+use shard::snapshots::snapshot_manifest::SnapshotManifest;
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
+use crate::common::memory_reporter::CollectionMemoryReport;
 use crate::operations::OperationWithClockTag;
 use crate::operations::operation_effect::{
     EstimateOperationEffectArea, OperationEffectArea, PointsOperationEffect,
 };
 use crate::operations::types::{
-    CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, OptimizersStatus, PointRequestInternal, RecordInternal,
-    UpdateResult,
+    CollectionError, CollectionInfo, CollectionResult, CountResult, OptimizersStatus,
+    PointRequestInternal, UpdateResult,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::shards::telemetry::LocalShardTelemetry;
-use crate::update_handler::UpdateSignal;
 
 type ChangedPointsSet = Arc<RwLock<AHashSet<PointIdType>>>;
 
@@ -46,7 +49,7 @@ type ChangedPointsSet = Arc<RwLock<AHashSet<PointIdType>>>;
 /// It can be used to provide all read and write operations while the wrapped shard is being transferred to another node.
 /// It keeps track of changed points during the shard transfer to assure consistency.
 pub struct ProxyShard {
-    wrapped_shard: LocalShard,
+    pub(super) wrapped_shard: LocalShard,
     changed_points: ChangedPointsSet,
     pub changed_alot: AtomicBool,
 }
@@ -72,29 +75,31 @@ impl ProxyShard {
         res
     }
 
-    /// Forward `create_snapshot` to `wrapped_shard`
-    pub async fn create_snapshot(
+    /// Forward `get_snapshot_creator` to `wrapped_shard`
+    pub async fn get_snapshot_creator(
         &self,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
+        manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
         self.wrapped_shard
-            .create_snapshot(temp_path, tar, format, save_wal)
+            .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
             .await
     }
 
-    pub fn segment_manifests(&self) -> CollectionResult<SegmentManifests> {
-        self.wrapped_shard.segment_manifests()
+    pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+        self.wrapped_shard.snapshot_manifest().await
     }
 
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.wrapped_shard.on_optimizer_config_update().await
     }
 
-    pub async fn on_strict_mode_config_update(&mut self) {
-        self.wrapped_shard.on_strict_mode_config_update().await;
+    pub fn on_strict_mode_config_update(&mut self, new_strict_mode: &StrictModeConfig) {
+        self.wrapped_shard
+            .on_strict_mode_config_update(new_strict_mode);
     }
 
     pub fn trigger_optimizers(&self) {
@@ -108,20 +113,13 @@ impl ProxyShard {
         // Clear the update queue
         let mut attempt = 1;
         loop {
-            let (tx, rx) = oneshot::channel();
-            let plunger = UpdateSignal::Plunger(tx);
-            self.wrapped_shard
-                .update_sender
-                .load()
-                .send(plunger)
-                .await?;
+            let plunger = self.wrapped_shard.plunge_async().await?;
             let attempt_timeout = UPDATE_QUEUE_CLEAR_TIMEOUT * 2_u32.pow(attempt);
             // It is possible, that the queue is recreated while we are waiting for plunger.
             // So we will timeout and try again
-            if timeout(attempt_timeout, rx).await.is_err() {
+            if timeout(attempt_timeout, plunger).await.is_err() {
                 log::warn!(
-                    "Timeout {} while waiting for the wrapped shard to finish the update queue, retrying",
-                    attempt_timeout.as_secs(),
+                    "Timeout {attempt_timeout:?} while waiting for the wrapped shard to finish the update queue, retrying",
                 );
                 attempt += 1;
                 if attempt_timeout > UPDATE_QUEUE_CLEAR_MAX_TIMEOUT {
@@ -144,28 +142,53 @@ impl ProxyShard {
         Ok(())
     }
 
-    pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
-        self.wrapped_shard.get_telemetry_data(detail)
+    pub async fn get_telemetry_data(
+        &self,
+        detail: TelemetryDetail,
+        timeout: Duration,
+    ) -> CollectionResult<LocalShardTelemetry> {
+        self.wrapped_shard.get_telemetry_data(detail, timeout).await
     }
 
-    pub fn get_optimization_status(&self) -> OptimizersStatus {
-        self.wrapped_shard.get_optimization_status()
+    pub async fn get_optimization_status(
+        &self,
+        timeout: Duration,
+    ) -> CollectionResult<OptimizersStatus> {
+        self.wrapped_shard.get_optimization_status(timeout).await
     }
 
-    pub fn get_size_stats(&self) -> SizeStats {
-        self.wrapped_shard.get_size_stats()
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
+        self.wrapped_shard.get_size_stats(timeout).await
     }
 
     pub fn update_tracker(&self) -> &UpdateTracker {
         self.wrapped_shard.update_tracker()
     }
 
-    pub fn estimate_cardinality(
+    pub fn optimizers_log(&self) -> Arc<ParkingMutex<TrackerLog>> {
+        self.wrapped_shard.optimizers_log()
+    }
+
+    pub async fn estimate_cardinality(
         &self,
         filter: Option<&Filter>,
-        hw_counter: &HardwareCounterCell,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CardinalityEstimation> {
-        self.wrapped_shard.estimate_cardinality(filter, hw_counter)
+        self.wrapped_shard
+            .estimate_cardinality(filter, hw_measurement_acc)
+            .await
+    }
+
+    pub async fn set_extended_wal_retention(&self) {
+        self.wrapped_shard.set_extended_wal_retention().await;
+    }
+
+    pub async fn set_normal_wal_retention(&self) {
+        self.wrapped_shard.set_normal_wal_retention().await;
+    }
+
+    pub async fn memory_report(&self) -> CollectionResult<CollectionMemoryReport> {
+        self.wrapped_shard.memory_report().await
     }
 }
 
@@ -179,7 +202,8 @@ impl ShardOperation for ProxyShard {
     async fn update(
         &self,
         operation: OperationWithClockTag,
-        wait: bool,
+        wait: WaitUntil,
+        timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // If we modify `self.changed_points`, we *have to* (?) execute `local_shard` update
@@ -192,14 +216,22 @@ impl ShardOperation for ProxyShard {
             OperationEffectArea::Points(points) => PointsOperationEffect::Some(Vec::from(points)),
             OperationEffectArea::Filter(filter) => {
                 let cardinality = local_shard
-                    .estimate_cardinality(Some(filter), &hw_measurement_acc.get_counter_cell())?;
+                    .estimate_cardinality(Some(filter), &hw_measurement_acc)
+                    .await?;
                 // validate the size of the change set before retrieving it
                 if cardinality.max > MAX_CHANGES_TRACKED_COUNT {
                     PointsOperationEffect::Many
                 } else {
                     let runtime_handle = self.wrapped_shard.search_runtime.clone();
                     let points = local_shard
-                        .read_filtered(Some(filter), &runtime_handle, hw_measurement_acc.clone())
+                        .read_filtered(
+                            Some(filter),
+                            &runtime_handle,
+                            hw_measurement_acc.clone(),
+                            None, // no timeout on update path
+                            // Including deferred points in the result here since they could be part of the update operation.
+                            DeferredBehavior::IncludeAll,
+                        )
                         .await?;
                     PointsOperationEffect::Some(points.into_iter().collect())
                 }
@@ -226,7 +258,7 @@ impl ShardOperation for ProxyShard {
             // Shard update is within a write lock scope, because we need a way to block the shard updates
             // during the transfer restart and finalization.
             local_shard
-                .update(operation, wait, hw_measurement_acc)
+                .update(operation, wait, timeout, hw_measurement_acc)
                 .await
         }
     }
@@ -234,28 +266,42 @@ impl ShardOperation for ProxyShard {
     /// Forward read-only `scroll_by` to `wrapped_shard`
     async fn scroll_by(
         &self,
-        offset: Option<ExtendedPointId>,
-        limit: usize,
-        with_payload_interface: &WithPayloadInterface,
-        with_vector: &WithVector,
-        filter: Option<&Filter>,
-        search_runtime_handle: &Handle,
-        order_by: Option<&OrderBy>,
+        request: Arc<ScrollRequestInternal>,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .scroll_by(
+            .scroll_by(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .await
+    }
+
+    /// Forward read-only `local_scroll_by_id` to `wrapped_shard`
+    async fn local_scroll_by_id(
+        &self,
+        offset: Option<ExtendedPointId>,
+        limit: usize,
+        with_payload_interface: &WithPayloadInterface,
+        with_vector: &WithVector,
+        filter: Option<&Filter>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        let local_shard = &self.wrapped_shard;
+        local_shard
+            .local_scroll_by_id(
                 offset,
                 limit,
                 with_payload_interface,
                 with_vector,
                 filter,
                 search_runtime_handle,
-                order_by,
                 timeout,
                 hw_measurement_acc,
+                deferred_behavior,
             )
             .await
     }
@@ -270,7 +316,7 @@ impl ShardOperation for ProxyShard {
     async fn core_search(
         &self,
         request: Arc<CoreSearchRequestBatch>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
@@ -284,13 +330,20 @@ impl ShardOperation for ProxyShard {
     async fn count(
         &self,
         request: Arc<CountRequestInternal>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<CountResult> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .count(
+                request,
+                search_runtime_handle,
+                timeout,
+                hw_measurement_acc,
+                deferred_behavior,
+            )
             .await
     }
 
@@ -300,9 +353,10 @@ impl ShardOperation for ProxyShard {
         request: Arc<PointRequestInternal>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
@@ -313,6 +367,7 @@ impl ShardOperation for ProxyShard {
                 search_runtime_handle,
                 timeout,
                 hw_measurement_acc,
+                deferred_behavior,
             )
             .await
     }
@@ -321,7 +376,7 @@ impl ShardOperation for ProxyShard {
     async fn query_batch(
         &self,
         request: Arc<Vec<ShardQueryRequest>>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
@@ -334,7 +389,7 @@ impl ShardOperation for ProxyShard {
     async fn facet(
         &self,
         request: Arc<FacetParams>,
-        search_runtime_handle: &Handle,
+        search_runtime_handle: &AdaptiveSearchHandle,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
@@ -342,5 +397,10 @@ impl ShardOperation for ProxyShard {
         local_shard
             .facet(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
+    }
+
+    async fn stop_gracefully(self) {
+        let local_shard = self.wrapped_shard;
+        local_shard.stop_gracefully().await;
     }
 }

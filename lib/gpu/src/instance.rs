@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -76,21 +76,6 @@ impl InstanceBuilder {
         self
     }
 
-    /// Set CPU allocation callbacks for the instance.
-    pub fn with_allocation_callbacks(
-        mut self,
-        allocation_callbacks: Box<dyn AllocationCallbacks>,
-    ) -> Self {
-        self.allocation_callbacks = Some(allocation_callbacks);
-        self
-    }
-
-    // Enable API dump layer.
-    pub fn with_dump_api(mut self, dump_api: bool) -> Self {
-        self.dump_api = dump_api;
-        self
-    }
-
     pub fn build(self) -> GpuResult<Arc<Instance>> {
         Instance::new(
             self.debug_messenger,
@@ -114,7 +99,7 @@ impl Instance {
         // It's used to compile GLSL into SPIR-V.
         let compiler = Mutex::new(
             shaderc::Compiler::new()
-                .ok_or_else(|| GpuError::Other("Failed to create shaderc compiler".to_string()))?,
+                .map_err(|_| GpuError::Other("Failed to create shaderc compiler".to_string()))?,
         );
 
         // Create Vulkan API entry point.
@@ -141,7 +126,7 @@ impl Instance {
             .iter()
             .filter_map(|s| CString::new(s.clone().into_bytes()).ok())
             .collect();
-        let extension_names_raw: Vec<*const i8> = extensions_cstr
+        let extension_names_raw: Vec<*const c_char> = extensions_cstr
             .iter()
             .map(|raw_name| raw_name.as_ptr())
             .collect();
@@ -154,7 +139,7 @@ impl Instance {
             .iter()
             .filter_map(|s| CString::new(s.clone().into_bytes()).ok())
             .collect();
-        let layers_raw: Vec<*const i8> = layers_cstr
+        let layers_raw: Vec<*const c_char> = layers_cstr
             .iter()
             .map(|raw_name| raw_name.as_ptr())
             .collect();
@@ -278,7 +263,7 @@ impl Instance {
 
     fn debug_messenger_create_info(
         debug_messenger: &dyn DebugMessenger,
-    ) -> vk::DebugUtilsMessengerCreateInfoEXT {
+    ) -> vk::DebugUtilsMessengerCreateInfoEXT<'_> {
         vk::DebugUtilsMessengerCreateInfoEXT::default()
             .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
             .message_severity(debug_messenger.severity_flags())
@@ -286,7 +271,7 @@ impl Instance {
             .pfn_user_callback(debug_messenger.callback())
     }
 
-    pub fn cpu_allocation_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
+    pub fn cpu_allocation_callbacks(&self) -> Option<&vk::AllocationCallbacks<'_>> {
         self.allocation_callbacks
             .as_ref()
             .map(|alloc| alloc.allocation_callbacks())
@@ -307,9 +292,8 @@ impl Instance {
         defines: Option<&HashMap<String, Option<String>>>,
         includes: Option<&HashMap<String, String>>,
     ) -> GpuResult<Vec<u8>> {
-        let mut options = shaderc::CompileOptions::new().ok_or_else(|| {
-            GpuError::Other("Failed to create shaderc compile options".to_string())
-        })?;
+        let mut options = shaderc::CompileOptions::new()
+            .map_err(|_| GpuError::Other("Failed to create shaderc compile options".to_string()))?;
         options.set_optimization_level(shaderc::OptimizationLevel::Performance);
         options.set_target_env(
             shaderc::TargetEnv::Vulkan,
@@ -369,10 +353,8 @@ impl Instance {
 
     fn extensions_list(validation: bool) -> Vec<String> {
         let mut extensions_list = Vec::new();
-        if validation {
-            if let Ok(ext) = ash::ext::debug_utils::NAME.to_str() {
-                extensions_list.push(ext.to_string());
-            }
+        if validation && let Ok(ext) = ash::ext::debug_utils::NAME.to_str() {
+            extensions_list.push(ext.to_string());
         }
 
         #[cfg(target_os = "macos")]
@@ -421,13 +403,10 @@ impl Drop for Instance {
         let allocation_callbacks = self.cpu_allocation_callbacks();
         unsafe {
             // Destroy first debug messenger if it's present.
-            if let Some(loader) = &self.vk_debug_utils_loader {
-                if self.vk_debug_messenger != vk::DebugUtilsMessengerEXT::null() {
-                    loader.destroy_debug_utils_messenger(
-                        self.vk_debug_messenger,
-                        allocation_callbacks,
-                    );
-                }
+            if let Some(loader) = &self.vk_debug_utils_loader
+                && self.vk_debug_messenger != vk::DebugUtilsMessengerEXT::null()
+            {
+                loader.destroy_debug_utils_messenger(self.vk_debug_messenger, allocation_callbacks);
             }
 
             // Last step after all drops of all GPU resources: destroy vulkan instance.

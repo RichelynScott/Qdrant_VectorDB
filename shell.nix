@@ -8,48 +8,11 @@
 #
 # Usage: Run `nix-shell` in the root directory of this repository. You will then
 # be dropped into a new shell with all programs and dependencies available.
-#
-# To update dependencies, run ./tools/nix/update.py.
 
 let
   sources = import ./tools/nix/npins;
   fenix = import sources.fenix { inherit pkgs; };
   pkgs = import sources.nixpkgs { };
-  poetry2nix = import sources.poetry2nix { inherit pkgs; };
-
-  versions = builtins.fromJSON (builtins.readFile ./tools/nix/versions.json);
-
-  rust-combined =
-    let
-      stable = fenix.toolchainOf {
-        channel = versions.stable.version;
-        sha256 = versions.stable.sha256;
-      };
-      nightly = fenix.toolchainOf {
-        channel = "nightly";
-        date = versions.nightly.date;
-        sha256 = versions.nightly.sha256;
-      };
-    in
-    fenix.combine [
-      nightly.rustfmt # should be the first
-      stable.rust
-      stable.rust-analyzer
-      stable.rust-src
-    ];
-
-  # A workaround to allow running `cargo +nightly fmt`
-  cargo-wrapper = pkgs.writeScriptBin "cargo" ''
-    #!${pkgs.stdenv.shell}
-    [ "$1" != "+nightly" ] || [ "$2" != "fmt" ] || shift
-    exec ${rust-combined}/bin/cargo "$@"
-  '';
-
-  # Python dependencies used in tests
-  python-env = poetry2nix.mkPoetryEnv {
-    projectDir = ./tests; # reads pyproject.toml and poetry.lock
-    preferWheels = true; # wheels speed up building of the environment
-  };
 
   # Use mold linker to speed up builds
   mkShell =
@@ -61,8 +24,7 @@ in
 mkShell {
   buildInputs = [
     # Rust toolchain
-    cargo-wrapper # should be before rust-combined
-    rust-combined
+    pkgs.rustup
 
     # Crates' build dependencies
     pkgs.cmake # for shaderc-sys
@@ -73,22 +35,30 @@ mkShell {
     pkgs.rustPlatform.bindgenHook # for bindgen deps
 
     # For tests and tools
+    pkgs.ast-grep # used in lib/edge/publish/amalgamate.py
     pkgs.cargo-nextest # mentioned in .github/workflows/rust.yml
     pkgs.ccache # mentioned in shellHook
     pkgs.curl # used in ./tests
     pkgs.glsl_analyzer # language server for editing *.comp files
     pkgs.gnuplot # optional runtime dep for criterion
     pkgs.jq # used in ./tests and ./tools
-    pkgs.nixfmt-rfc-style # to format this file
+    pkgs.just # for lib/edge/Justfile
+    pkgs.maturin # mentioned in lib/edge/python/README.md
+    pkgs.nixfmt # to format this file
     pkgs.npins # used in tools/nix/update.py
-    pkgs.poetry # used to update poetry.lock
+    pkgs.python3 # used in ./tests, ./tools, lib/edge
     pkgs.sccache # mentioned in shellHook
+    pkgs.unzip # used in tools/sync-web-ui.sh
+    pkgs.uv # used in tests
     pkgs.vulkan-tools # mentioned in .github/workflows/rust-gpu.yml
     pkgs.wget # used in tests/storage-compat
     pkgs.yq-go # used in tools/generate_openapi_models.sh
     pkgs.ytt # used in tools/generate_openapi_models.sh
-    python-env # used in tests
   ];
+
+  # Fix for tikv-jemalloc-sys
+  # https://github.com/tikv/jemallocator/issues/108
+  hardeningDisable = [ "fortify" ];
 
   shellHook = ''
     # Caching for C/C++ deps, particularly for librocksdb-sys
@@ -106,7 +76,7 @@ mkShell {
     # Fix for older macOS
     # https://github.com/rust-rocksdb/rust-rocksdb/issues/776
     if [[ "$OSTYPE" == "darwin"* ]]; then
-      export CFLAGS="-mmacosx-version-min=10.13"
+      export CFLAGS="$CFLAGS -mmacosx-version-min=10.13"
       export CXXFLAGS="-mmacosx-version-min=10.13"
       export MACOSX_DEPLOYMENT_TARGET="10.13"
     fi

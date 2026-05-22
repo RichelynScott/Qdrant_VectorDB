@@ -1,15 +1,16 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::typelevel::True;
 use common::types::{PointOffsetType, ScoreType};
+use zerocopy::FromBytes;
 
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{DenseVector, TypedDenseVector};
 use crate::spaces::metric::Metric;
 use crate::vector_storage::DenseVectorStorage;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
 
@@ -18,13 +19,11 @@ pub struct CustomQueryScorer<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
     TVectorStorage: DenseVectorStorage<TElement>,
-    TInputQuery: Query<DenseVector>,
     TStoredQuery: Query<TypedDenseVector<TElement>>,
 > {
     vector_storage: &'a TVectorStorage,
     query: TStoredQuery,
     metric: PhantomData<TMetric>,
-    _input_query: PhantomData<TInputQuery>,
     _element: PhantomData<TElement>,
     hardware_counter: HardwareCounterCell,
 }
@@ -34,15 +33,18 @@ impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
     TVectorStorage: DenseVectorStorage<TElement>,
-    TInputQuery: Query<DenseVector> + TransformInto<TStoredQuery, DenseVector, TypedDenseVector<TElement>>,
     TStoredQuery: Query<TypedDenseVector<TElement>>,
-> CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TInputQuery, TStoredQuery>
+> CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TStoredQuery>
 {
-    pub fn new(
+    pub fn new<TInputQuery>(
         query: TInputQuery,
         vector_storage: &'a TVectorStorage,
         mut hardware_counter: HardwareCounterCell,
-    ) -> Self {
+    ) -> Self
+    where
+        TInputQuery: Query<DenseVector>
+            + TransformInto<TStoredQuery, DenseVector, TypedDenseVector<TElement>>,
+    {
         let mut dim = 0;
         let query = query
             .transform(|vector| {
@@ -65,7 +67,6 @@ impl<
             query,
             vector_storage,
             metric: PhantomData,
-            _input_query: PhantomData,
             _element: PhantomData,
             hardware_counter,
         }
@@ -76,33 +77,27 @@ impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
     TVectorStorage: DenseVectorStorage<TElement>,
-    TInputQuery: Query<DenseVector>,
     TStoredQuery: Query<TypedDenseVector<TElement>>,
-> QueryScorer<[TElement]>
-    for CustomQueryScorer<'_, TElement, TMetric, TVectorStorage, TInputQuery, TStoredQuery>
+> QueryScorer for CustomQueryScorer<'_, TElement, TMetric, TVectorStorage, TStoredQuery>
 {
+    type TVector = [TElement];
+
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        let stored = self.vector_storage.get_dense(idx);
+        let stored = self.vector_storage.get_dense::<Random>(idx);
         self.hardware_counter.vector_io_read().incr();
 
-        self.score(stored)
+        self.score(&stored)
     }
 
+    #[inline]
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
         debug_assert_eq!(ids.len(), scores.len());
-
-        let mut vectors = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
-        let vectors = self
-            .vector_storage
-            .get_dense_batch(ids, &mut vectors[..ids.len()]);
 
         self.hardware_counter.vector_io_read().incr_delta(ids.len());
 
-        for idx in 0..ids.len() {
-            scores[idx] = self.score(vectors[idx]);
-        }
+        self.vector_storage
+            .for_each_in_dense_batch(ids, |idx, vector| scores[idx] = self.score(vector));
     }
 
     #[inline]
@@ -117,5 +112,10 @@ impl<
 
     fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {
         unimplemented!("Custom scorer can compare against multiple vectors, not just one")
+    }
+
+    type SupportsBytes = True;
+    fn score_bytes(&self, _enabled: Self::SupportsBytes, bytes: &[u8]) -> ScoreType {
+        self.score(<[TElement]>::ref_from_bytes(bytes).unwrap())
     }
 }

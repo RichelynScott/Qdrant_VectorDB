@@ -4,27 +4,26 @@ use actix_web::{Responder, get, post, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
-use collection::operations::types::{
-    PointRequest, PointRequestInternal, RecordInternal, ScrollRequest,
-};
+use collection::operations::types::{PointRequest, PointRequestInternal, ScrollRequest};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::TryFutureExt;
 use itertools::Itertools;
 use segment::types::{PointIdType, WithPayloadInterface};
 use serde::Deserialize;
+use shard::retrieve::record_internal::RecordInternal;
 use storage::content_manager::collection_verification::{
     check_strict_mode, check_strict_mode_timeout,
 };
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::Access;
+use storage::rbac::Auth;
 use tokio::time::Instant;
 use validator::Validate;
 
 use super::CollectionPath;
 use super::read_params::ReadParams;
-use crate::actix::auth::ActixAccess;
+use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{
     get_request_hardware_counter, process_response, process_response_error,
 };
@@ -44,7 +43,7 @@ async fn do_get_point(
     point_id: PointIdType,
     read_consistency: Option<ReadConsistency>,
     timeout: Option<Duration>,
-    access: Access,
+    auth: Auth,
     hw_counter: HwMeasurementAcc,
 ) -> Result<Option<RecordInternal>, StorageError> {
     let request = PointRequestInternal {
@@ -61,27 +60,27 @@ async fn do_get_point(
         read_consistency,
         timeout,
         shard_selection,
-        access,
+        auth,
         hw_counter,
     )
     .await
     .map(|points| points.into_iter().next())
 }
 
-#[get("/collections/{name}/points/{id}")]
+#[get("/collections/{collection_name}/points/{id}")]
 async fn get_point(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     point: Path<PointPath>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let pass = match check_strict_mode_timeout(
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -90,33 +89,32 @@ async fn get_point(
     };
 
     let Ok(point_id) = point.id.parse::<PointIdType>() else {
-        let err = StorageError::BadInput {
-            description: format!("Can not recognize \"{}\" as point id", point.id),
-        };
+        let err =
+            StorageError::bad_input(format!("Can not recognize \"{}\" as point id", point.id));
         return process_response_error(err, Instant::now(), None);
     };
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let res = do_get_point(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         point_id,
         params.consistency,
         params.timeout(),
-        access,
+        auth,
         request_hw_counter.get_counter(),
     )
     .await
     .and_then(|i| {
-        i.ok_or_else(|| StorageError::NotFound {
-            description: format!("Point with id {point_id} does not exists!"),
+        i.ok_or_else(|| {
+            StorageError::not_found(format!("Point with id {point_id} does not exists!"))
         })
     })
     .map(api::rest::Record::from);
@@ -124,20 +122,20 @@ async fn get_point(
     process_response(res, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points")]
+#[post("/collections/{collection_name}/points")]
 async fn get_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<PointRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let pass = match check_strict_mode_timeout(
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -157,20 +155,20 @@ async fn get_points(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let res = do_get_points(
-        dispatcher.toc(&access, &pass),
-        &collection.name,
+        dispatcher.toc(&auth, &pass),
+        &collection.collection_name,
         point_request,
         params.consistency,
         params.timeout(),
         shard_selection,
-        access,
+        auth,
         request_hw_counter.get_counter(),
     )
     .map_ok(|response| {
@@ -184,14 +182,14 @@ async fn get_points(
     process_response(res, timing, request_hw_counter.to_rest_api())
 }
 
-#[post("/collections/{name}/points/scroll")]
+#[post("/collections/{collection_name}/points/scroll")]
 async fn scroll_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     request: Json<ScrollRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let ScrollRequest {
         scroll_request,
@@ -201,9 +199,9 @@ async fn scroll_points(
     let pass = match check_strict_mode(
         &scroll_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -218,21 +216,21 @@ async fn scroll_points(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
     let timing = Instant::now();
 
     let res = dispatcher
-        .toc(&access, &pass)
+        .toc(&auth, &pass)
         .scroll(
-            &collection.name,
+            &collection.collection_name,
             scroll_request,
             params.consistency,
             params.timeout(),
             shard_selection,
-            access,
+            auth,
             request_hw_counter.get_counter(),
         )
         .await;

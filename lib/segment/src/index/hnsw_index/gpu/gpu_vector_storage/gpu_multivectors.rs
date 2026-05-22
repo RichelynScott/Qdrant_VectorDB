@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common::generic_consts::Random;
 use common::types::PointOffsetType;
 use quantization::EncodedVectors;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -58,13 +59,11 @@ impl ShaderBuilderParameters for GpuMultivectors {
 impl GpuMultivectors {
     /// Construct multivectors data from quantized storage.
     pub fn new_quantized<
-        TEncodedQuery: Sized,
-        QuantizedStorage: EncodedVectors<TEncodedQuery>,
+        QuantizedStorage: EncodedVectors,
         TMultivectorOffsetsStorage: MultivectorOffsetsStorage,
     >(
         device: Arc<gpu::Device>,
         quantized_storage: &QuantizedMultivectorStorage<
-            TEncodedQuery,
             QuantizedStorage,
             TMultivectorOffsetsStorage,
         >,
@@ -91,7 +90,8 @@ impl GpuMultivectors {
                 // map ID to count of vectors in multivector
                 .map(|id| {
                     vector_storage
-                        .get_multi(id as PointOffsetType)
+                        .get_multi::<Random>(id as PointOffsetType)
+                        .as_ref()
                         .vectors_count()
                 })
                 // Map count of vectors to start and count of vectors in multivector.

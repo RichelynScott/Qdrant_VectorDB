@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod auth;
 pub mod collections;
 pub mod debugger;
@@ -11,8 +12,10 @@ pub mod pyroscope_state;
 pub mod query;
 pub mod snapshots;
 pub mod stacktrace;
+pub mod strict_mode;
 pub mod strings;
 pub mod telemetry;
 pub mod telemetry_ops;
 pub mod telemetry_reporting;
 pub mod update;
+pub mod validate_vectors;

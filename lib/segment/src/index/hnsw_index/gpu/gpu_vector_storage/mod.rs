@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use common::generic_consts::Random;
 use common::types::PointOffsetType;
 use gpu_multivectors::GpuMultivectors;
 use gpu_quantization::GpuQuantization;
 use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin};
-use quantization::{EncodedStorage, EncodedVectorsPQ, EncodedVectorsU8};
+use quantization::{EncodedStorage, EncodedVectors, EncodedVectorsPQ, EncodedVectorsU8};
+use zerocopy::IntoBytes;
 
 use super::shader_builder::ShaderBuilderParameters;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
@@ -25,7 +27,7 @@ use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectorStorage, QuantizedVectors,
 };
 use crate::vector_storage::{
-    DenseVectorStorage, MultiVectorStorage, VectorStorage, VectorStorageEnum,
+    DenseVectorStorage, MultiVectorStorage, VectorStorageEnum, VectorStorageRead,
 };
 
 pub const ELEMENTS_PER_SUBGROUP: usize = 4;
@@ -138,12 +140,19 @@ impl GpuVectorStorage {
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
         if let Some(quantized_storage) = quantized_storage {
-            Self::new_quantized(
-                device,
+            let gpu_vector_storage = Self::new_quantized(
+                device.clone(),
                 vector_storage.distance(),
                 quantized_storage.get_storage(),
                 stopped,
-            )
+            )?;
+            if let Some(gpu_vector_storage) = gpu_vector_storage {
+                Ok(gpu_vector_storage)
+            } else {
+                // Quantized storage is not supported, fallback to vector storage.
+                // Force half precision for `f32` vectors if supported by device.
+                Self::new_from_vector_storage(device, vector_storage, true, stopped)
+            }
         } else {
             Self::new_from_vector_storage(device, vector_storage, force_half_precision, stopped)
         }
@@ -154,8 +163,8 @@ impl GpuVectorStorage {
         distance: Distance,
         quantized_storage: &QuantizedVectorStorage,
         stopped: &AtomicBool,
-    ) -> OperationResult<Self> {
-        match quantized_storage {
+    ) -> OperationResult<Option<Self>> {
+        let gpu_vector_storage = match quantized_storage {
             QuantizedVectorStorage::ScalarRam(quantized_storage) => Self::new_sq(
                 device.clone(),
                 distance,
@@ -165,6 +174,14 @@ impl GpuVectorStorage {
                 stopped,
             ),
             QuantizedVectorStorage::ScalarMmap(quantized_storage) => Self::new_sq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage,
+                None,
+                stopped,
+            ),
+            QuantizedVectorStorage::ScalarChunkedMmap(quantized_storage) => Self::new_sq(
                 device.clone(),
                 distance,
                 quantized_storage.vectors_count(),
@@ -188,6 +205,14 @@ impl GpuVectorStorage {
                 None,
                 stopped,
             ),
+            QuantizedVectorStorage::PQChunkedMmap(quantized_storage) => Self::new_pq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage,
+                None,
+                stopped,
+            ),
             QuantizedVectorStorage::BinaryRam(quantized_storage) => Self::new_bq(
                 device.clone(),
                 distance,
@@ -204,6 +229,17 @@ impl GpuVectorStorage {
                 None,
                 stopped,
             ),
+            QuantizedVectorStorage::BinaryChunkedMmap(quantized_storage) => Self::new_bq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage,
+                None,
+                stopped,
+            ),
+            QuantizedVectorStorage::TQRam(_) => return Ok(None),
+            QuantizedVectorStorage::TQMmap(_) => return Ok(None),
+            QuantizedVectorStorage::TQChunkedMmap(_) => return Ok(None),
             QuantizedVectorStorage::ScalarRamMulti(quantized_storage) => Self::new_sq(
                 device.clone(),
                 distance,
@@ -213,6 +249,14 @@ impl GpuVectorStorage {
                 stopped,
             ),
             QuantizedVectorStorage::ScalarMmapMulti(quantized_storage) => Self::new_sq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage.inner_storage(),
+                Some(GpuMultivectors::new_quantized(device, quantized_storage)?),
+                stopped,
+            ),
+            QuantizedVectorStorage::ScalarChunkedMmapMulti(quantized_storage) => Self::new_sq(
                 device.clone(),
                 distance,
                 quantized_storage.vectors_count(),
@@ -236,6 +280,14 @@ impl GpuVectorStorage {
                 Some(GpuMultivectors::new_quantized(device, quantized_storage)?),
                 stopped,
             ),
+            QuantizedVectorStorage::PQChunkedMmapMulti(quantized_storage) => Self::new_pq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage.inner_storage(),
+                Some(GpuMultivectors::new_quantized(device, quantized_storage)?),
+                stopped,
+            ),
             QuantizedVectorStorage::BinaryRamMulti(quantized_storage) => Self::new_bq(
                 device.clone(),
                 distance,
@@ -252,7 +304,19 @@ impl GpuVectorStorage {
                 Some(GpuMultivectors::new_quantized(device, quantized_storage)?),
                 stopped,
             ),
-        }
+            QuantizedVectorStorage::BinaryChunkedMmapMulti(quantized_storage) => Self::new_bq(
+                device.clone(),
+                distance,
+                quantized_storage.vectors_count(),
+                quantized_storage.inner_storage(),
+                Some(GpuMultivectors::new_quantized(device, quantized_storage)?),
+                stopped,
+            ),
+            QuantizedVectorStorage::TQRamMulti(_) => return Ok(None),
+            QuantizedVectorStorage::TQMmapMulti(_) => return Ok(None),
+            QuantizedVectorStorage::TQChunkedMmapMulti(_) => return Ok(None),
+        }?;
+        Ok(Some(gpu_vector_storage))
     }
 
     pub fn new_sq<TStorage: EncodedStorage>(
@@ -268,9 +332,13 @@ impl GpuVectorStorage {
             distance,
             quantized_storage.vectors_count(),
             num_vectors,
-            quantized_storage.get_quantized_vector(0).1.len(),
+            quantized_storage
+                .get_quantized_vector_offset_and_code(0)
+                .1
+                .len(),
             (0..quantized_storage.vectors_count()).map(|id| {
-                let (_, vector) = quantized_storage.get_quantized_vector(id as PointOffsetType);
+                let (_, vector) =
+                    quantized_storage.get_quantized_vector_offset_and_code(id as PointOffsetType);
                 Cow::Borrowed(vector)
             }),
             Some(GpuQuantization::new_sq(device, quantized_storage)?),
@@ -293,10 +361,8 @@ impl GpuVectorStorage {
             quantized_storage.vectors_count(),
             num_vectors,
             quantized_storage.get_quantized_vector(0).len(),
-            (0..quantized_storage.vectors_count()).map(|id| {
-                let vector = quantized_storage.get_quantized_vector(id as PointOffsetType);
-                Cow::Borrowed(vector)
-            }),
+            (0..quantized_storage.vectors_count())
+                .map(|id| quantized_storage.get_quantized_vector(id as PointOffsetType)),
             Some(GpuQuantization::new_pq(device, quantized_storage)?),
             multivectors,
             stopped,
@@ -317,9 +383,8 @@ impl GpuVectorStorage {
             quantized_storage.vectors_count(),
             num_vectors,
             quantized_storage.get_quantized_vector(0).len(),
-            (0..quantized_storage.vectors_count()).map(|id| {
-                Cow::Borrowed(quantized_storage.get_quantized_vector(id as PointOffsetType))
-            }),
+            (0..quantized_storage.vectors_count())
+                .map(|id| quantized_storage.get_quantized_vector(id as PointOffsetType)),
             Some(GpuQuantization::new_bq(device, quantized_storage)),
             multivectors,
             stopped,
@@ -333,13 +398,15 @@ impl GpuVectorStorage {
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
         match vector_storage {
-            VectorStorageEnum::DenseSimple(vector_storage) => {
+            VectorStorageEnum::DenseVolatile(vector_storage) => {
                 Self::new_dense_f32(device, vector_storage, force_half_precision, stopped)
             }
-            VectorStorageEnum::DenseSimpleByte(vector_storage) => {
+            #[cfg(test)]
+            VectorStorageEnum::DenseVolatileByte(vector_storage) => {
                 Self::new_dense(device, vector_storage, stopped)
             }
-            VectorStorageEnum::DenseSimpleHalf(vector_storage) => {
+            #[cfg(test)]
+            VectorStorageEnum::DenseVolatileHalf(vector_storage) => {
                 Self::new_dense_f16(device, vector_storage, stopped)
             }
             VectorStorageEnum::DenseMemmap(vector_storage) => Self::new_dense_f32(
@@ -354,6 +421,21 @@ impl GpuVectorStorage {
             VectorStorageEnum::DenseMemmapHalf(vector_storage) => {
                 Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
             }
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseUring(vector_storage) => Self::new_dense_f32(
+                device,
+                vector_storage.as_ref(),
+                force_half_precision,
+                stopped,
+            ),
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseUringByte(vector_storage) => {
+                Self::new_dense(device, vector_storage.as_ref(), stopped)
+            }
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseUringHalf(vector_storage) => {
+                Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
+            }
             VectorStorageEnum::DenseAppendableMemmap(vector_storage) => Self::new_dense_f32(
                 device,
                 vector_storage.as_ref(),
@@ -366,34 +448,24 @@ impl GpuVectorStorage {
             VectorStorageEnum::DenseAppendableMemmapHalf(vector_storage) => {
                 Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
             }
-            VectorStorageEnum::DenseAppendableInRam(vector_storage) => Self::new_dense_f32(
-                device,
-                vector_storage.as_ref(),
-                force_half_precision,
-                stopped,
-            ),
-            VectorStorageEnum::DenseAppendableInRamByte(vector_storage) => {
-                Self::new_dense(device, vector_storage.as_ref(), stopped)
-            }
-            VectorStorageEnum::DenseAppendableInRamHalf(vector_storage) => {
-                Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
-            }
-            VectorStorageEnum::SparseSimple(_) => Err(OperationError::from(
+            VectorStorageEnum::SparseVolatile(_) => Err(OperationError::from(
                 gpu::GpuError::NotSupported("Sparse vectors are not supported on GPU".to_string()),
             )),
             VectorStorageEnum::SparseMmap(_) => Err(OperationError::from(
                 gpu::GpuError::NotSupported("Sparse vectors are not supported on GPU".to_string()),
             )),
-            VectorStorageEnum::MultiDenseSimple(vector_storage) => Self::new_multi_f32(
+            VectorStorageEnum::MultiDenseVolatile(vector_storage) => Self::new_multi_f32(
                 device.clone(),
                 vector_storage,
                 force_half_precision,
                 stopped,
             ),
-            VectorStorageEnum::MultiDenseSimpleByte(vector_storage) => {
+            #[cfg(test)]
+            VectorStorageEnum::MultiDenseVolatileByte(vector_storage) => {
                 Self::new_multi(device, vector_storage, stopped)
             }
-            VectorStorageEnum::MultiDenseSimpleHalf(vector_storage) => {
+            #[cfg(test)]
+            VectorStorageEnum::MultiDenseVolatileHalf(vector_storage) => {
                 Self::new_multi_f16(device, vector_storage, stopped)
             }
             VectorStorageEnum::MultiDenseAppendableMemmap(vector_storage) => Self::new_multi_f32(
@@ -408,17 +480,10 @@ impl GpuVectorStorage {
             VectorStorageEnum::MultiDenseAppendableMemmapHalf(vector_storage) => {
                 Self::new_multi_f16(device, vector_storage.as_ref(), stopped)
             }
-            VectorStorageEnum::MultiDenseAppendableInRam(vector_storage) => Self::new_multi_f32(
-                device.clone(),
-                vector_storage.as_ref(),
-                force_half_precision,
-                stopped,
-            ),
-            VectorStorageEnum::MultiDenseAppendableInRamByte(vector_storage) => {
-                Self::new_multi(device, vector_storage.as_ref(), stopped)
-            }
-            VectorStorageEnum::MultiDenseAppendableInRamHalf(vector_storage) => {
-                Self::new_multi_f16(device, vector_storage.as_ref(), stopped)
+            VectorStorageEnum::EmptyDense(_) | VectorStorageEnum::EmptySparse(_) => {
+                Err(OperationError::service_error(
+                    "Cannot create GPU vector storage for empty vector storage",
+                ))
             }
         }
     }
@@ -437,9 +502,9 @@ impl GpuVectorStorage {
                 vector_storage.total_vector_count(),
                 vector_storage.vector_dim(),
                 (0..vector_storage.total_vector_count()).map(|id| {
-                    VectorElementTypeHalf::slice_from_float_cow(Cow::Borrowed(
-                        vector_storage.get_dense(id as PointOffsetType),
-                    ))
+                    VectorElementTypeHalf::slice_from_float_cow(
+                        vector_storage.get_dense::<Random>(id as PointOffsetType),
+                    )
                 }),
                 None,
                 None,
@@ -465,9 +530,9 @@ impl GpuVectorStorage {
                 vector_storage.total_vector_count(),
                 vector_storage.vector_dim(),
                 (0..vector_storage.total_vector_count()).map(|id| {
-                    VectorElementTypeHalf::slice_to_float_cow(Cow::Borrowed(
-                        vector_storage.get_dense(id as PointOffsetType),
-                    ))
+                    VectorElementTypeHalf::slice_to_float_cow(
+                        vector_storage.get_dense::<Random>(id as PointOffsetType),
+                    )
                 }),
                 None,
                 None,
@@ -488,7 +553,7 @@ impl GpuVectorStorage {
             vector_storage.total_vector_count(),
             vector_storage.vector_dim(),
             (0..vector_storage.total_vector_count())
-                .map(|id| Cow::Borrowed(vector_storage.get_dense(id as PointOffsetType))),
+                .map(|id| vector_storage.get_dense::<Random>(id as PointOffsetType)),
             None,
             None,
             stopped,
@@ -508,15 +573,16 @@ impl GpuVectorStorage {
                 (0..vector_storage.total_vector_count())
                     .map(|id| {
                         vector_storage
-                            .get_multi(id as PointOffsetType)
+                            .get_multi::<Random>(id as PointOffsetType)
+                            .as_ref()
                             .vectors_count()
                     })
                     .sum(),
                 vector_storage.total_vector_count(),
                 vector_storage.vector_dim(),
-                vector_storage.iterate_inner_vectors().map(|vector| {
-                    VectorElementTypeHalf::slice_from_float_cow(Cow::Borrowed(vector))
-                }),
+                vector_storage
+                    .iterate_inner_vectors()
+                    .map(|vector| VectorElementTypeHalf::slice_from_float_cow(vector)),
                 None,
                 Some(GpuMultivectors::new_multidense(device, vector_storage)?),
                 stopped,
@@ -540,7 +606,8 @@ impl GpuVectorStorage {
                 (0..vector_storage.total_vector_count())
                     .map(|id| {
                         vector_storage
-                            .get_multi(id as PointOffsetType)
+                            .get_multi::<Random>(id as PointOffsetType)
+                            .as_ref()
                             .vectors_count()
                     })
                     .sum(),
@@ -548,7 +615,7 @@ impl GpuVectorStorage {
                 vector_storage.vector_dim(),
                 vector_storage
                     .iterate_inner_vectors()
-                    .map(|vector| VectorElementTypeHalf::slice_to_float_cow(Cow::Borrowed(vector))),
+                    .map(|vector| VectorElementTypeHalf::slice_to_float_cow(vector)),
                 None,
                 Some(GpuMultivectors::new_multidense(device, vector_storage)?),
                 stopped,
@@ -567,13 +634,14 @@ impl GpuVectorStorage {
             (0..vector_storage.total_vector_count())
                 .map(|id| {
                     vector_storage
-                        .get_multi(id as PointOffsetType)
+                        .get_multi::<Random>(id as PointOffsetType)
+                        .as_ref()
                         .vectors_count()
                 })
                 .sum(),
             vector_storage.total_vector_count(),
             vector_storage.vector_dim(),
-            vector_storage.iterate_inner_vectors().map(Cow::Borrowed),
+            vector_storage.iterate_inner_vectors(),
             None,
             Some(GpuMultivectors::new_multidense(device, vector_storage)?),
             stopped,
@@ -630,7 +698,7 @@ impl GpuVectorStorage {
         // fill staging buffer with zeros
         let zero_vector = vec![TElement::default(); gpu_vector_capacity];
         for i in 0..upload_points_count {
-            staging_buffer.upload(TElement::as_bytes(&zero_vector), i * gpu_vector_capacity)?;
+            staging_buffer.upload(zero_vector.as_bytes(), i * gpu_vector_capacity)?;
         }
         log::trace!(
             "GPU staging buffer size {}, `upload_points_count` = {}",
@@ -647,8 +715,7 @@ impl GpuVectorStorage {
 
             for vector in vectors.clone().skip(storage_index).step_by(STORAGES_COUNT) {
                 check_process_stopped(stopped)?;
-                staging_buffer
-                    .upload(TElement::as_bytes(&vector), upload_points * gpu_vector_size)?;
+                staging_buffer.upload(vector.as_bytes(), upload_points * gpu_vector_size)?;
                 upload_size += gpu_vector_size;
                 upload_points += 1;
 
@@ -780,7 +847,7 @@ impl GpuVectorStorage {
 
     /// Number of vectors in each gpu buffer.
     fn points_in_storage_count(num_vectors: usize) -> usize {
-        num_vectors.next_multiple_of(STORAGES_COUNT) / STORAGES_COUNT
+        num_vectors.div_ceil(STORAGES_COUNT)
     }
 
     pub fn descriptor_set_layout(&self) -> Arc<gpu::DescriptorSetLayout> {

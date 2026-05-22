@@ -1,38 +1,31 @@
 use std::borrow::Cow;
-use std::mem::take;
 
-use ahash::AHashSet;
-use api::rest::LookupLocation;
+use api::rest::{LookupLocation, SearchRequestInternal};
 use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::lookup::WithLookup;
 use collection::operations::CollectionUpdateOperations;
-use collection::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
-use collection::operations::point_ops::{PointIdsList, PointOperations};
 use collection::operations::types::{
-    ContextExamplePair, CoreSearchRequest, CountRequestInternal, DiscoverRequestInternal,
-    PointRequestInternal, RecommendExample, RecommendRequestInternal, ScrollRequestInternal,
+    CoreSearchRequest, CountRequestInternal, DiscoverRequestInternal, PointRequestInternal,
+    RecommendRequestInternal,
 };
 use collection::operations::universal_query::collection_query::{
-    CollectionPrefetch, CollectionQueryRequest, Query, VectorInputInternal, VectorQuery,
+    CollectionPrefetch, CollectionQueryRequest,
 };
-use collection::operations::vector_ops::VectorOperations;
 use segment::data_types::facets::FacetParams;
-use segment::types::{Condition, ExtendedPointId, FieldCondition, Filter, Match, Payload};
+use shard::scroll::ScrollRequestInternal;
 
-use super::{
-    Access, AccessRequirements, CollectionAccessList, CollectionAccessView, CollectionPass,
-    PayloadConstraint, incompatible_with_payload_constraint,
-};
+use super::{Access, AccessRequirements, CollectionAccessList, CollectionPass};
 use crate::content_manager::collection_meta_ops::CollectionMetaOperations;
 use crate::content_manager::errors::{StorageError, StorageResult};
+use crate::rbac::auditable_operation::AuditableOperation;
 
 impl Access {
     #[allow(private_bounds)]
     pub(crate) fn check_point_op<'a>(
         &self,
         collection_name: &'a str,
-        op: &mut impl CheckableCollectionOperation,
+        op: &impl CheckableCollectionOperation,
     ) -> Result<CollectionPass<'a>, StorageError> {
         let requirements = op.access_requirements();
         match self {
@@ -40,7 +33,7 @@ impl Access {
             Access::Collection(list) => {
                 let view = list.find_view(collection_name)?;
                 view.meets_requirements(requirements)?;
-                op.check_access(view, list)?;
+                op.check_access(list)?;
             }
         }
         Ok(CollectionPass(Cow::Borrowed(collection_name)))
@@ -65,16 +58,32 @@ impl Access {
             CollectionMetaOperations::CreatePayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole().extras(),
+                    AccessRequirements::new().write().extras(),
                 )?;
             }
             CollectionMetaOperations::DropPayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole().extras(),
+                    AccessRequirements::new().write().extras(),
+                )?;
+            }
+            CollectionMetaOperations::CreateNamedVector(op) => {
+                self.check_collection_access(
+                    &op.collection_name,
+                    AccessRequirements::new().write().extras(),
+                )?;
+            }
+            CollectionMetaOperations::DeleteNamedVector(op) => {
+                self.check_collection_access(
+                    &op.collection_name,
+                    AccessRequirements::new().write().extras(),
                 )?;
             }
             CollectionMetaOperations::Nop { token: _ } => (),
+            #[cfg(feature = "staging")]
+            CollectionMetaOperations::TestSlowDown(_) => {
+                self.check_global_access(AccessRequirements::new().manage())?;
+            }
         }
         Ok(())
     }
@@ -84,11 +93,7 @@ trait CheckableCollectionOperation {
     /// Used to distinguish whether the operation is read-only or read-write.
     fn access_requirements(&self) -> AccessRequirements;
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        access: &CollectionAccessList,
-    ) -> Result<(), StorageError>;
+    fn check_access(&self, access: &CollectionAccessList) -> Result<(), StorageError>;
 }
 
 impl CollectionAccessList {
@@ -97,69 +102,30 @@ impl CollectionAccessList {
         lookup_location: &Option<LookupLocation>,
     ) -> Result<(), StorageError> {
         if let Some(lookup_location) = lookup_location {
-            self.find_view(&lookup_location.collection)?
-                .check_whole_access()?;
+            self.find_view(&lookup_location.collection)?;
         }
         Ok(())
     }
 
     fn check_with_lookup(&self, with_lookup: &Option<WithLookup>) -> Result<(), StorageError> {
         if let Some(with_lookup) = with_lookup {
-            self.find_view(&with_lookup.collection_name)?
-                .check_whole_access()?;
+            self.find_view(&with_lookup.collection_name)?;
         }
         Ok(())
     }
 }
 
-impl CollectionAccessView<'_> {
-    fn apply_filter(&self, filter: &mut Option<Filter>) {
-        if let Some(payload) = &self.payload {
-            let f = filter.get_or_insert_with(Default::default);
-            *f = take(f).merge_owned(payload.to_filter());
+impl CheckableCollectionOperation for SearchRequestInternal {
+    fn access_requirements(&self) -> AccessRequirements {
+        AccessRequirements {
+            write: false,
+            manage: false,
+            extras: false,
         }
     }
 
-    fn check_recommend_example(&self, example: &RecommendExample) -> Result<(), StorageError> {
-        match example {
-            RecommendExample::PointId(_) => self.check_whole_access(),
-            RecommendExample::Dense(_) | RecommendExample::Sparse(_) => Ok(()),
-        }
-    }
-
-    fn check_vector_query(
-        &self,
-        vector_query: &VectorQuery<VectorInputInternal>,
-    ) -> Result<(), StorageError> {
-        match vector_query {
-            VectorQuery::Nearest(nearest) => self.check_vector_input(nearest)?,
-            VectorQuery::RecommendBestScore(reco)
-            | VectorQuery::RecommendSumScores(reco)
-            | VectorQuery::RecommendAverageVector(reco) => {
-                for vector_input in reco.flat_iter() {
-                    self.check_vector_input(vector_input)?
-                }
-            }
-            VectorQuery::Discover(discover) => {
-                for vector_input in discover.flat_iter() {
-                    self.check_vector_input(vector_input)?
-                }
-            }
-            VectorQuery::Context(context) => {
-                for vector_input in context.flat_iter() {
-                    self.check_vector_input(vector_input)?
-                }
-            }
-        };
-
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
-    }
-
-    fn check_vector_input(&self, vector_input: &VectorInputInternal) -> Result<(), StorageError> {
-        match vector_input {
-            VectorInputInternal::Vector(_) => Ok(()),
-            VectorInputInternal::Id(_) => self.check_whole_access(),
-        }
     }
 }
 
@@ -168,24 +134,12 @@ impl CheckableCollectionOperation for RecommendRequestInternal {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        for e in &self.positive {
-            view.check_recommend_example(e)?;
-        }
-        for e in &self.negative {
-            view.check_recommend_example(e)?;
-        }
+    fn check_access(&self, access: &CollectionAccessList) -> Result<(), StorageError> {
         access.check_lookup_from(&self.lookup_from)?;
-        view.apply_filter(&mut self.filter);
         Ok(())
     }
 }
@@ -195,16 +149,11 @@ impl CheckableCollectionOperation for PointRequestInternal {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: true,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        _view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
     }
 }
@@ -214,17 +163,11 @@ impl CheckableCollectionOperation for CoreSearchRequest {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
     }
 }
@@ -234,17 +177,11 @@ impl CheckableCollectionOperation for CountRequestInternal {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
     }
 }
@@ -254,22 +191,15 @@ impl CheckableCollectionOperation for GroupRequest {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        match &mut self.source {
-            SourceRequest::Search(s) => {
-                view.apply_filter(&mut s.filter);
-            }
-            SourceRequest::Recommend(r) => r.check_access(view, access)?,
-            SourceRequest::Query(q) => q.check_access(view, access)?,
+    fn check_access(&self, access: &CollectionAccessList) -> Result<(), StorageError> {
+        match &self.source {
+            SourceRequest::Search(s) => s.check_access(access)?,
+            SourceRequest::Recommend(r) => r.check_access(access)?,
+            SourceRequest::Query(q) => q.check_access(access)?,
         }
         access.check_with_lookup(&self.with_lookup)?;
         Ok(())
@@ -281,25 +211,11 @@ impl CheckableCollectionOperation for DiscoverRequestInternal {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        if let Some(target) = &self.target {
-            view.check_recommend_example(target)?;
-        }
-        for ContextExamplePair { positive, negative } in self.context.iter().flat_map(|c| c.iter())
-        {
-            view.check_recommend_example(positive)?;
-            view.check_recommend_example(negative)?;
-        }
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, access: &CollectionAccessList) -> Result<(), StorageError> {
         access.check_lookup_from(&self.lookup_from)?;
         Ok(())
     }
@@ -310,17 +226,11 @@ impl CheckableCollectionOperation for ScrollRequestInternal {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
     }
 }
@@ -330,26 +240,15 @@ impl CheckableCollectionOperation for CollectionQueryRequest {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        view.apply_filter(&mut self.filter);
-
-        if let Some(Query::Vector(vector_query)) = &self.query {
-            view.check_vector_query(vector_query)?
-        }
-
+    fn check_access(&self, access: &CollectionAccessList) -> Result<(), StorageError> {
         access.check_lookup_from(&self.lookup_from)?;
 
-        for prefetch_query in self.prefetch.iter_mut() {
-            check_access_for_prefetch(prefetch_query, &view, access)?;
+        for prefetch_query in self.prefetch.iter() {
+            check_access_for_prefetch(prefetch_query, access)?;
         }
 
         Ok(())
@@ -357,21 +256,14 @@ impl CheckableCollectionOperation for CollectionQueryRequest {
 }
 
 fn check_access_for_prefetch(
-    prefetch: &mut CollectionPrefetch,
-    view: &CollectionAccessView<'_>,
+    prefetch: &CollectionPrefetch,
     access: &CollectionAccessList,
 ) -> Result<(), StorageError> {
-    view.apply_filter(&mut prefetch.filter);
-
-    if let Some(Query::Vector(vector_query)) = &prefetch.query {
-        view.check_vector_query(vector_query)?
-    }
-
     access.check_lookup_from(&prefetch.lookup_from)?;
 
     // Recurse inner prefetches
-    for prefetch_query in prefetch.prefetch.iter_mut() {
-        check_access_for_prefetch(prefetch_query, view, access)?;
+    for prefetch_query in prefetch.prefetch.iter() {
+        check_access_for_prefetch(prefetch_query, access)?;
     }
 
     Ok(())
@@ -382,17 +274,11 @@ impl CheckableCollectionOperation for FacetParams {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> StorageResult<()> {
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, _access: &CollectionAccessList) -> StorageResult<()> {
         Ok(())
     }
 }
@@ -402,17 +288,11 @@ impl CheckableCollectionOperation for CollectionSearchMatrixRequest {
         AccessRequirements {
             write: false,
             manage: false,
-            whole: false,
             extras: false,
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> StorageResult<()> {
-        view.apply_filter(&mut self.filter);
+    fn check_access(&self, _access: &CollectionAccessList) -> StorageResult<()> {
         Ok(())
     }
 }
@@ -425,241 +305,59 @@ impl CheckableCollectionOperation for CollectionUpdateOperations {
             | CollectionUpdateOperations::PayloadOperation(_) => AccessRequirements {
                 write: true,
                 manage: false,
-                whole: false, // Checked in `check_access()`
                 extras: false,
             },
-            CollectionUpdateOperations::FieldIndexOperation(_) => AccessRequirements {
+            CollectionUpdateOperations::FieldIndexOperation(_)
+            | CollectionUpdateOperations::VectorNameOperation(_) => AccessRequirements {
                 write: true,
                 manage: true,
-                whole: true,
                 extras: true,
+            },
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperations::StagingOperation(_) => AccessRequirements {
+                write: true,
+                manage: false,
+                extras: false,
             },
         }
     }
 
-    fn check_access(
-        &mut self,
-        view: CollectionAccessView<'_>,
-        _access: &CollectionAccessList,
-    ) -> Result<(), StorageError> {
-        match self {
-            CollectionUpdateOperations::PointOperation(op) => match op {
-                PointOperations::UpsertPoints(_) => {
-                    view.check_whole_access()?;
-                }
-                PointOperations::DeletePoints { ids } => {
-                    if let Some(payload) = &view.payload {
-                        *op = PointOperations::DeletePointsByFilter(
-                            make_filter_from_ids(take(ids)).merge_owned(payload.to_filter()),
-                        );
-                    }
-                }
-                PointOperations::DeletePointsByFilter(filter) => {
-                    if let Some(payload) = &view.payload {
-                        *filter = take(filter).merge_owned(payload.to_filter());
-                    }
-                }
-                PointOperations::SyncPoints(_) => {
-                    view.check_whole_access()?;
-                }
-            },
-
-            CollectionUpdateOperations::VectorOperation(op) => match op {
-                VectorOperations::UpdateVectors(_) => {
-                    view.check_whole_access()?;
-                }
-                VectorOperations::DeleteVectors(PointIdsList { points, shard_key }, vectors) => {
-                    if let Some(payload) = &view.payload {
-                        if shard_key.is_some() {
-                            // It is unclear where to put the shard_key
-                            return incompatible_with_payload_constraint(view.collection);
-                        }
-                        *op = VectorOperations::DeleteVectorsByFilter(
-                            make_filter_from_ids(take(points)).merge_owned(payload.to_filter()),
-                            take(vectors),
-                        );
-                    }
-                }
-                VectorOperations::DeleteVectorsByFilter(filter, _) => {
-                    if let Some(payload) = &view.payload {
-                        *filter = take(filter).merge_owned(payload.to_filter());
-                    }
-                }
-            },
-
-            CollectionUpdateOperations::PayloadOperation(op) => 'a: {
-                let Some(payload) = &view.payload else {
-                    // Allow all operations when there is no payload constraint
-                    break 'a;
-                };
-
-                match op {
-                    PayloadOps::SetPayload(SetPayloadOp {
-                        payload: _, // TODO: validate
-                        points,
-                        filter,
-                        key: _, // TODO: validate
-                    }) => {
-                        let filter = filter.get_or_insert_with(Default::default);
-                        if let Some(points) = take(points) {
-                            *filter = take(filter).merge_owned(make_filter_from_ids(points));
-                        }
-
-                        // Reject as not implemented
-                        return incompatible_with_payload_constraint(view.collection);
-                    }
-                    PayloadOps::DeletePayload(DeletePayloadOp {
-                        keys: _, // TODO: validate
-                        points,
-                        filter,
-                    }) => {
-                        let filter = filter.get_or_insert_with(Default::default);
-                        if let Some(points) = take(points) {
-                            *filter = take(filter).merge_owned(make_filter_from_ids(points));
-                        }
-
-                        // Reject as not implemented
-                        return incompatible_with_payload_constraint(view.collection);
-                    }
-                    PayloadOps::ClearPayload { points } => {
-                        *op = PayloadOps::OverwritePayload(SetPayloadOp {
-                            payload: payload.make_payload(view.collection)?,
-                            points: None,
-                            filter: Some(
-                                make_filter_from_ids(take(points)).merge_owned(payload.to_filter()),
-                            ),
-                            key: None,
-                        });
-                    }
-                    PayloadOps::ClearPayloadByFilter(filter) => {
-                        *op = PayloadOps::OverwritePayload(SetPayloadOp {
-                            payload: payload.make_payload(view.collection)?,
-                            points: None,
-                            filter: Some(take(filter).merge_owned(payload.to_filter())),
-                            key: None,
-                        });
-                    }
-                    PayloadOps::OverwritePayload(SetPayloadOp {
-                        payload: _, // TODO: validate
-                        points,
-                        filter,
-                        key: _, // TODO: validate
-                    }) => {
-                        let filter = filter.get_or_insert_with(Default::default);
-                        if let Some(points) = take(points) {
-                            *filter = take(filter).merge_owned(make_filter_from_ids(points));
-                        }
-
-                        // Reject as not implemented
-                        return incompatible_with_payload_constraint(view.collection);
-                    }
-                }
-            }
-
-            CollectionUpdateOperations::FieldIndexOperation(_) => (),
-        }
+    fn check_access(&self, _access: &CollectionAccessList) -> Result<(), StorageError> {
         Ok(())
     }
 }
 
-/// Create a `must` filter from a list of point IDs.
-fn make_filter_from_ids(ids: Vec<ExtendedPointId>) -> Filter {
-    let cond = ids.into_iter().collect::<AHashSet<_>>().into();
-    Filter {
-        must: Some(vec![Condition::HasId(cond)]),
-        ..Default::default()
-    }
-}
+// ---------------------------------------------------------------------------
+// Auth wrappers – placed here so they can reference the private
+// `CheckableCollectionOperation` trait.
+// ---------------------------------------------------------------------------
 
-impl PayloadConstraint {
-    /// Create a `must` filter.
-    fn to_filter(&self) -> Filter {
-        Filter {
-            must: Some(
-                self.0
-                    .iter()
-                    .map(|(path, value)| {
-                        Condition::Field(FieldCondition::new_match(
-                            path.clone(),
-                            Match::new_value(value.clone()),
-                        ))
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
-        }
+use super::auth::Auth;
+
+impl Auth {
+    /// Check point-level access and emit an audit log entry.
+    #[allow(private_bounds)]
+    pub(crate) fn check_point_op<'a>(
+        &self,
+        collection_name: &'a str,
+        op: &impl CheckableCollectionOperation,
+        method: &str,
+    ) -> Result<CollectionPass<'a>, StorageError> {
+        let result = self.unlogged_access().check_point_op(collection_name, op);
+        self.emit_audit(method, Some(collection_name), &result);
+        result
     }
 
-    fn make_payload(&self, collection_name: &str) -> Result<Payload, StorageError> {
-        let _ = self; // TODO: We need to construct a payload, then validate it against the claim
-        incompatible_with_payload_constraint(collection_name) // Reject as not implemented
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use segment::json_path::JsonPath;
-    use segment::types::{MinShould, ValueVariants};
-
-    use super::*;
-    use crate::rbac::{CollectionAccess, CollectionAccessMode};
-
-    #[test]
-    fn test_apply_filter() {
-        let list = CollectionAccessList(vec![CollectionAccess {
-            collection: "col".to_string(),
-            access: CollectionAccessMode::Read,
-            payload: Some(PayloadConstraint(HashMap::from([(
-                "field".parse().unwrap(),
-                ValueVariants::Integer(42),
-            )]))),
-        }]);
-
-        let mut filter = None;
-        list.find_view("col").unwrap().apply_filter(&mut filter);
-        assert_eq!(
-            filter,
-            Some(Filter {
-                must: Some(vec![Condition::Field(FieldCondition::new_match(
-                    "field".parse().unwrap(),
-                    Match::new_value(ValueVariants::Integer(42))
-                ))]),
-                ..Default::default()
-            })
-        );
-
-        let cond = |path: &str| Condition::IsNull(path.parse::<JsonPath>().unwrap().into());
-
-        let mut filter = Some(Filter {
-            should: Some(vec![cond("a")]),
-            min_should: Some(MinShould {
-                conditions: vec![cond("b")],
-                min_count: 1,
-            }),
-            must: Some(vec![cond("c")]),
-            must_not: Some(vec![cond("d")]),
-        });
-        list.find_view("col").unwrap().apply_filter(&mut filter);
-        assert_eq!(
-            filter,
-            Some(Filter {
-                should: Some(vec![cond("a")]),
-                min_should: Some(MinShould {
-                    conditions: vec![cond("b")],
-                    min_count: 1,
-                }),
-                must: Some(vec![
-                    cond("c"),
-                    Condition::Field(FieldCondition::new_match(
-                        "field".parse().unwrap(),
-                        Match::new_value(ValueVariants::Integer(42))
-                    ))
-                ]),
-                must_not: Some(vec![cond("d")]),
-            })
-        );
+    /// Check collection meta-operation access and emit an audit log entry.
+    pub(crate) fn check_collection_meta_operation(
+        &self,
+        operation: &CollectionMetaOperations,
+    ) -> Result<(), StorageError> {
+        let result = self
+            .unlogged_access()
+            .check_collection_meta_operation(operation);
+        self.emit_audit(operation.operation_name(), None, &result);
+        result
     }
 }
 
@@ -667,17 +365,16 @@ mod tests {
 mod tests_ops {
     use std::fmt::Debug;
 
-    use api::rest::{
-        self, LookupLocation, OrderByInterface, RecommendStrategy, SearchRequestInternal,
-    };
+    use api::rest::{self, LookupLocation, RecommendStrategy, SearchRequestInternal};
     use collection::operations::payload_ops::PayloadOpsDiscriminants;
     use collection::operations::point_ops::{
-        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal,
-        PointInsertOperationsInternalDiscriminants, PointOperationsDiscriminants,
-        PointStructPersisted, PointSyncOperation, VectorStructPersisted,
+        BatchPersisted, BatchVectorStructPersisted, ConditionalInsertOperationInternal,
+        PointInsertOperationsInternal, PointInsertOperationsInternalDiscriminants,
+        PointOperationsDiscriminants, PointStructPersisted, PointSyncOperation,
+        VectorStructPersisted,
     };
     use collection::operations::query_enum::QueryEnum;
-    use collection::operations::types::UsingVector;
+    use collection::operations::types::{ContextExamplePair, RecommendExample, UsingVector};
     use collection::operations::vector_ops::{
         PointVectorsPersisted, UpdateVectorsOp, VectorOperationsDiscriminants,
     };
@@ -685,39 +382,36 @@ mod tests_ops {
         CollectionUpdateOperationsDiscriminants, CreateIndex, FieldIndexOperations,
         FieldIndexOperationsDiscriminants,
     };
+    use segment::data_types::order_by::OrderByInterface;
     use segment::data_types::vectors::NamedQuery;
-    use segment::types::{PointIdType, SearchParams, WithPayloadInterface, WithVector};
+    use segment::types::{
+        Condition, ExtendedPointId, Filter, Payload, PointIdType, SearchParams,
+        WithPayloadInterface, WithVector,
+    };
+    use shard::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
+    use shard::operations::point_ops::{PointIdsList, PointOperations};
+    use shard::operations::vector_ops::VectorOperations;
     use strum::IntoEnumIterator as _;
 
     use super::*;
     use crate::rbac::{AccessCollectionBuilder, GlobalAccessMode};
+
+    /// Create a `must` filter from a list of point IDs.
+    #[cfg(test)]
+    fn make_filter_from_ids(ids: Vec<ExtendedPointId>) -> Filter {
+        let cond = ids.into_iter().collect::<ahash::AHashSet<_>>().into();
+        Filter {
+            must: Some(vec![Condition::HasId(cond)]),
+            ..Default::default()
+        }
+    }
 
     /// Operation is allowed with the given access, and no rewrite is expected.
     fn assert_allowed<Op: Debug + Clone + PartialEq + CheckableCollectionOperation>(
         op: &Op,
         access: &Access,
     ) {
-        let mut op_actual = op.clone();
-        access
-            .check_point_op("col", &mut op_actual)
-            .expect("Should be allowed");
-        assert_eq!(op, &op_actual, "Expected not to change");
-    }
-
-    /// Operation is allowed with the given access, and the rewrite is expected.
-    /// A closure `rewrite` is expected to produce the same result as the rewritten operation.
-    fn assert_allowed_rewrite<Op: Debug + Clone + PartialEq + CheckableCollectionOperation>(
-        op: &Op,
-        access: &Access,
-        rewrite: impl FnOnce(&mut Op),
-    ) {
-        let mut op_actual = op.clone();
-        access
-            .check_point_op("col", &mut op_actual)
-            .expect("Should be allowed");
-        let mut op_reference = op.clone();
-        rewrite(&mut op_reference);
-        assert_eq!(op_reference, op_actual, "Expected to change");
+        access.check_point_op("col", op).expect("Should be allowed");
     }
 
     /// Operation is forbidden with the given access.
@@ -726,8 +420,8 @@ mod tests_ops {
         access: &Access,
     ) {
         access
-            .check_point_op("col", &mut op.clone())
-            .expect_err("Should be allowed");
+            .check_point_op("col", op)
+            .expect_err("should be forbidden");
     }
 
     /// Operation requires write + whole collection access.
@@ -738,22 +432,8 @@ mod tests_ops {
         assert_allowed(op, &Access::Global(GlobalAccessMode::Manage));
         assert_forbidden(op, &Access::Global(GlobalAccessMode::Read));
 
-        assert_allowed(
-            op,
-            &AccessCollectionBuilder::new().add("col", true, true).into(),
-        );
-        assert_forbidden(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-        assert_forbidden(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", true, false)
-                .into(),
-        );
+        assert_allowed(op, &AccessCollectionBuilder::new().add("col", true).into());
+        assert_forbidden(op, &AccessCollectionBuilder::new().add("col", false).into());
     }
 
     #[test]
@@ -780,53 +460,26 @@ mod tests_ops {
         assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
         assert_allowed(&op, &Access::Global(GlobalAccessMode::Read));
 
-        // Require whole access to col2
-        assert_forbidden(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, false)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
-            |op| {
-                op.filter = Some(PayloadConstraint::new_test("col").to_filter());
-            },
-        );
-
         // Point ID is used
         assert_forbidden(
             &RecommendRequestInternal {
                 positive: vec![RecommendExample::PointId(ExtendedPointId::NumId(12345))],
                 ..op.clone()
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col2", false).into(),
         );
 
         // lookup_from requires read access
         assert_forbidden(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
         assert_allowed(
             &RecommendRequestInternal {
                 lookup_from: None,
                 ..op
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -841,18 +494,11 @@ mod tests_ops {
         assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
         assert_allowed(&op, &Access::Global(GlobalAccessMode::Read));
 
-        assert_forbidden(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .into(),
-        );
+        assert_forbidden(&op, &AccessCollectionBuilder::new().into());
 
         assert_allowed(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -874,19 +520,7 @@ mod tests_ops {
 
         assert_allowed(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .into(),
-            |op| {
-                op.filter = Some(PayloadConstraint::new_test("col").to_filter());
-            },
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -902,19 +536,7 @@ mod tests_ops {
 
         assert_allowed(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .into(),
-            |op| {
-                op.filter = Some(PayloadConstraint::new_test("col").to_filter());
-            },
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -948,49 +570,22 @@ mod tests_ops {
         assert_allowed(
             &op,
             &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .add("col2", false, true)
+                .add("col", false)
+                .add("col2", false)
                 .into(),
         );
 
         // with_lookup requires whole read access
         assert_forbidden(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-        assert_forbidden(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .add("col", false, false)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
         assert_allowed(
             &GroupRequest {
                 with_lookup: None,
                 ..op.clone()
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        // filter rewrite
-        assert_allowed_rewrite(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
-            |op| match &mut op.source {
-                SourceRequest::Search(s) => {
-                    s.filter = Some(PayloadConstraint::new_test("col").to_filter());
-                }
-                SourceRequest::Recommend(_) => unreachable!(),
-                SourceRequest::Query(_) => unreachable!(),
-            },
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -1022,20 +617,9 @@ mod tests_ops {
         assert_allowed(
             &op,
             &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .add("col2", false, true)
+                .add("col", false)
+                .add("col2", false)
                 .into(),
-        );
-
-        assert_allowed_rewrite(
-            &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
-            |op| {
-                op.filter = Some(PayloadConstraint::new_test("col").to_filter());
-            },
         );
 
         // Point ID is used
@@ -1044,10 +628,7 @@ mod tests_ops {
                 target: Some(RecommendExample::PointId(ExtendedPointId::NumId(12345))),
                 ..op.clone()
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col2", false).into(),
         );
         assert_forbidden(
             &DiscoverRequestInternal {
@@ -1057,10 +638,7 @@ mod tests_ops {
                 }]),
                 ..op.clone()
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col2", false).into(),
         );
         assert_forbidden(
             &DiscoverRequestInternal {
@@ -1070,27 +648,20 @@ mod tests_ops {
                 }]),
                 ..op.clone()
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .add("col2", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col2", false).into(),
         );
 
         // lookup_from requires read access
         assert_forbidden(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
         assert_allowed(
             &DiscoverRequestInternal {
                 lookup_from: None,
                 ..op
             },
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -1110,19 +681,7 @@ mod tests_ops {
 
         assert_allowed(
             &op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            &ScrollRequestInternal { ..op },
-            &AccessCollectionBuilder::new()
-                .add("col", false, false)
-                .into(),
-            |op| {
-                op.filter = Some(PayloadConstraint::new_test("col").to_filter());
-            },
+            &AccessCollectionBuilder::new().add("col", false).into(),
         );
     }
 
@@ -1140,6 +699,17 @@ mod tests_ops {
             }
             CollectionUpdateOperationsDiscriminants::FieldIndexOperation => {
                 check_collection_update_operations_field_index()
+            }
+            CollectionUpdateOperationsDiscriminants::VectorNameOperation => {
+                check_collection_update_operations_vector_name()
+            }
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperationsDiscriminants::StagingOperation => {
+                use shard::operations::staging::{StagingOperations, TestDelayOperation};
+                let op = CollectionUpdateOperations::StagingOperation(StagingOperations::Delay(
+                    TestDelayOperation::new(1.0),
+                ));
+                assert_requires_whole_write_access(&op);
             }
         });
     }
@@ -1173,6 +743,25 @@ mod tests_ops {
                     );
                     assert_requires_whole_write_access(&op);
                 }
+            }
+            PointOperationsDiscriminants::UpsertPointsConditional => {
+                let inner = PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
+                    id: ExtendedPointId::NumId(12345),
+                    vector: VectorStructPersisted::Single(vec![0.0, 1.0, 2.0]),
+                    payload: None,
+                }]);
+
+                let filter = make_filter_from_ids(vec![ExtendedPointId::NumId(12345)]);
+
+                let op = CollectionUpdateOperations::PointOperation(
+                    PointOperations::UpsertPointsConditional(ConditionalInsertOperationInternal {
+                        points_op: inner,
+                        condition: filter,
+                        update_mode: None,
+                    }),
+                );
+
+                assert_requires_whole_write_access(&op);
             }
 
             PointOperationsDiscriminants::DeletePoints => {
@@ -1211,31 +800,8 @@ mod tests_ops {
         assert_allowed(op, &Access::Global(GlobalAccessMode::Manage));
         assert_forbidden(op, &Access::Global(GlobalAccessMode::Read));
 
-        assert_allowed(
-            op,
-            &AccessCollectionBuilder::new().add("col", true, true).into(),
-        );
-        assert_forbidden(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", true, false)
-                .into(),
-            |op| {
-                *op = CollectionUpdateOperations::PointOperation(
-                    PointOperations::DeletePointsByFilter(
-                        make_filter_from_ids(vec![ExtendedPointId::NumId(12345)])
-                            .merge_owned(PayloadConstraint::new_test("col").to_filter()),
-                    ),
-                );
-            },
-        );
+        assert_allowed(op, &AccessCollectionBuilder::new().add("col", true).into());
+        assert_forbidden(op, &AccessCollectionBuilder::new().add("col", false).into());
     }
 
     /// Tests for [`CollectionUpdateOperations::VectorOperation`].
@@ -1248,6 +814,7 @@ mod tests_ops {
                             id: ExtendedPointId::NumId(12345),
                             vector: VectorStructPersisted::Single(vec![0.0, 1.0, 2.0]),
                         }],
+                        update_filter: None,
                     }),
                 );
                 assert_requires_whole_write_access(&op);
@@ -1281,32 +848,8 @@ mod tests_ops {
         assert_allowed(op, &Access::Global(GlobalAccessMode::Manage));
         assert_forbidden(op, &Access::Global(GlobalAccessMode::Read));
 
-        assert_allowed(
-            op,
-            &AccessCollectionBuilder::new().add("col", true, true).into(),
-        );
-        assert_forbidden(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", false, true)
-                .into(),
-        );
-
-        assert_allowed_rewrite(
-            op,
-            &AccessCollectionBuilder::new()
-                .add("col", true, false)
-                .into(),
-            |op| {
-                *op = CollectionUpdateOperations::VectorOperation(
-                    VectorOperations::DeleteVectorsByFilter(
-                        make_filter_from_ids(vec![ExtendedPointId::NumId(12345)])
-                            .merge_owned(PayloadConstraint::new_test("col").to_filter()),
-                        vec!["vector".into()],
-                    ),
-                );
-            },
-        );
+        assert_allowed(op, &AccessCollectionBuilder::new().add("col", true).into());
+        assert_forbidden(op, &AccessCollectionBuilder::new().add("col", false).into());
     }
 
     /// Tests for [`CollectionUpdateOperations::PayloadOperation`].
@@ -1367,15 +910,49 @@ mod tests_ops {
             let op = CollectionUpdateOperations::FieldIndexOperation(inner);
             assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
             assert_forbidden(&op, &Access::Global(GlobalAccessMode::Read));
+            assert_forbidden(&op, &AccessCollectionBuilder::new().add("col", true).into());
             assert_forbidden(
                 &op,
-                &AccessCollectionBuilder::new().add("col", true, true).into(),
+                &AccessCollectionBuilder::new().add("col", false).into(),
             );
+        }
+    }
+
+    /// Tests for [`CollectionUpdateOperations::VectorNameOperation`].
+    fn check_collection_update_operations_vector_name() {
+        use segment::types::Distance;
+        use shard::operations::vector_name_ops::{
+            DenseVectorConfig, VectorNameConfig, VectorNameOperationsDiscriminants,
+        };
+        use shard::operations::{CreateVectorName, DeleteVectorName, VectorNameOperations};
+
+        for discr in VectorNameOperationsDiscriminants::iter() {
+            let inner = match discr {
+                VectorNameOperationsDiscriminants::CreateVectorName => {
+                    VectorNameOperations::CreateVectorName(CreateVectorName {
+                        vector_name: "test".into(),
+                        config: VectorNameConfig::dense(DenseVectorConfig {
+                            size: 4,
+                            distance: Distance::Cosine,
+                            multivector_config: None,
+                            datatype: None,
+                        }),
+                    })
+                }
+                VectorNameOperationsDiscriminants::DeleteVectorName => {
+                    VectorNameOperations::DeleteVectorName(DeleteVectorName {
+                        vector_name: "test".into(),
+                    })
+                }
+            };
+
+            let op = CollectionUpdateOperations::VectorNameOperation(inner);
+            assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
+            assert_forbidden(&op, &Access::Global(GlobalAccessMode::Read));
+            assert_forbidden(&op, &AccessCollectionBuilder::new().add("col", true).into());
             assert_forbidden(
                 &op,
-                &AccessCollectionBuilder::new()
-                    .add("col", false, true)
-                    .into(),
+                &AccessCollectionBuilder::new().add("col", false).into(),
             );
         }
     }

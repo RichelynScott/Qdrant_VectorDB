@@ -1,12 +1,15 @@
+use std::hash::Hash;
+
 use common::math::scaled_fast_sigmoid;
 use common::types::ScoreType;
 use itertools::Itertools;
+use serde::Serialize;
 
 use super::{Query, TransformInto};
 use crate::common::operation_error::OperationResult;
 use crate::data_types::vectors::{QueryVector, VectorInternal};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Hash)]
 pub struct RecoQuery<T> {
     pub positives: Vec<T>,
     pub negatives: Vec<T>,

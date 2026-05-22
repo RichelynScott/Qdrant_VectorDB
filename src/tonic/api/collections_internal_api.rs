@@ -4,22 +4,26 @@ use std::time::{Duration, Instant};
 use api::grpc::qdrant::collections_internal_server::CollectionsInternal;
 use api::grpc::qdrant::{
     CollectionOperationResponse, GetCollectionInfoRequestInternal, GetCollectionInfoResponse,
-    GetShardRecoveryPointRequest, GetShardRecoveryPointResponse, InitiateShardTransferRequest,
-    UpdateShardCutoffPointRequest, WaitForShardStateRequest,
+    GetShardMemoryReportRequest, GetShardMemoryReportResponse, GetShardOptimizationsRequest,
+    GetShardOptimizationsResponse, GetShardRecoveryPointRequest, GetShardRecoveryPointResponse,
+    InitiateShardTransferRequest, UpdateShardCutoffPointRequest, WaitForShardStateRequest,
 };
+use shard::operations::optimization::OptimizationsRequestOptions;
 use storage::content_manager::toc::TableOfContent;
-use storage::rbac::{Access, AccessRequirements, CollectionPass};
+use storage::rbac::{AccessRequirements, Auth, CollectionPass};
 use tonic::{Request, Response, Status};
 
 use super::validate_and_log;
 use crate::tonic::api::collections_common::get;
+use crate::tonic::auth::extract_auth;
 
-const FULL_ACCESS: Access = Access::full("Internal API");
-
-fn full_access_pass(collection_name: &str) -> Result<CollectionPass<'_>, Status> {
-    FULL_ACCESS
-        .check_collection_access(collection_name, AccessRequirements::new())
-        .map_err(Status::from)
+fn access_pass<'a>(auth: &'a Auth, collection_name: &'a str) -> Result<CollectionPass<'a>, Status> {
+    auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write().manage().extras(),
+        "internal_collection_access",
+    )
+    .map_err(Status::from)
 }
 
 pub struct CollectionsInternalService {
@@ -36,9 +40,10 @@ impl CollectionsInternalService {
 impl CollectionsInternal for CollectionsInternalService {
     async fn get(
         &self,
-        request: Request<GetCollectionInfoRequestInternal>,
+        mut request: Request<GetCollectionInfoRequestInternal>,
     ) -> Result<Response<GetCollectionInfoResponse>, Status> {
         validate_and_log(request.get_ref());
+        let auth = extract_auth(&mut request);
         let GetCollectionInfoRequestInternal {
             get_collection_info_request,
             shard_id,
@@ -50,7 +55,7 @@ impl CollectionsInternal for CollectionsInternalService {
         get(
             self.toc.as_ref(),
             get_collection_info_request,
-            FULL_ACCESS.clone(),
+            &auth,
             Some(shard_id),
         )
         .await
@@ -83,8 +88,9 @@ impl CollectionsInternal for CollectionsInternalService {
 
     async fn wait_for_shard_state(
         &self,
-        request: Request<WaitForShardStateRequest>,
+        mut request: Request<WaitForShardStateRequest>,
     ) -> Result<Response<CollectionOperationResponse>, Status> {
+        let auth = extract_auth(&mut request);
         let request = request.into_inner();
         validate_and_log(&request);
 
@@ -100,7 +106,7 @@ impl CollectionsInternal for CollectionsInternalService {
 
         let collection_read = self
             .toc
-            .get_collection(&full_access_pass(&collection_name)?)
+            .get_collection(&access_pass(&auth, &collection_name)?)
             .await
             .map_err(|err| {
                 Status::not_found(format!(
@@ -127,9 +133,10 @@ impl CollectionsInternal for CollectionsInternalService {
 
     async fn get_shard_recovery_point(
         &self,
-        request: Request<GetShardRecoveryPointRequest>,
+        mut request: Request<GetShardRecoveryPointRequest>,
     ) -> Result<Response<GetShardRecoveryPointResponse>, Status> {
         validate_and_log(request.get_ref());
+        let auth = extract_auth(&mut request);
 
         let timing = Instant::now();
         let GetShardRecoveryPointRequest {
@@ -139,7 +146,7 @@ impl CollectionsInternal for CollectionsInternalService {
 
         let collection_read = self
             .toc
-            .get_collection(&full_access_pass(&collection_name)?)
+            .get_collection(&access_pass(&auth, &collection_name)?)
             .await
             .map_err(|err| {
                 Status::not_found(format!(
@@ -166,9 +173,10 @@ impl CollectionsInternal for CollectionsInternalService {
 
     async fn update_shard_cutoff_point(
         &self,
-        request: Request<UpdateShardCutoffPointRequest>,
+        mut request: Request<UpdateShardCutoffPointRequest>,
     ) -> Result<Response<CollectionOperationResponse>, Status> {
         validate_and_log(request.get_ref());
+        let auth = extract_auth(&mut request);
 
         let timing = Instant::now();
         let UpdateShardCutoffPointRequest {
@@ -181,7 +189,7 @@ impl CollectionsInternal for CollectionsInternalService {
 
         let collection_read = self
             .toc
-            .get_collection(&full_access_pass(&collection_name)?)
+            .get_collection(&access_pass(&auth, &collection_name)?)
             .await
             .map_err(|err| {
                 Status::not_found(format!(
@@ -201,6 +209,100 @@ impl CollectionsInternal for CollectionsInternalService {
 
         let response = CollectionOperationResponse {
             result: true,
+            time: timing.elapsed().as_secs_f64(),
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn get_shard_optimizations(
+        &self,
+        mut request: Request<GetShardOptimizationsRequest>,
+    ) -> Result<Response<GetShardOptimizationsResponse>, Status> {
+        validate_and_log(request.get_ref());
+        let auth = extract_auth(&mut request);
+
+        let timing = Instant::now();
+        let GetShardOptimizationsRequest {
+            collection_name,
+            shard_id,
+            with_queued,
+            completed_limit,
+            with_idle_segments,
+        } = request.into_inner();
+
+        let options = OptimizationsRequestOptions {
+            queued: with_queued,
+            completed_limit: completed_limit.map(|l| l as usize),
+            idle_segments: with_idle_segments,
+        };
+
+        let collection_read = self
+            .toc
+            .get_collection(&access_pass(&auth, &collection_name)?)
+            .await
+            .map_err(|err| {
+                Status::not_found(format!(
+                    "Collection {collection_name} could not be found: {err}"
+                ))
+            })?;
+
+        let optimizations_response = collection_read
+            .local_shard_optimizations(shard_id, options)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "Failed to get optimizations for shard {shard_id}: {err}"
+                ))
+            })?;
+
+        let optimizations_json = serde_json::to_vec(&optimizations_response).map_err(|err| {
+            Status::internal(format!("Failed to serialize optimizations response: {err}"))
+        })?;
+
+        let response = GetShardOptimizationsResponse {
+            optimizations_json,
+            time: timing.elapsed().as_secs_f64(),
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn get_shard_memory_report(
+        &self,
+        mut request: Request<GetShardMemoryReportRequest>,
+    ) -> Result<Response<GetShardMemoryReportResponse>, Status> {
+        validate_and_log(request.get_ref());
+        let auth = extract_auth(&mut request);
+
+        let timing = Instant::now();
+        let GetShardMemoryReportRequest {
+            collection_name,
+            shard_id,
+        } = request.into_inner();
+
+        let collection_read = self
+            .toc
+            .get_collection(&access_pass(&auth, &collection_name)?)
+            .await
+            .map_err(|err| {
+                Status::not_found(format!(
+                    "Collection {collection_name} could not be found: {err}"
+                ))
+            })?;
+
+        let memory_report = collection_read
+            .local_shard_memory_report(shard_id)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "Failed to get memory report for shard {shard_id}: {err}"
+                ))
+            })?;
+
+        let memory_report_json = serde_json::to_vec(&memory_report)
+            .map_err(|err| Status::internal(format!("Failed to serialize memory report: {err}")))?;
+
+        let response = GetShardMemoryReportResponse {
+            memory_report_json,
             time: timing.elapsed().as_secs_f64(),
         };
         Ok(Response::new(response))

@@ -1,22 +1,26 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::sync::LazyLock;
 
 use collection::collection_state;
 use collection::config::ShardingMethod;
 use collection::events::{CollectionDeletedEvent, IndexCreatedEvent};
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::transfer::ShardTransfer;
 use collection::shards::{CollectionId, transfer};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use tempfile::Builder;
+use common::fs::safe_delete_in_tmp;
 
-use super::TableOfContent;
+use super::{COLLECTION_DELETE_SPIN_INTERVAL, COLLECTION_DELETE_WAIT_TIMEOUT, TableOfContent};
+use crate::common::utils::try_unwrap_with_timeout_async;
 use crate::content_manager::collection_meta_ops::*;
 use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus_ops::ConsensusOperations;
 use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
+
+static CREATE_CUSTOM_SHARDS_IN_INITIALIZING_STATE: LazyLock<semver::Version> =
+    LazyLock::new(|| semver::Version::parse("1.14.2-dev").unwrap());
 
 impl TableOfContent {
     pub(super) fn perform_collection_meta_op_sync(
@@ -27,6 +31,9 @@ impl TableOfContent {
             .block_on(self.perform_collection_meta_op(operation))
     }
 
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
     pub async fn perform_collection_meta_op(
         &self,
         operation: CollectionMetaOperations,
@@ -41,13 +48,16 @@ impl TableOfContent {
                         .unwrap_or_default()
                     {
                         ShardingMethod::Auto => {
-                            let shard_number =
-                                operation.create_collection.shard_number.or_else(|| {
-                                    self.storage_config
-                                        .collection
-                                        .as_ref()
-                                        .map(|i| i.shard_number_per_node)
-                                });
+                            let collection_defaults = self.storage_config.collection.as_ref();
+
+                            let number_of_peers = 1; // this is a single node deployment
+                            let suggested_shard_number = collection_defaults
+                                .map(|config| config.get_shard_number(number_of_peers));
+
+                            let shard_number = operation
+                                .create_collection
+                                .shard_number
+                                .or(suggested_shard_number);
                             CollectionShardDistribution::all_local(shard_number, self.this_peer_id)
                         }
                         ShardingMethod::Custom => ShardDistributionProposal::empty().into(),
@@ -112,6 +122,23 @@ impl TableOfContent {
                     .await
                     .map(|()| true)
             }
+            CollectionMetaOperations::CreateNamedVector(create_named_vector) => {
+                log::debug!("Create named vector {create_named_vector:?}");
+                self.create_named_vector(create_named_vector)
+                    .await
+                    .map(|()| true)
+            }
+            CollectionMetaOperations::DeleteNamedVector(delete_named_vector) => {
+                log::debug!("Delete named vector {delete_named_vector:?}");
+                self.delete_named_vector(delete_named_vector)
+                    .await
+                    .map(|()| true)
+            }
+            #[cfg(feature = "staging")]
+            CollectionMetaOperations::TestSlowDown(test_slow_down) => {
+                test_slow_down.execute(self.this_peer_id).await;
+                Ok(true)
+            }
         }
     }
 
@@ -128,6 +155,7 @@ impl TableOfContent {
             quantization_config,
             sparse_vectors,
             strict_mode_config: strict_mode,
+            metadata,
         } = operation.update_collection;
         let collection = self
             .get_collection_unchecked(&operation.collection_name)
@@ -167,9 +195,19 @@ impl TableOfContent {
             collection.update_strict_mode_config(strict_mode).await?;
         }
 
+        if let Some(metadata) = metadata {
+            collection.update_metadata(metadata).await?;
+        }
+
+        collection.print_warnings().await;
+
         // Recreate optimizers
+        //
+        // This runs in the background and does not block: this path is reached from consensus, and
+        // stopping the existing optimizers can take a long time (in-flight optimizations are
+        // awaited), which would otherwise stall the consensus loop and can take down a cluster.
         if recreate_optimizers {
-            collection.recreate_optimizers_blocking().await?;
+            collection.recreate_optimizers_background();
         }
         Ok(true)
     }
@@ -179,74 +217,86 @@ impl TableOfContent {
         collection_name: &str,
     ) -> Result<bool, StorageError> {
         let _collection_create_guard = self.collection_create_lock.lock().await;
-        if let Some(removed) = self.collections.write().await.remove(collection_name) {
-            self.alias_persistence
-                .write()
-                .await
-                .remove_collection(collection_name)?;
 
-            let path = self.get_collection_path(collection_name);
+        self.alias_persistence
+            .write()
+            .await
+            .remove_collection(collection_name)?;
 
-            if let Some(state) = removed.resharding_state().await {
-                if let Err(err) = removed.abort_resharding(state.key(), true).await {
-                    log::error!(
-                        "Failed to abort resharding {} when deleting collection {collection_name}: \
+        let to_delete;
+        let result;
+        let collection_path = self.get_collection_path(collection_name);
+        let safe_delete_path = self.storage_config.storage_path.join(".deleted");
+
+        let removed_opt = self.collections.write().await.remove(collection_name);
+        if let Some(removed) = removed_opt {
+            if let Some(state) = removed.resharding_state().await
+                && let Err(err) = removed.abort_resharding(state.key(), true).await
+            {
+                log::error!(
+                    "Failed to abort resharding {} when deleting collection {collection_name}: \
                          {err}",
-                        state.key(),
-                    );
-                }
+                    state.key(),
+                );
             }
 
-            drop(removed);
+            removed.stop_gracefully().await;
 
-            // Move collection to ".deleted" folder to prevent accidental reuse
-            // the original collection path will be moved atomically within this
-            // directory.
-            let removed_collections_path =
-                Path::new(&self.storage_config.storage_path).join(".deleted");
-            tokio::fs::create_dir_all(&removed_collections_path).await?;
+            // If we try to wait for the collection to be freed, and fail if it is still busy after timeout
+            // it can risk stopping the consensus progress.
+            //
+            // Instead, we proceed with removal regardless, as it should be safe to remove files
+            // at least on Linux.
+            let removed_collection_res = try_unwrap_with_timeout_async(
+                removed,
+                COLLECTION_DELETE_SPIN_INTERVAL,
+                COLLECTION_DELETE_WAIT_TIMEOUT,
+            )
+            .await;
 
-            let deleted_path = Builder::new()
-                // Limit the file name to be on a lower side to avoid running into too-long
-                // file names.
-                // Even if the chosen randomness factor poses chances of collision, the library
-                // prevents creation of duplicate files within the chosen directory.
-                .rand_bytes(8)
-                .prefix("")
-                .tempdir_in(removed_collections_path)?;
+            match removed_collection_res {
+                Ok(collection) => drop(collection),
+                Err(busy_collection) => {
+                    debug_assert!(false, "Collection `{collection_name}` is busy");
+                    log::error!(
+                        "Collection `{collection_name}` is busy and cannot be removed in time."
+                    );
+                    drop(busy_collection);
+                }
+            };
 
-            tokio::fs::rename(path, &deleted_path).await?;
+            to_delete = Some(safe_delete_in_tmp(&collection_path, &safe_delete_path)?);
 
             // Solve all issues related to this collection
             issues::publish(CollectionDeletedEvent {
                 collection_id: collection_name.to_string(),
             });
 
-            // At this point collection is removed from memory and moved to ".deleted" folder.
-            // Next time we load service the collection will not appear in the list of collections.
-            // We can take our time to delete the collection from disk.
-            tokio::spawn(async move {
-                if let Err(error) = tokio::fs::remove_dir_all(&deleted_path).await {
-                    log::error!(
-                        "Can't delete collection {} from disk. Error: {}",
-                        deleted_path.as_ref().display(),
-                        error
-                    );
-                }
-            });
-            Ok(true)
+            result = true;
         } else {
             // we hold the collection_create lock to make sure no one is creating this collection
             // otherwise we would delete its content now
-            let path = self.get_collection_path(collection_name);
-            if path.exists() {
+            if collection_path.exists() {
                 log::warn!(
                     "Collection {collection_name} is not loaded, but its directory still exists. Deleting it."
                 );
-                tokio::fs::remove_dir_all(path).await?;
+                to_delete = Some(safe_delete_in_tmp(&collection_path, &safe_delete_path)?);
+            } else {
+                to_delete = None;
             }
-            Ok(false)
+
+            result = false;
         }
+
+        if let Some(to_delete) = to_delete {
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = to_delete.close() {
+                    log::error!("Can't delete collection from disk: {error}");
+                }
+            });
+        }
+
+        Ok(result)
     }
 
     /// performs several alias changes in an atomic fashion
@@ -291,6 +341,9 @@ impl TableOfContent {
         Ok(true)
     }
 
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancel safe.
     async fn handle_resharding(
         &self,
         collection_id: CollectionId,
@@ -505,6 +558,7 @@ impl TableOfContent {
                     to: transfer_restart.to,
                     sync: old_transfer.sync, // Preserve sync flag from the old transfer
                     method: Some(transfer_restart.method),
+                    filter: None,
                 };
 
                 Box::pin(
@@ -526,7 +580,7 @@ impl TableOfContent {
             }
             ShardTransferOperations::RecoveryToPartial(transfer)
             | ShardTransferOperations::SnapshotRecovered(transfer) => {
-                // Validate transfer exists to prevent double handling
+                // Validate transfer exists
                 transfer::helpers::validate_transfer_exists(
                     &transfer,
                     &collection.state().await.transfers,
@@ -551,7 +605,15 @@ impl TableOfContent {
 
                 match current_state {
                     ReplicaState::PartialSnapshot | ReplicaState::Recovery => (),
-                    _ => {
+                    ReplicaState::Active
+                    | ReplicaState::Dead
+                    | ReplicaState::Partial
+                    | ReplicaState::Initializing
+                    | ReplicaState::Listener
+                    | ReplicaState::Resharding
+                    | ReplicaState::ReshardingScaleDown
+                    | ReplicaState::ActiveRead
+                    | ReplicaState::ManualRecovery => {
                         return Err(StorageError::bad_input(format!(
                             "Replica {} of {collection_id}:{} has unexpected {current_state:?} \
                              (expected {:?} or {:?})",
@@ -584,7 +646,9 @@ impl TableOfContent {
                     &collection.state().await.transfers,
                 )?;
                 log::warn!("Aborting shard transfer: {reason}");
-                collection.abort_shard_transfer(transfer, None).await?;
+                collection
+                    .abort_shard_transfer_and_resharding(transfer)
+                    .await?;
             }
         };
         Ok(())
@@ -606,11 +670,28 @@ impl TableOfContent {
         Ok(())
     }
 
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
     async fn create_shard_key(&self, operation: CreateShardKey) -> Result<(), StorageError> {
+        let use_initializing_state = self.is_distributed()
+            && self
+                .get_channel_service()
+                .all_peers_at_version(&CREATE_CUSTOM_SHARDS_IN_INITIALIZING_STATE);
+
+        let init_state = if let Some(initial_state) = operation.initial_state {
+            initial_state
+        } else if use_initializing_state {
+            ReplicaState::Initializing
+        } else {
+            ReplicaState::Active
+        };
+
         self.get_collection_unchecked(&operation.collection_name)
             .await?
-            .create_shard_key(operation.shard_key, operation.placement)
+            .create_shard_key(operation.shard_key, operation.placement, init_state)
             .await?;
+
         Ok(())
     }
 
@@ -655,6 +736,28 @@ impl TableOfContent {
             .await?
             .drop_payload_index(operation.field_name)
             .await?;
+        Ok(())
+    }
+
+    async fn create_named_vector(&self, operation: CreateNamedVector) -> Result<(), StorageError> {
+        let collection_hw_acc = HwMeasurementAcc::new_with_metrics_drain(
+            self.get_collection_hw_metrics(operation.collection_name.clone()),
+        );
+
+        self.get_collection_unchecked(&operation.collection_name)
+            .await?
+            .create_named_vector(operation.vector_name, operation.config, collection_hw_acc)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn delete_named_vector(&self, operation: DeleteNamedVector) -> Result<(), StorageError> {
+        self.get_collection_unchecked(&operation.collection_name)
+            .await?
+            .delete_named_vector(operation.vector_name)
+            .await?;
+
         Ok(())
     }
 }

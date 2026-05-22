@@ -5,7 +5,7 @@ use std::collections::{BinaryHeap, HashMap};
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::types::{PointOffsetType, ScoredPointOffset};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rstest::rstest;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -175,7 +175,7 @@ fn test_gpu_nearest_heap(#[values(true, false)] linear: bool) {
         .unwrap();
 
     context
-        .bind_pipeline(pipeline, &[descriptor_set.clone()])
+        .bind_pipeline(pipeline, std::slice::from_ref(&descriptor_set))
         .unwrap();
     context.dispatch(groups_count, 1, 1).unwrap();
     context.run().unwrap();
@@ -369,7 +369,7 @@ fn test_gpu_candidates_heap(#[values(true, false)] linear: bool) {
         .unwrap();
 
     context
-        .bind_pipeline(pipeline, &[descriptor_set.clone()])
+        .bind_pipeline(pipeline, std::slice::from_ref(&descriptor_set))
         .unwrap();
     context.dispatch(groups_count, 1, 1).unwrap();
     context.run().unwrap();

@@ -3,19 +3,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::hardware_counter::HardwareCounterCell;
 use super::hardware_data::HardwareData;
+use crate::cpu_utilization::CpuUtilization;
 
 /// Data structure, that routes hardware measurement counters to specific location.
 /// Shared drain MUST NOT create its own counters, but only hold a reference to the existing one,
 /// as it doesn't provide any checks on drop.
 #[derive(Debug)]
 pub struct HwSharedDrain {
-    pub(crate) cpu_counter: Arc<AtomicUsize>,
-    pub(crate) payload_io_read_counter: Arc<AtomicUsize>,
-    pub(crate) payload_io_write_counter: Arc<AtomicUsize>,
-    pub(crate) payload_index_io_read_counter: Arc<AtomicUsize>,
-    pub(crate) payload_index_io_write_counter: Arc<AtomicUsize>,
-    pub(crate) vector_io_read_counter: Arc<AtomicUsize>,
-    pub(crate) vector_io_write_counter: Arc<AtomicUsize>,
+    pub(crate) cpu_counter: AtomicUsize,
+    pub(crate) payload_io_read_counter: AtomicUsize,
+    pub(crate) payload_io_write_counter: AtomicUsize,
+    pub(crate) payload_index_io_read_counter: AtomicUsize,
+    pub(crate) payload_index_io_write_counter: AtomicUsize,
+    pub(crate) vector_io_read_counter: AtomicUsize,
+    pub(crate) vector_io_write_counter: AtomicUsize,
 }
 
 impl HwSharedDrain {
@@ -69,29 +70,16 @@ impl HwSharedDrain {
     }
 }
 
-impl Clone for HwSharedDrain {
-    fn clone(&self) -> Self {
-        HwSharedDrain {
-            cpu_counter: self.cpu_counter.clone(),
-            payload_io_read_counter: self.payload_io_read_counter.clone(),
-            payload_io_write_counter: self.payload_io_write_counter.clone(),
-            payload_index_io_read_counter: self.payload_index_io_read_counter.clone(),
-            payload_index_io_write_counter: self.payload_index_io_write_counter.clone(),
-            vector_io_read_counter: self.vector_io_read_counter.clone(),
-            vector_io_write_counter: self.vector_io_write_counter.clone(),
-        }
-    }
-}
 impl Default for HwSharedDrain {
     fn default() -> Self {
         Self {
-            cpu_counter: Arc::new(AtomicUsize::new(0)),
-            payload_io_read_counter: Arc::new(AtomicUsize::new(0)),
-            payload_io_write_counter: Arc::new(AtomicUsize::new(0)),
-            payload_index_io_read_counter: Arc::new(AtomicUsize::new(0)),
-            payload_index_io_write_counter: Arc::new(AtomicUsize::new(0)),
-            vector_io_read_counter: Arc::new(AtomicUsize::new(0)),
-            vector_io_write_counter: Arc::new(AtomicUsize::new(0)),
+            cpu_counter: AtomicUsize::new(0),
+            payload_io_read_counter: AtomicUsize::new(0),
+            payload_io_write_counter: AtomicUsize::new(0),
+            payload_index_io_read_counter: AtomicUsize::new(0),
+            payload_index_io_write_counter: AtomicUsize::new(0),
+            vector_io_read_counter: AtomicUsize::new(0),
+            vector_io_write_counter: AtomicUsize::new(0),
         }
     }
 }
@@ -100,31 +88,40 @@ impl Default for HwSharedDrain {
 /// This type is completely reference counted and clones of this type will read/write the same values as their origin structure.
 #[derive(Debug)]
 pub struct HwMeasurementAcc {
-    request_drain: HwSharedDrain,
-    metrics_drain: HwSharedDrain,
+    request_drain: Arc<HwSharedDrain>,
+    metrics_drain: Arc<HwSharedDrain>,
     /// If this is set to true, the accumulator will not accumulate any values.
     disposable: bool,
+    cpu_utilization: CpuUtilization,
 }
 
 impl HwMeasurementAcc {
     #[cfg(feature = "testing")]
     pub fn new() -> Self {
         Self {
-            request_drain: HwSharedDrain::default(),
-            metrics_drain: HwSharedDrain::default(),
+            request_drain: Arc::new(HwSharedDrain::default()),
+            metrics_drain: Arc::new(HwSharedDrain::default()),
             disposable: false,
+            cpu_utilization: CpuUtilization::new(),
         }
     }
 
     /// Create a disposable accumulator, which will not accumulate any values.
     /// WARNING: This is intended for specific internal use-cases only.
     /// DO NOT use it in tests or if you don't know what you're doing.
+    /// Prefer `new` to be used in tests.
     pub fn disposable() -> Self {
         Self {
-            request_drain: HwSharedDrain::default(),
-            metrics_drain: HwSharedDrain::default(),
+            request_drain: Arc::new(HwSharedDrain::default()),
+            metrics_drain: Arc::new(HwSharedDrain::default()),
             disposable: true,
+            cpu_utilization: CpuUtilization::new(),
         }
+    }
+
+    /// Same as `disposable`, but expected to be used in edge crate for better code navigation.
+    pub fn disposable_edge() -> Self {
+        Self::disposable()
     }
 
     pub fn is_disposable(&self) -> bool {
@@ -136,12 +133,17 @@ impl HwMeasurementAcc {
         HardwareCounterCell::new_with_accumulator(self.clone())
     }
 
-    pub fn new_with_metrics_drain(metrics_drain: HwSharedDrain) -> Self {
+    pub fn new_with_metrics_drain(metrics_drain: Arc<HwSharedDrain>) -> Self {
         Self {
-            request_drain: HwSharedDrain::default(),
+            request_drain: Arc::new(HwSharedDrain::default()),
             metrics_drain,
             disposable: false,
+            cpu_utilization: CpuUtilization::new(),
         }
+    }
+
+    pub fn cpu_utilization(&self) -> CpuUtilization {
+        self.cpu_utilization.clone()
     }
 
     pub fn accumulate<T: Into<HardwareData>>(&self, src: T) {
@@ -195,7 +197,7 @@ impl HwMeasurementAcc {
             payload_index_io_write_counter,
             vector_io_read_counter,
             vector_io_write_counter,
-        } = &self.request_drain;
+        } = self.request_drain.as_ref();
 
         HardwareData {
             cpu: cpu_counter.load(Ordering::Relaxed),
@@ -222,6 +224,7 @@ impl Clone for HwMeasurementAcc {
             request_drain: self.request_drain.clone(),
             metrics_drain: self.metrics_drain.clone(),
             disposable: self.disposable,
+            cpu_utilization: self.cpu_utilization.clone(),
         }
     }
 }
